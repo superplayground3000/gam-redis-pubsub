@@ -1,0 +1,93 @@
+# Redis fan-out validation stack
+# - redis-central: source of truth, writes go here, holds the events Stream
+# - redis-edge-{1,2,3}: independent Redis instances representing N edge "clusters"
+# - relay: reads events via consumer group, fans out to all edges in parallel
+# - loadgen / validator: invoked on demand via `docker compose run`
+#
+# To scale each edge to a true 3-node cluster, replace the edge service with
+# a cluster-enabled set (see notes in README). Standalone is used here so the
+# stack stays light enough to run on a laptop while validating the architecture.
+
+services:
+  redis-central:
+    image: redis:7-alpine
+    container_name: rf-central
+    ports: ["6380:6379"]
+    # appendonly: durability; keyspace events enabled for the pub/sub variant demo
+    command: >
+      redis-server
+      --appendonly yes
+      --notify-keyspace-events KEA
+      --maxmemory-policy noeviction
+    networks: [mesh]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  redis-edge-1:
+    image: redis:7-alpine
+    container_name: rf-edge-1
+    ports: ["6381:6379"]
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    networks: [mesh]
+    healthcheck: &edge_hc
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  redis-edge-2:
+    image: redis:7-alpine
+    container_name: rf-edge-2
+    ports: ["6382:6379"]
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    networks: [mesh]
+    healthcheck: *edge_hc
+
+  redis-edge-3:
+    image: redis:7-alpine
+    container_name: rf-edge-3
+    ports: ["6383:6379"]
+    command: redis-server --appendonly yes --maxmemory-policy noeviction
+    networks: [mesh]
+    healthcheck: *edge_hc
+
+  relay:
+    build: ./relay
+    container_name: rf-relay
+    environment:
+      CENTRAL_URL: redis://redis-central:6379
+      EDGE_URLS: redis://redis-edge-1:6379,redis://redis-edge-2:6379,redis://redis-edge-3:6379
+      STREAM_KEY: events
+      CONSUMER_GROUP: relay-group
+      CONSUMER_NAME: relay-1
+      BATCH_SIZE: "1000"
+      BLOCK_MS: "1000"
+    depends_on:
+      redis-central: { condition: service_healthy }
+      redis-edge-1:  { condition: service_healthy }
+      redis-edge-2:  { condition: service_healthy }
+      redis-edge-3:  { condition: service_healthy }
+    networks: [mesh]
+    restart: unless-stopped
+
+  # Run on demand:
+  #   docker compose run --rm loadgen python loadgen.py --count 10000
+  #   docker compose run --rm loadgen python validate.py --count 10000
+  loadgen:
+    build: ./loadgen
+    container_name: rf-loadgen
+    environment:
+      CENTRAL_URL: redis://redis-central:6379
+      STREAM_KEY: events
+      EDGE_URLS: redis://redis-edge-1:6379,redis://redis-edge-2:6379,redis://redis-edge-3:6379
+    depends_on:
+      redis-central: { condition: service_healthy }
+    networks: [mesh]
+    profiles: ["tools"]   # not started by `docker compose up`
+
+networks:
+  mesh:
+    driver: bridge
