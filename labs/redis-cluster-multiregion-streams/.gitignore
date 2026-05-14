@@ -1,0 +1,3 @@
+shared/*
+!shared/.gitkeep
+.env

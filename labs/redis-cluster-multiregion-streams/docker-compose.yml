@@ -1,0 +1,256 @@
+name: lab-redis-cluster-multiregion-streams
+
+# Topology:
+#   cluster-bus  - redis-a/b/c + toxiproxies + init containers (intra-cluster + admin plane)
+#   region-X-net - client-X + toxiproxy-X with redis-{a,b,c}.local DNS aliases on toxiproxy-X
+#
+# The same hostname (redis-a.local) resolves to a different toxiproxy depending on
+# which region-X-net you ask from. Cluster-bus traffic stays on cluster-bus and
+# does not go through any toxiproxy.
+
+x-redis-base: &redis-base
+  image: redis:7.4-alpine
+  restart: "no"
+
+services:
+
+  redis-a:
+    <<: *redis-base
+    container_name: r2a-redis-a
+    command:
+      - redis-server
+      - --port
+      - "6001"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-port
+      - "16001"
+      - --cluster-node-timeout
+      - "15000"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --bind
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6001", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      cluster-bus:
+
+  redis-b:
+    <<: *redis-base
+    container_name: r2a-redis-b
+    command:
+      - redis-server
+      - --port
+      - "6002"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-port
+      - "16002"
+      - --cluster-node-timeout
+      - "15000"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --bind
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6002", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      cluster-bus:
+
+  redis-c:
+    <<: *redis-base
+    container_name: r2a-redis-c
+    command:
+      - redis-server
+      - --port
+      - "6003"
+      - --cluster-enabled
+      - "yes"
+      - --cluster-port
+      - "16003"
+      - --cluster-node-timeout
+      - "15000"
+      - --appendonly
+      - "no"
+      - --save
+      - ""
+      - --protected-mode
+      - "no"
+      - --bind
+      - "0.0.0.0"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "6003", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
+    networks:
+      cluster-bus:
+
+  cluster-init:
+    build: ./cluster-init
+    container_name: r2a-cluster-init
+    restart: "no"
+    depends_on:
+      redis-a:
+        condition: service_healthy
+      redis-b:
+        condition: service_healthy
+      redis-c:
+        condition: service_healthy
+    volumes:
+      - ./shared:/shared
+    networks:
+      cluster-bus:
+
+  toxiproxy-a:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: r2a-toxiproxy-a
+    restart: "no"
+    command: ["-host", "0.0.0.0"]
+    healthcheck:
+      # toxiproxy-cli list talks to the admin API (8474); exits 0 once admin is listening.
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    networks:
+      cluster-bus:
+      region-a-net:
+        aliases:
+          - redis-a.local
+          - redis-b.local
+          - redis-c.local
+
+  toxiproxy-b:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: r2a-toxiproxy-b
+    restart: "no"
+    command: ["-host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    networks:
+      cluster-bus:
+      region-b-net:
+        aliases:
+          - redis-a.local
+          - redis-b.local
+          - redis-c.local
+
+  toxiproxy-c:
+    image: ghcr.io/shopify/toxiproxy:2.9.0
+    container_name: r2a-toxiproxy-c
+    restart: "no"
+    command: ["-host", "0.0.0.0"]
+    healthcheck:
+      test: ["CMD", "/toxiproxy-cli", "list"]
+      interval: 1s
+      timeout: 2s
+      retries: 15
+      start_period: 1s
+    networks:
+      cluster-bus:
+      region-c-net:
+        aliases:
+          - redis-a.local
+          - redis-b.local
+          - redis-c.local
+
+  proxy-init:
+    build: ./proxy-init
+    container_name: r2a-proxy-init
+    restart: "no"
+    environment:
+      LATENCY_LOCAL_MS: ${LATENCY_LOCAL_MS:-1}
+      LATENCY_MID_MS: ${LATENCY_MID_MS:-100}
+      LATENCY_FAR_MS: ${LATENCY_FAR_MS:-500}
+    depends_on:
+      cluster-init:
+        condition: service_completed_successfully
+      toxiproxy-a:
+        condition: service_healthy
+      toxiproxy-b:
+        condition: service_healthy
+      toxiproxy-c:
+        condition: service_healthy
+    volumes:
+      - ./shared:/shared
+    networks:
+      cluster-bus:
+
+  client-a:
+    build: ./client
+    container_name: r2a-client-a
+    restart: "no"
+    environment:
+      REGION: a
+      MEASURE_INTERVAL_MS: ${MEASURE_INTERVAL_MS:-1000}
+    depends_on:
+      proxy-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/shared
+    networks:
+      region-a-net:
+
+  client-b:
+    build: ./client
+    container_name: r2a-client-b
+    restart: "no"
+    environment:
+      REGION: b
+      MEASURE_INTERVAL_MS: ${MEASURE_INTERVAL_MS:-1000}
+    depends_on:
+      proxy-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/shared
+    networks:
+      region-b-net:
+
+  client-c:
+    build: ./client
+    container_name: r2a-client-c
+    restart: "no"
+    environment:
+      REGION: c
+      MEASURE_INTERVAL_MS: ${MEASURE_INTERVAL_MS:-1000}
+    depends_on:
+      proxy-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./shared:/shared
+    networks:
+      region-c-net:
+
+networks:
+  cluster-bus:
+    driver: bridge
+  region-a-net:
+    driver: bridge
+  region-b-net:
+    driver: bridge
+  region-c-net:
+    driver: bridge
