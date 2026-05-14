@@ -2,7 +2,6 @@
 .omc/
 
 # research-lab skill output: generated docker-compose labs
-labs/
 
 # Python
 __pycache__/
