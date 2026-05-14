@@ -26,6 +26,14 @@ Each lab provides its own `scripts/smoke-test.sh`. The script must:
 
 If the property is "subscriber receives messages from publisher", the smoke test publishes a known payload, subscribes, and asserts the payload was delivered — by reading actual logs or by running a verifier client. Checking `redis-cli ping` returns PONG is *not* a smoke test for pub/sub.
 
+**Data-collection options, from simplest to most robust:**
+
+1. **Log grep** — extract observations from `docker compose logs <service>` with `grep`/`awk`. Cheap, no extra plumbing; relies on the service printing a stable, parseable line. Acceptable for demos.
+2. **Shared volume** — services append structured observation records (one JSON/CSV line each) to a bind-mounted file the smoke test then reads. Decouples from log format; survives log rotation.
+3. **External verifier** — the smoke test runs its own client (via `docker compose exec` or against an exposed port) that talks to the service the same way the demo's client would. Most robust; required when the property cannot be observed via logs (e.g., "the message is queryable from a fresh consumer" — you need a fresh consumer to check).
+
+Pick the simplest option that actually proves the property. Don't add a verifier client just for ceremony; don't grep logs when the property requires a fresh observer.
+
 ## Failure handling discipline
 
 When `validate_lab.sh` fails:

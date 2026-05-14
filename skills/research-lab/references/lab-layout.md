@@ -70,6 +70,19 @@ Links lifted from RESEARCH.md. Most useful first.
 - Client uses `depends_on: { server: { condition: service_healthy } }`. No `sleep` for synchronization.
 - Host port mappings use the high range (≥ 15000) to avoid colliding with the user's other services. Default ports listed in `.env.example`.
 
+### Startup-order gotcha: consumer-side setup
+
+A class of demos has consumers that perform setup *after* the server is healthy — creating consumer groups, declaring queues, subscribing to topics, opening replication slots. The server being healthy is not enough: if the producer starts XADDing / publishing before consumers finish their setup, those messages are missed.
+
+The fix is to make each consumer expose a *readiness signal* and have the producer wait on it:
+
+1. Consumer performs its setup (e.g., `XGROUP CREATE`, queue declare, subscribe).
+2. Consumer writes a sentinel file inside the container, e.g. `/tmp/ready`.
+3. Consumer's compose healthcheck is `["CMD", "test", "-f", "/tmp/ready"]`.
+4. Producer's `depends_on` lists every consumer with `condition: service_healthy`.
+
+This is the right answer for Redis Streams, RabbitMQ work queues with declared queues, Postgres logical replication subscribers, Kafka consumer groups when the producer must not get ahead of them, and similar. Without it, the demo will pass most of the time and mysteriously fail occasionally — the worst kind of demo bug.
+
 ## Dockerfile conventions
 
 - Multi-stage where there's a compile step (Go always, Python only if building wheels).

@@ -1,6 +1,9 @@
 .DS_Store
 .omc/
 
+# research-lab skill output: generated docker-compose labs
+labs/
+
 # Python
 __pycache__/
 *.py[cod]

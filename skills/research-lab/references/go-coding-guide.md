@@ -27,6 +27,19 @@ Pin Go: `golang:1.23-alpine` build stage, `gcr.io/distroless/static-debian12` or
 
 Multi-stage Dockerfile is mandatory for Go — the build image is large, the runtime image should not be.
 
+**Generating `go.sum` without a host Go toolchain:** the lab dir needs `go.sum` checked in (or generated) before the first build, otherwise the build is non-reproducible and slower. If the host has no Go installed, generate via a one-shot container (host-isolation-safe — nothing installed on host):
+
+```bash
+docker run --rm \
+  -v "$PWD/server:/work" -w /work \
+  --user "$(id -u):$(id -g)" \
+  -e GOCACHE=/tmp/gocache -e GOPATH=/tmp/gopath \
+  golang:1.23-alpine \
+  sh -c "go mod download && go mod tidy"
+```
+
+Run this once per service dir (server, client). The resulting `go.sum` lives inside the lab.
+
 ## Server practices
 
 - **Bind `0.0.0.0`, not `localhost`.** Same issue as Python. A `net.Listen("tcp", ":8080")` (empty host) is correct; `net.Listen("tcp", "localhost:8080")` is the bug.

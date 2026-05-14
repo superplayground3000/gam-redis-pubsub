@@ -54,7 +54,7 @@ Read primary sources (project docs, RFCs, source code) first. Secondary sources 
 
 Sketch the smallest topology that demonstrates the property. Decide services, ports, volumes, healthchecks.
 
-**Escalation trigger:** if the design requires **3 or more services beyond the client**, or multi-node coordination, **invoke `superpowers:writing-plans`** to produce an implementation plan before coding. Smaller designs (1 server + 1 client, optionally + 1 dependency like a DB) proceed inline.
+**Escalation trigger:** if the design has **3+ distinct service types** (a "service type" is a unique role/image; three identical consumer replicas count as one type), multi-node coordination, or non-trivial cross-service ordering requirements, **invoke `superpowers:writing-plans`** to produce an implementation plan before coding. Smaller designs (one server + one client, optionally one shared dependency like a DB) proceed inline. When uncertain, prefer escalating.
 
 Append a "Design" subsection to RESEARCH.md capturing the chosen topology and the rejected alternatives with reasons.
 
