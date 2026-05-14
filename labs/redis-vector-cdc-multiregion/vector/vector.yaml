@@ -1,0 +1,53 @@
+# Vector pipeline:
+#   http_server (NDJSON, :9000)  ->  remap (derive subject)  ->  nats (JetStream)
+#
+# The HTTP source returns 200 only after downstream sinks ack, so relay-publish
+# can safely XACK Redis on a 200 response.
+#
+# Subject convention: cdc.<pattern>.<id> — one NATS subject per Redis key.
+# Stream REGION_CDC (created by relay-consume) captures cdc.> .
+
+data_dir: /var/lib/vector
+
+api:
+  enabled: true
+  address: 0.0.0.0:8686
+
+sources:
+  ingest:
+    type: http_server
+    address: 0.0.0.0:9000
+    encoding: ndjson
+
+transforms:
+  shape:
+    type: remap
+    inputs: [ingest]
+    source: |
+      # Pull the relay-publish payload up out of the event envelope. The
+      # http_server source wraps each line; the field name depends on encoding.
+      # For ndjson the parsed object is placed at the event root, so we just
+      # validate the required fields and synthesize the routing key.
+      if !exists(.pattern) || !exists(.id) {
+        log("dropping event missing pattern/id: " + to_string!(.), level: "warn")
+        abort
+      }
+      .pattern = string!(.pattern)
+      .id      = string!(.id)
+      # Sanitize: subject tokens must not contain '.' or whitespace.
+      .pattern = replace(.pattern, ".", "_")
+      .id      = replace(.id, ".", "_")
+
+sinks:
+  to_jetstream:
+    type: nats
+    inputs: [shape]
+    url: "nats://nats:4222"
+    subject: "cdc.{{ pattern }}.{{ id }}"
+    encoding:
+      codec: json
+    jetstream: true
+    healthcheck:
+      enabled: true
+    acknowledgements:
+      enabled: true

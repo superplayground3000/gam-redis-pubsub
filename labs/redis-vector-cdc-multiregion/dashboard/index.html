@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Redis → Vector → JetStream → Region Redis</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel-2: #1c2330;
+    --border: #30363d;
+    --fg: #e6edf3;
+    --muted: #7d8590;
+    --ok: #2ea043;
+    --warn: #d29922;
+    --bad: #f85149;
+    --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px;
+    background: var(--bg); color: var(--fg);
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  h1 { font-size: 16px; margin: 0 0 4px 0; font-weight: 600; }
+  .sub { color: var(--muted); margin-bottom: 14px; }
+  .grid {
+    display: grid; gap: 12px;
+    grid-template-columns: 1fr 1fr;
+  }
+  @media (max-width: 1100px) { .grid { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 6px; padding: 10px 12px;
+  }
+  .panel h2 {
+    font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em;
+    color: var(--muted); margin: 0 0 8px 0; font-weight: 600;
+  }
+  table { width: 100%; border-collapse: collapse; }
+  th, td {
+    text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border);
+    vertical-align: top; word-break: break-all;
+  }
+  th {
+    color: var(--muted); font-weight: 500; font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  td.num { font-variant-numeric: tabular-nums; }
+  tr.row-mismatch td { background: rgba(248, 81, 73, 0.07); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; vertical-align: 1px; }
+  .dot-ok { background: var(--ok); }
+  .dot-bad { background: var(--bad); }
+  .dot-warn { background: var(--warn); }
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin-bottom: 8px;
+  }
+  .stat {
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px;
+  }
+  .stat .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .stat .value { font-size: 18px; font-variant-numeric: tabular-nums; margin-top: 2px; }
+  .stat .value.ok   { color: var(--ok); }
+  .stat .value.warn { color: var(--warn); }
+  .stat .value.bad  { color: var(--bad); }
+  #events {
+    max-height: 360px; overflow-y: auto;
+    background: var(--panel-2); border: 1px solid var(--border);
+    border-radius: 6px; padding: 6px 8px;
+    font-size: 12px;
+  }
+  #events .ev { padding: 3px 0; border-bottom: 1px dotted var(--border); display: grid; grid-template-columns: 130px 90px 1fr; gap: 8px; }
+  #events .ev:last-child { border-bottom: none; }
+  #events .ev .delay { font-variant-numeric: tabular-nums; }
+  #events .ev .delay-fast { color: var(--ok); }
+  #events .ev .delay-warn { color: var(--warn); }
+  #events .ev .delay-bad  { color: var(--bad); }
+  #events .ev .key { color: var(--accent); }
+  .footer { margin-top: 14px; color: var(--muted); font-size: 11px; }
+  code { color: var(--accent); }
+</style>
+</head>
+<body>
+  <h1>Redis → Vector → JetStream → Region Redis</h1>
+  <div class="sub">
+    Producer writes to <code>central-redis</code>. Bridge: XREADGROUP → Vector → NATS JetStream → applier → <code>region-redis</code>.
+    Each row should converge within ~1s. Mismatched rows are highlighted.
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="label">Keys in sync</div><div class="value" id="stat-sync">–</div></div>
+    <div class="stat"><div class="label">Events delivered</div><div class="value" id="stat-events">0</div></div>
+    <div class="stat"><div class="label">p50 delay (ms)</div><div class="value" id="stat-p50">–</div></div>
+    <div class="stat"><div class="label">p99 delay (ms)</div><div class="value" id="stat-p99">–</div></div>
+  </div>
+
+  <div class="grid">
+    <div class="panel">
+      <h2>KV state (central vs region)</h2>
+      <table id="kv-table">
+        <thead>
+          <tr><th>Key</th><th>Central</th><th>Region</th><th>Match</th></tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>Live propagation events (newest first)</h2>
+      <div id="events"></div>
+    </div>
+  </div>
+
+  <div class="footer">
+    Refresh interval: <code>500 ms</code> for KV snapshot. Events arrive via SSE the moment the region applier writes.
+  </div>
+
+<script>
+(function() {
+  var delays = [];  // ring buffer of recent delays (ms)
+  var DELAY_WINDOW = 200;
+  var deliveredCount = 0;
+  var eventsBox = document.getElementById('events');
+  var statSync = document.getElementById('stat-sync');
+  var statEvents = document.getElementById('stat-events');
+  var statP50 = document.getElementById('stat-p50');
+  var statP99 = document.getElementById('stat-p99');
+  var tbody = document.querySelector('#kv-table tbody');
+
+  function pct(arr, p) {
+    if (!arr.length) return null;
+    var sorted = arr.slice().sort(function(a,b){return a-b;});
+    var idx = Math.min(sorted.length - 1, Math.floor(sorted.length * p));
+    return sorted[idx];
+  }
+
+  function fmtVal(s) {
+    if (!s) return '<span style="color:var(--muted)">∅</span>';
+    try {
+      var o = JSON.parse(s);
+      if (typeof o === 'object' && o !== null && 'counter' in o) {
+        return 'counter=' + o.counter;
+      }
+    } catch(_) {}
+    return s.length > 60 ? s.slice(0,57)+'…' : s;
+  }
+
+  function refreshState() {
+    fetch('/api/state', {cache:'no-store'})
+      .then(function(r){ return r.json(); })
+      .then(function(s){
+        var rows = '';
+        var inSync = 0;
+        s.keys.forEach(function(k){
+          var match = k.match;
+          if (match) inSync++;
+          var dot = match ? '<span class="dot dot-ok"></span>'
+                          : (k.region_present ? '<span class="dot dot-warn"></span>'
+                                              : '<span class="dot dot-bad"></span>');
+          rows += '<tr'+(match?'':' class="row-mismatch"')+'>' +
+            '<td>'+ k.key +'</td>' +
+            '<td>'+ fmtVal(k.central) +'</td>' +
+            '<td>'+ fmtVal(k.region) +'</td>' +
+            '<td>'+ dot + (match?'in sync':(k.region_present?'lagging':'missing')) +'</td>' +
+            '</tr>';
+        });
+        tbody.innerHTML = rows;
+        statSync.textContent = inSync + ' / ' + s.keys.length;
+        statSync.className = 'value ' + (inSync === s.keys.length ? 'ok' : 'warn');
+      })
+      .catch(function(){});
+  }
+
+  function classifyDelay(ms) {
+    if (ms < 200) return 'delay-fast';
+    if (ms < 1000) return 'delay-warn';
+    return 'delay-bad';
+  }
+
+  function renderStats() {
+    statEvents.textContent = deliveredCount;
+    var p50 = pct(delays, 0.50);
+    var p99 = pct(delays, 0.99);
+    statP50.textContent = (p50 === null ? '–' : p50);
+    statP99.textContent = (p99 === null ? '–' : p99);
+  }
+
+  function openEvents() {
+    var es = new EventSource('/api/events');
+    es.onmessage = function(m) {
+      try {
+        var ev = JSON.parse(m.data);
+        deliveredCount++;
+        delays.push(ev.delay_ms);
+        if (delays.length > DELAY_WINDOW) delays.shift();
+
+        var t = new Date(ev.applied_at_ns / 1e6);
+        var ts = t.toISOString().substring(11, 23);
+        var row = document.createElement('div');
+        row.className = 'ev';
+        row.innerHTML =
+          '<span style="color:var(--muted)">' + ts + '</span>' +
+          '<span class="delay ' + classifyDelay(ev.delay_ms) + '">' + ev.delay_ms + ' ms</span>' +
+          '<span><span class="key">' + ev.key + '</span> ← <code>' + ev.subject + '</code></span>';
+        eventsBox.insertBefore(row, eventsBox.firstChild);
+        while (eventsBox.children.length > 100) eventsBox.removeChild(eventsBox.lastChild);
+        renderStats();
+      } catch(_) {}
+    };
+    es.onerror = function() {
+      setTimeout(openEvents, 1000);
+      try { es.close(); } catch(_) {}
+    };
+  }
+
+  refreshState();
+  setInterval(refreshState, 500);
+  openEvents();
+})();
+</script>
+</body>
+</html>

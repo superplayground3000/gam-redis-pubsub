@@ -1,0 +1,178 @@
+name: lab-redis-vector-cdc-multiregion
+
+# Topology:
+#   producer --MULTI{SET,XADD}--> central-redis --XREADGROUP--> relay-publish
+#       --POST NDJSON--> vector --jetstream--> nats(JS) --pull--> relay-consume
+#       --SET / PUBLISH cdc:applied--> region-redis
+#   dashboard reads central-redis & region-redis (snapshot) and subscribes to
+#   region-redis Pub/Sub channel cdc:applied for live propagation events.
+#
+# Startup-order: relay-publish creates the consumer group on central-redis and
+# touches /tmp/ready; relay-consume creates the JetStream stream + durable
+# consumer and touches /tmp/ready. The producer depends_on both being healthy
+# so no XADDs can happen before the bridge is up.
+
+services:
+  central-redis:
+    image: redis:7.4-alpine
+    ports:
+      - "${CENTRAL_REDIS_HOST_PORT:-15401}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+    networks: [lab]
+
+  region-redis:
+    image: redis:7.4-alpine
+    ports:
+      - "${REGION_REDIS_HOST_PORT:-15402}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+    networks: [lab]
+
+  nats:
+    image: nats:2.11-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${NATS_HOST_PORT:-15422}:4222"
+      - "${NATS_MONITORING_HOST_PORT:-15822}:8222"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: "no"
+    networks: [lab]
+
+  vector:
+    image: timberio/vector:0.46.0-alpine
+    volumes:
+      - ./vector/vector.yaml:/etc/vector/vector.yaml:ro
+    command: ["--config", "/etc/vector/vector.yaml"]
+    environment:
+      VECTOR_LOG: ${VECTOR_LOG:-info}
+    depends_on:
+      nats:
+        condition: service_healthy
+    healthcheck:
+      # Vector exposes a built-in /health on the API port when api.enabled.
+      # Use 127.0.0.1 explicitly: busybox wget resolves "localhost" to ::1
+      # first and Vector's API listens IPv4 only, so a "localhost" probe
+      # gets ECONNREFUSED.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8686/health || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "${VECTOR_API_HOST_PORT:-15686}:8686"
+    restart: "no"
+    networks: [lab]
+
+  relay-publish:
+    build: ./relay-publish
+    environment:
+      REDIS_ADDR: central-redis:6379
+      STREAM_NAME: ${STREAM_NAME:-cdc:events}
+      CONSUMER_GROUP: ${CONSUMER_GROUP:-cdc-bridge}
+      CONSUMER_NAME: ${CONSUMER_NAME:-relay-1}
+      VECTOR_URL: http://vector:9000/
+      BATCH_COUNT: "64"
+      BLOCK_MS: "5000"
+    depends_on:
+      central-redis:
+        condition: service_healthy
+      vector:
+        condition: service_healthy
+      # Wait for relay-consume to have created the JetStream stream — otherwise
+      # the relay-publish readiness probe POST will travel through Vector to a
+      # nonexistent JS stream and 5xx until the stream appears.
+      relay-consume:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  relay-consume:
+    build: ./relay-consume
+    environment:
+      REDIS_ADDR: region-redis:6379
+      NATS_URL: nats://nats:4222
+      NATS_STREAM: ${NATS_STREAM:-REGION_CDC}
+      NATS_SUBJECT_FILTER: "cdc.>"
+      NATS_DURABLE: ${NATS_DURABLE:-region-applier}
+      APPLIED_CHANNEL: cdc:applied
+    depends_on:
+      region-redis:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  producer:
+    build: ./producer
+    environment:
+      REDIS_ADDR: central-redis:6379
+      STREAM_NAME: ${STREAM_NAME:-cdc:events}
+      EMIT_INTERVAL_MS: ${EMIT_INTERVAL_MS:-1000}
+      MAX_TICKS: ${MAX_TICKS:-0}     # 0 = run forever
+    depends_on:
+      central-redis:
+        condition: service_healthy
+      relay-publish:
+        condition: service_healthy
+      relay-consume:
+        condition: service_healthy
+    # Producer runs continuously; it has no /tmp/ready file. A healthcheck is
+    # added below so that compose `up --wait` does not return before the
+    # producer has emitted its first tick (without it, smoke tests can race
+    # the first XADD).
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/first-tick"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  dashboard:
+    build: ./dashboard
+    environment:
+      CENTRAL_REDIS_ADDR: central-redis:6379
+      REGION_REDIS_ADDR: region-redis:6379
+      APPLIED_CHANNEL: cdc:applied
+      LISTEN_ADDR: ":8080"
+    depends_on:
+      central-redis:
+        condition: service_healthy
+      region-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "${DASHBOARD_HOST_PORT:-15500}:8080"
+    restart: "no"
+    networks: [lab]
+
+networks:
+  lab:
+    driver: bridge
