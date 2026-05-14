@@ -1,0 +1,98 @@
+name: lab-redis-streams-multigroup-fanout
+
+# Startup order matters here. Consumers create their groups at $ (current
+# end of stream); any messages produced before all groups exist are missed.
+# To enforce ordering, each consumer writes /tmp/ready after XGROUP CREATE
+# succeeds, exposes that as a healthcheck, and the producer waits on all
+# three consumers being healthy before it starts producing.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "${REDIS_HOST_PORT:-15379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+    networks: [lab]
+
+  consumer-a:
+    build: ./consumer
+    environment:
+      REDIS_ADDR: redis:6379
+      STREAM_NAME: ${STREAM_NAME:-events}
+      GROUP_NAME: group-a
+      CONSUMER_NAME: consumer-a
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  consumer-b:
+    build: ./consumer
+    environment:
+      REDIS_ADDR: redis:6379
+      STREAM_NAME: ${STREAM_NAME:-events}
+      GROUP_NAME: group-b
+      CONSUMER_NAME: consumer-b
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  consumer-c:
+    build: ./consumer
+    environment:
+      REDIS_ADDR: redis:6379
+      STREAM_NAME: ${STREAM_NAME:-events}
+      GROUP_NAME: group-c
+      CONSUMER_NAME: consumer-c
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  producer:
+    build: ./producer
+    environment:
+      REDIS_ADDR: redis:6379
+      STREAM_NAME: ${STREAM_NAME:-events}
+      MAX_MESSAGES: ${MAX_MESSAGES:-10}
+      INTERVAL_MS: ${INTERVAL_MS:-1000}
+    depends_on:
+      redis:
+        condition: service_healthy
+      consumer-a:
+        condition: service_healthy
+      consumer-b:
+        condition: service_healthy
+      consumer-c:
+        condition: service_healthy
+    # Producer is a finite job; exits 0 once MAX_MESSAGES is reached.
+    restart: "no"
+    networks: [lab]
+
+networks:
+  lab:
+    driver: bridge
