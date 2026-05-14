@@ -1,6 +1,6 @@
 ---
 name: research-lab
-description: Use when the user wants to research, prototype, demonstrate, or learn about a networked service or protocol — phrases like "build a lab for X", "show me how Kafka rebalances", "demo Redis pub/sub fanout", "spin up a Postgres logical replication example", or any request for a runnable client/server demo of a backend system. Produces a RESEARCH.md plus a self-contained docker-compose lab under ./labs/<topic-slug>/ in Python or Go. Trigger this skill whenever the user asks for a hands-on experiment with a server/client wire protocol — even if they don't say "skill" or "lab" explicitly. Skip only for purely-frontend topics, ML training pipelines, or topics that fundamentally require host OS changes.
+description: Use when the user wants to research, prototype, demonstrate, or learn about a networked service or protocol — phrases like "build a lab for X", "show me how Kafka rebalances", "demo Redis pub/sub fanout", "spin up a Postgres logical replication example", or any request for a runnable client/server demo of a backend system. Produces a RESEARCH.md plus a self-contained docker-compose lab under ./labs/{topic-slug}/ in Python or Go. Trigger this skill whenever the user asks for a hands-on experiment with a server/client wire protocol — even if they don't say "skill" or "lab" explicitly. Skip only for purely-frontend topics, ML training pipelines, or topics that fundamentally require host OS changes.
 ---
 
 # research-lab
