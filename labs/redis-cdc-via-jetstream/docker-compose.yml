@@ -1,0 +1,138 @@
+name: lab-redis-cdc-via-jetstream
+
+# Topology:
+#   server  --XADD-->  redis-source  --XREADGROUP-->  provider  --NATS publish-->  nats (JS)
+#                                                                                   |
+#                                                                                   v
+#   client  <--HGETALL--  redis-sink  <--HSET--  consumer  <--JS subscribe (durable)
+#
+# Startup ordering: provider creates its source-side consumer group; consumer creates
+# the NATS JetStream stream + durable consumer. Both write /tmp/ready when their
+# bridge setup is done. The server waits on both being healthy before XADDing so that
+# no events can be produced before there's a bridge to carry them.
+
+services:
+  redis-source:
+    image: redis:7.4-alpine
+    ports:
+      - "${REDIS_SOURCE_HOST_PORT:-15301}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+    networks: [lab]
+
+  redis-sink:
+    image: redis:7.4-alpine
+    ports:
+      - "${REDIS_SINK_HOST_PORT:-15302}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+    restart: "no"
+    networks: [lab]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "${NATS_HOST_PORT:-15422}:4222"
+      - "${NATS_MONITORING_HOST_PORT:-15822}:8222"
+    healthcheck:
+      # Hit the /healthz endpoint exposed on the monitoring port. Returns 200 once JS is ready.
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    restart: "no"
+    networks: [lab]
+
+  provider:
+    build: ./provider
+    environment:
+      REDIS_ADDR: redis-source:6379
+      NATS_URL: nats://nats:4222
+      STREAM_NAME: ${STREAM_NAME:-events}
+      SOURCE_GROUP: ${SOURCE_GROUP:-bridge}
+      NATS_SUBJECT_PREFIX: ${NATS_SUBJECT_PREFIX:-events}
+    depends_on:
+      redis-source:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: "no"
+    networks: [lab]
+
+  consumer:
+    build: ./consumer
+    environment:
+      REDIS_ADDR: redis-sink:6379
+      NATS_URL: nats://nats:4222
+      NATS_STREAM: ${NATS_STREAM:-EVENTS}
+      NATS_SUBJECT_PREFIX: ${NATS_SUBJECT_PREFIX:-events}
+      NATS_DURABLE: ${NATS_DURABLE:-bridge-consumer}
+    depends_on:
+      redis-sink:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-f", "/tmp/ready"]
+      interval: 1s
+      timeout: 1s
+      retries: 30
+    restart: unless-stopped
+    networks: [lab]
+    # NOTE: `restart: unless-stopped` (deviating from the skill's default `no`) is
+    # intentional. The smoke test deliberately `docker compose stop`s this service
+    # mid-flight and then `start`s it again to exercise the durability property.
+    # `unless-stopped` is the policy that lets compose start it back. The
+    # `docker compose stop` action sets the desired state to stopped so the
+    # container does not auto-recover on its own.
+
+  server:
+    build: ./server
+    environment:
+      REDIS_ADDR: redis-source:6379
+      STREAM_NAME: ${STREAM_NAME:-events}
+      MAX_MESSAGES: ${MAX_MESSAGES:-100}
+      INTERVAL_MS: ${INTERVAL_MS:-100}
+    depends_on:
+      redis-source:
+        condition: service_healthy
+      provider:
+        condition: service_healthy
+      consumer:
+        condition: service_healthy
+    # Server is a finite job; exits 0 once MAX_MESSAGES is reached. Short-lived by
+    # design — no healthcheck needed.
+    restart: "no"
+    networks: [lab]
+
+  client:
+    build: ./client
+    environment:
+      REDIS_ADDR: redis-sink:6379
+      MAX_MESSAGES: ${MAX_MESSAGES:-100}
+      DEADLINE_SECONDS: "120"
+    depends_on:
+      redis-sink:
+        condition: service_healthy
+      consumer:
+        condition: service_healthy
+    # Client is a finite job; polls sink, computes latency stats, exits 0 when N events seen.
+    restart: "no"
+    networks: [lab]
+
+networks:
+  lab:
+    driver: bridge
