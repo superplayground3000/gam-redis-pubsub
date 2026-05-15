@@ -1,0 +1,7 @@
+# editor / OS
+*.swp
+.DS_Store
+
+# build artifacts (none expected to land in tree, but be defensive)
+/writer/writer
+/dashboard/dashboard
