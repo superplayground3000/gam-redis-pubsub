@@ -30,38 +30,53 @@ type event struct {
 	DeltaMs int64  `json:"delta_ms"`
 }
 
-type hub struct {
-	mu      sync.Mutex
-	clients map[*websocket.Conn]struct{}
+// wsClient wraps a *websocket.Conn with a write mutex. gorilla/websocket
+// requires writes to a single connection to be serialized — broadcast() can
+// be called concurrently from multiple keyspace-subscriber goroutines, so the
+// per-conn lock is mandatory, not optional.
+type wsClient struct {
+	conn   *websocket.Conn
+	writeM sync.Mutex
 }
 
-func newHub() *hub { return &hub{clients: map[*websocket.Conn]struct{}{}} }
+func (c *wsClient) write(msg []byte) error {
+	c.writeM.Lock()
+	defer c.writeM.Unlock()
+	_ = c.conn.SetWriteDeadline(time.Now().Add(2 * time.Second))
+	return c.conn.WriteMessage(websocket.TextMessage, msg)
+}
 
-func (h *hub) add(c *websocket.Conn) {
+type hub struct {
+	mu      sync.Mutex
+	clients map[*wsClient]struct{}
+}
+
+func newHub() *hub { return &hub{clients: map[*wsClient]struct{}{}} }
+
+func (h *hub) add(c *wsClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.clients[c] = struct{}{}
 }
 
-func (h *hub) remove(c *websocket.Conn) {
+func (h *hub) remove(c *wsClient) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if _, ok := h.clients[c]; ok {
 		delete(h.clients, c)
-		_ = c.Close()
+		_ = c.conn.Close()
 	}
 }
 
 func (h *hub) broadcast(msg []byte) {
 	h.mu.Lock()
-	conns := make([]*websocket.Conn, 0, len(h.clients))
+	clients := make([]*wsClient, 0, len(h.clients))
 	for c := range h.clients {
-		conns = append(conns, c)
+		clients = append(clients, c)
 	}
 	h.mu.Unlock()
-	for _, c := range conns {
-		_ = c.SetWriteDeadline(time.Now().Add(2 * time.Second))
-		if err := c.WriteMessage(websocket.TextMessage, msg); err != nil {
+	for _, c := range clients {
+		if err := c.write(msg); err != nil {
 			h.remove(c)
 		}
 	}
@@ -91,8 +106,10 @@ func main() {
 	}
 
 	h := newHub()
-	go subscribeKeyspace(ctx, central, "central", h)
-	go subscribeKeyspace(ctx, region, "region", h)
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() { defer wg.Done(); subscribeKeyspace(ctx, central, "central", h) }()
+	go func() { defer wg.Done(); subscribeKeyspace(ctx, region, "region", h) }()
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(r *http.Request) bool { return true }}
 
@@ -106,15 +123,16 @@ func main() {
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		c, err := upgrader.Upgrade(w, r, nil)
+		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			return
 		}
+		c := &wsClient{conn: conn}
 		h.add(c)
 		go func() {
 			defer h.remove(c)
 			for {
-				if _, _, err := c.ReadMessage(); err != nil {
+				if _, _, err := conn.ReadMessage(); err != nil {
 					return
 				}
 			}
@@ -136,6 +154,11 @@ func main() {
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
+	// Wait for keyspace subscribers to drain their loops before closing redis
+	// clients, so we don't read from a closed PubSub channel during shutdown.
+	wg.Wait()
+	_ = central.Close()
+	_ = region.Close()
 }
 
 func subscribeKeyspace(ctx context.Context, c *redis.Client, side string, h *hub) {
