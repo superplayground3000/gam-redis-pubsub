@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Redis Multiregion via Connect — Live</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+         margin: 14px; background: #0e1117; color: #e6e6e6; }
+  h1 { font-size: 16px; margin: 0 0 12px; color: #fff; }
+  h2 { font-size: 13px; color: #b8c2cc; margin: 16px 0 6px; font-weight: 500; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border-bottom: 1px solid #2a2f3a; padding: 4px 8px; text-align: left; }
+  th { background: #161b22; color: #b8c2cc; font-weight: 500; }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .card { background: #161b22; padding: 8px 12px; border-radius: 6px; min-width: 240px; }
+  .card .name { font-size: 11px; color: #b8c2cc; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .row { display: flex; gap: 14px; margin-top: 6px; }
+  .card .metric { font-size: 14px; }
+  .card .metric .label { color: #8b95a3; font-size: 10px; display: block; }
+  .lat { font-weight: 600; }
+  .lat.ok { color: #7ee787; } .lat.warn { color: #d29922; } .lat.bad { color: #f85149; }
+  .side-central { color: #79c0ff; } .side-region { color: #d2a8ff; }
+  #status { font-size: 11px; color: #8b95a3; margin-bottom: 8px; }
+  #log-wrap { max-height: 48vh; overflow-y: auto; border: 1px solid #2a2f3a; border-radius: 6px; }
+  code { background: #161b22; padding: 1px 4px; border-radius: 3px; font-size: 11px; }
+</style>
+</head>
+<body>
+<h1>Redis Multiregion via Connect — propagation delay</h1>
+<div id="status">connecting…</div>
+
+<h2>Per-pattern latency (region-side observations)</h2>
+<div class="stats" id="stats"></div>
+
+<h2>Live event stream</h2>
+<div id="log-wrap">
+  <table>
+    <thead><tr><th>time</th><th>side</th><th>key</th><th>v</th><th>delta_ms</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<h2>Latest value per key (central vs region)</h2>
+<table>
+  <thead><tr><th>key</th><th>central <code>v</code></th><th>region <code>v</code></th><th>last region delta_ms</th></tr></thead>
+  <tbody id="ground-rows"></tbody>
+</table>
+
+<script>
+const rows = document.getElementById("rows");
+const groundRows = document.getElementById("ground-rows");
+const stats = document.getElementById("stats");
+const status = document.getElementById("status");
+
+const latestByKey = {};
+const samplesByPattern = {};
+
+function patternOf(key) {
+  if (key.startsWith("lb:company:")) return "company";
+  if (key.startsWith("lb:functions:")) return "functions";
+  if (key.startsWith("lb:general:")) return "general";
+  return "other";
+}
+
+function percentile(arr, p) {
+  if (!arr.length) return null;
+  const s = [...arr].sort((a,b)=>a-b);
+  return s[Math.min(s.length-1, Math.floor(s.length * p))];
+}
+
+function renderStats() {
+  const html = [];
+  for (const pat of ["company","functions","general"]) {
+    const arr = samplesByPattern[pat] || [];
+    const p50 = percentile(arr, 0.5);
+    const p95 = percentile(arr, 0.95);
+    const last = arr.length ? arr[arr.length-1] : null;
+    html.push(`<div class="card">
+      <div class="name">${pat}</div>
+      <div class="row">
+        <div class="metric"><span class="label">count</span>${arr.length}</div>
+        <div class="metric"><span class="label">last</span>${last ?? "—"} ms</div>
+        <div class="metric"><span class="label">p50</span>${p50 ?? "—"} ms</div>
+        <div class="metric"><span class="label">p95</span>${p95 ?? "—"} ms</div>
+      </div>
+    </div>`);
+  }
+  stats.innerHTML = html.join("");
+}
+
+function renderGround() {
+  const html = [];
+  const keys = Object.keys(latestByKey).sort();
+  for (const k of keys) {
+    const r = latestByKey[k];
+    html.push(`<tr><td>${k}</td><td class="side-central">${r.central?.v ?? "—"}</td><td class="side-region">${r.region?.v ?? "—"}</td><td>${r.lastDelta ?? "—"}</td></tr>`);
+  }
+  groundRows.innerHTML = html.join("");
+}
+
+function classifyLat(d) { if (d < 200) return "ok"; if (d < 1000) return "warn"; return "bad"; }
+
+function append(e) {
+  let v = "—";
+  try { v = JSON.parse(e.value).v; } catch {}
+  const ts = new Date(e.now_ms).toISOString().split("T")[1].replace("Z","");
+  const cls = classifyLat(e.delta_ms);
+  const tr = document.createElement("tr");
+  tr.innerHTML = `<td>${ts}</td><td class="side-${e.side}">${e.side}</td><td>${e.key}</td><td>${v}</td><td class="lat ${cls}">${e.delta_ms}</td>`;
+  rows.prepend(tr);
+  while (rows.childElementCount > 100) rows.removeChild(rows.lastChild);
+
+  if (!latestByKey[e.key]) latestByKey[e.key] = {};
+  latestByKey[e.key][e.side] = { v };
+  if (e.side === "region") {
+    latestByKey[e.key].lastDelta = e.delta_ms;
+    const pat = patternOf(e.key);
+    if (!samplesByPattern[pat]) samplesByPattern[pat] = [];
+    samplesByPattern[pat].push(e.delta_ms);
+    if (samplesByPattern[pat].length > 200) samplesByPattern[pat].shift();
+  }
+  renderStats();
+  renderGround();
+}
+
+let ws;
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws");
+  ws.onopen = () => { status.textContent = "live · " + new Date().toISOString(); };
+  ws.onclose = () => { status.textContent = "disconnected, retrying…"; setTimeout(connect, 1500); };
+  ws.onmessage = (m) => {
+    try {
+      const e = JSON.parse(m.data);
+      if (e.type === "event") append(e);
+    } catch {}
+  };
+}
+connect();
+renderStats();
+renderGround();
+</script>
+</body>
+</html>
