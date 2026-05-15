@@ -1,0 +1,37 @@
+# Consumes JetStream APP_EVENTS, extracts {key, value} from the JSON envelope,
+# and SETs the value into region Redis.
+
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+
+input:
+  label: jetstream_source
+  nats_jetstream:
+    urls: [nats://nats:4222]
+    subject: app.events.>
+    durable: region-writer
+    deliver: all
+    ack_wait: 30s
+
+pipeline:
+  threads: 2
+  processors:
+    - mapping: |
+        # Extract the inner value string; surface key as metadata.
+        meta key = this.key
+        root = this.value
+
+output:
+  label: redis_sink
+  redis:
+    url: redis://redis-region:6379
+    command: set
+    args_mapping: |
+      root = [ meta("key"), content().string() ]
+    max_in_flight: 64
+
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
