@@ -24,10 +24,12 @@ EXPECTED_KEYS=(
   "lb:general:items:id:9125"
 )
 
+# Use probe-only keys the writer never touches, so the writer's 1Hz updates
+# don't race with the probe value during the polling window.
 PROBES=(
-  "lb:company:employees:id:55688|company"
-  "lb:functions:groups:id:89889|functions"
-  "lb:general:items:id:9123|general"
+  "lb:company:employees:id:probe1|company"
+  "lb:functions:groups:id:probe2|functions"
+  "lb:general:items:id:probe3|general"
 )
 
 # Map host port -> container name (for docker exec fallback)

@@ -1,5 +1,5 @@
 # Consumes JetStream APP_EVENTS, extracts {key, value} from the JSON envelope,
-# and SETs the value into region Redis.
+# and writes the value into region Redis via a cache resource (SET semantics).
 
 http:
   address: 0.0.0.0:4195
@@ -18,18 +18,22 @@ pipeline:
   threads: 2
   processors:
     - mapping: |
-        # Extract the inner value string; surface key as metadata.
+        # Surface key as metadata, then collapse body to the inner value string.
         meta key = this.key
         root = this.value
 
 output:
   label: redis_sink
-  redis:
-    url: redis://redis-region:6379
-    command: set
-    args_mapping: |
-      root = [ meta("key"), content().string() ]
+  cache:
+    target: region_kv
+    key: ${! meta("key") }
     max_in_flight: 64
+
+cache_resources:
+  - label: region_kv
+    redis:
+      url: redis://redis-region:6379
+      kind: simple
 
 logger:
   level: INFO
