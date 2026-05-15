@@ -1,0 +1,168 @@
+name: redis-multiregion-via-connect
+
+services:
+  redis-central:
+    image: redis:7.4-alpine
+    container_name: rmvc-redis-central
+    command:
+      - "redis-server"
+      - "--notify-keyspace-events"
+      - "KEA"
+      - "--appendonly"
+      - "no"
+      - "--save"
+      - ""
+    ports:
+      - "15379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [rmvc]
+
+  redis-region:
+    image: redis:7.4-alpine
+    container_name: rmvc-redis-region
+    command:
+      - "redis-server"
+      - "--notify-keyspace-events"
+      - "KEA"
+      - "--appendonly"
+      - "no"
+      - "--save"
+      - ""
+    ports:
+      - "15380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [rmvc]
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: rmvc-nats
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports:
+      - "15222:4222"
+      - "18222:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [rmvc]
+
+  nats-init:
+    image: natsio/nats-box:0.14.5
+    container_name: rmvc-nats-init
+    depends_on:
+      nats: { condition: service_healthy }
+    restart: "no"
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        if nats --server nats://nats:4222 stream info APP_EVENTS >/dev/null 2>&1; then
+          echo "APP_EVENTS already exists"
+        else
+          nats --server nats://nats:4222 stream add APP_EVENTS \
+            --subjects 'app.events.>' \
+            --storage file \
+            --replicas 1 \
+            --retention limits \
+            --discard old \
+            --max-age 1h \
+            --max-bytes=-1 \
+            --max-msgs=-1 \
+            --max-msg-size=1MB \
+            --dupe-window 5m \
+            --defaults
+        fi
+        nats --server nats://nats:4222 stream info APP_EVENTS
+    networks: [rmvc]
+
+  connect-forward:
+    image: docker.redpanda.com/redpandadata/connect:4.45.1
+    container_name: rmvc-connect-forward
+    depends_on:
+      redis-central: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    volumes:
+      - ./connect/forward.yaml:/connect.yaml:ro
+    command: ["run", "/connect.yaml"]
+    ports:
+      - "15195:4195"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [rmvc]
+
+  connect-reverse:
+    image: docker.redpanda.com/redpandadata/connect:4.45.1
+    container_name: rmvc-connect-reverse
+    depends_on:
+      redis-region: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    volumes:
+      - ./connect/reverse.yaml:/connect.yaml:ro
+    command: ["run", "/connect.yaml"]
+    ports:
+      - "15196:4195"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [rmvc]
+
+  writer:
+    build: ./writer
+    container_name: rmvc-writer
+    depends_on:
+      redis-central: { condition: service_healthy }
+      connect-forward: { condition: service_healthy }
+    environment:
+      REDIS_ADDR: redis-central:6379
+      STREAM_KEY: app.events
+      WRITE_INTERVAL_MS: "1000"
+      HEALTH_ADDR: ":8081"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [rmvc]
+
+  dashboard:
+    build: ./dashboard
+    container_name: rmvc-dashboard
+    depends_on:
+      redis-central: { condition: service_healthy }
+      redis-region: { condition: service_healthy }
+      connect-reverse: { condition: service_healthy }
+    environment:
+      CENTRAL_ADDR: redis-central:6379
+      REGION_ADDR: redis-region:6379
+      LISTEN_ADDR: ":8080"
+    ports:
+      - "15080:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+    networks: [rmvc]
+
+networks:
+  rmvc:
+    name: rmvc-net
+
+volumes:
+  nats-data:
