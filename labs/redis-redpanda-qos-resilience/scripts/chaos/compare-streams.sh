@@ -30,30 +30,40 @@ redc() {
   fi
 }
 
-# Pull source event_ids from app.events (key field "event_id").
-src_tmp=$(mktemp)
-reg_tmp=$(mktemp)
-trap 'rm -f "$src_tmp" "$reg_tmp"' EXIT
+src_raw=$(mktemp)
+reg_raw=$(mktemp)
+src_sorted=$(mktemp)
+reg_sorted=$(mktemp)
+reg_dedup=$(mktemp)
+trap 'rm -f "$src_raw" "$reg_raw" "$src_sorted" "$reg_sorted" "$reg_dedup"' EXIT
 
 src_len=$(redc "$REDIS_CENTRAL_PORT" XLEN app.events | tr -d '\r' || echo 0)
 reg_len=$(redc "$REDIS_REGION_PORT" XLEN region-events 2>/dev/null | tr -d '\r' || echo 0)
 
-# XRANGE returns lines: id then field/value pairs. Extract event_id values.
-redc "$REDIS_CENTRAL_PORT" XRANGE app.events - + | \
-  awk 'prev=="event_id" {print; prev=""} {prev=$0}' > "$src_tmp"
+# XRANGE non-TTY output is one token per line. event_id values are the line
+# immediately following "event_id". tr -d '\r' guards against CRs from
+# docker-exec piping.
+redc "$REDIS_CENTRAL_PORT" XRANGE app.events - + | tr -d '\r' | \
+  awk 'prev=="event_id" {print; prev=""} {prev=$0}' > "$src_raw"
 
-redc "$REDIS_REGION_PORT" XRANGE region-events - + 2>/dev/null | \
-  awk 'prev=="event_id" {print; prev=""} {prev=$0}' > "$reg_tmp" || true
+redc "$REDIS_REGION_PORT" XRANGE region-events - + 2>/dev/null | tr -d '\r' | \
+  awk 'prev=="event_id" {print; prev=""} {prev=$0}' > "$reg_raw" || true
 
-# missing in region: source ids not in region
-missing=$(comm -23 <(sort -u "$src_tmp") <(sort -u "$reg_tmp") | wc -l)
-# extra in region: region ids not in source (shouldn't happen normally)
-extra=$(comm -13 <(sort -u "$src_tmp") <(sort -u "$reg_tmp") | wc -l)
-# duplicates in region: region entries with duplicate event_id
-dups=$(sort "$reg_tmp" | uniq -d | wc -l)
+# LC_ALL=C: byte-order collation. comm requires the same ordering its inputs
+# were sorted with — locale-sensitive sort breaks comm under most distro
+# defaults. Force C here for both sort and comm.
+LC_ALL=C sort -u "$src_raw" -o "$src_sorted"
+LC_ALL=C sort    "$reg_raw" -o "$reg_sorted"
+LC_ALL=C uniq    "$reg_sorted" > "$reg_dedup"
 
-echo "source app.events XLEN     : $src_len  (unique event_ids: $(sort -u "$src_tmp" | wc -l))"
-echo "region region-events XLEN  : $reg_len  (unique event_ids: $(sort -u "$reg_tmp" | wc -l))"
+src_unique=$(wc -l < "$src_sorted" | tr -d ' ')
+reg_unique=$(wc -l < "$reg_dedup"  | tr -d ' ')
+dups=$(LC_ALL=C uniq -d < "$reg_sorted" | wc -l | tr -d ' ')
+missing=$(LC_ALL=C comm -23 "$src_sorted" "$reg_dedup" | wc -l | tr -d ' ')
+extra=$(LC_ALL=C comm -13 "$src_sorted" "$reg_dedup" | wc -l | tr -d ' ')
+
+echo "source app.events XLEN     : $src_len  (unique event_ids: $src_unique)"
+echo "region region-events XLEN  : $reg_len  (unique event_ids: $reg_unique)"
 echo "missing in region (loss)   : $missing"
 echo "extra in region            : $extra"
 echo "duplicate event_ids region : $dups"
