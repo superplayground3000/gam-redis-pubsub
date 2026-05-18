@@ -1,0 +1,55 @@
+# Reads central Redis stream and publishes each entry to NATS JetStream.
+# Each XADD entry has fields: event_id, key, value, pattern, t_send_ms.
+# body_key=value -> message body is the JSON value string; the rest land as metadata.
+
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+
+input:
+  label: redis_source
+  redis_streams:
+    url: redis://redis-central:6379
+    kind: simple
+    streams: [app.events]
+    consumer_group: propagator
+    client_id: ${HOSTNAME:rpconnect-forward}
+    body_key: value
+    create_streams: true
+    start_from_oldest: false
+    commit_period: 200ms
+    timeout: 500ms
+    limit: 50
+    auto_replay_nacks: true
+
+pipeline:
+  threads: 2
+  processors:
+    # Re-wrap the message as a JSON envelope so the reverse leg has key + value
+    # without depending on NATS header passthrough behavior.
+    - mapping: |
+        let original_value = content().string()
+        root = {
+          "key":        meta("key").or("unknown"),
+          "value":      $original_value,
+          "event_id":   meta("event_id").or("unknown"),
+          "pattern":    meta("pattern").or("unknown"),
+          "t_send_ms":  meta("t_send_ms").or("0").number()
+        }
+        meta event_id = meta("event_id").or($original_value.hash("sha256").encode("hex"))
+        meta pattern  = meta("pattern").or("unknown")
+
+output:
+  label: jetstream_sink
+  nats_jetstream:
+    urls: [nats://nats:4222]
+    subject: app.events.${! meta("pattern") }
+    headers:
+      Nats-Msg-Id: ${! meta("event_id") }
+      Content-Type: application/json
+    max_in_flight: 256
+
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
