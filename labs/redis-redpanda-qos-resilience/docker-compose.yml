@@ -87,7 +87,7 @@ services:
     networks: [rrqr]
 
   connect-source:
-    image: docker.redpanda.com/redpandadata/connect:4.45.1
+    image: hpdevelop/connect:4.92.0-claudefix
     container_name: rrqr-connect-source
     depends_on:
       redis-central: { condition: service_healthy }
@@ -105,7 +105,7 @@ services:
     networks: [rrqr]
 
   connect-sink:
-    image: docker.redpanda.com/redpandadata/connect:4.45.1
+    image: hpdevelop/connect:4.92.0-claudefix
     container_name: rrqr-connect-sink
     depends_on:
       redis-region: { condition: service_healthy }
