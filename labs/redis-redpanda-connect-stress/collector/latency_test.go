@@ -42,3 +42,24 @@ func TestLatencyTrackerRecordAndPercentiles(t *testing.T) {
 		t.Errorf("P50Ms=%.2f, want in [10,200]", s.P50Ms)
 	}
 }
+
+func TestExtractTsNsRejectsNegative(t *testing.T) {
+	if _, err := extractTsNs(`{"event_id":"abc","ts_ns":-1}`); err == nil {
+		t.Errorf("expected error on negative ts_ns")
+	}
+}
+
+func TestLatencyTrackerClampsOverRange(t *testing.T) {
+	lt := NewLatencyTracker()
+	now := int64(400_000_000_000_000_000) // arbitrary now
+	// Sample 400 seconds old → above the 300s max
+	lt.RecordAt(now-400_000_000_000_000_000+1, now)
+	s := lt.Summary()
+	if s.Samples != 1 {
+		t.Errorf("Samples=%d, want 1 (over-range sample should be clamped, not dropped)", s.Samples)
+	}
+	// Max should be ~300s (300000ms) — clamped, not exact.
+	if s.MaxMs < 290_000 || s.MaxMs > 310_000 {
+		t.Errorf("MaxMs=%.2f, want near 300000 after clamp", s.MaxMs)
+	}
+}

@@ -14,8 +14,8 @@ func extractTsNs(value string) (int64, error) {
 	if err := json.Unmarshal([]byte(value), &p); err != nil {
 		return 0, err
 	}
-	if p.TsNs == 0 {
-		return 0, fmt.Errorf("ts_ns missing or zero")
+	if p.TsNs <= 0 {
+		return 0, fmt.Errorf("ts_ns missing, zero, or negative")
 	}
 	return p.TsNs, nil
 }
@@ -25,14 +25,18 @@ type LatencyTracker struct {
 }
 
 func NewLatencyTracker() *LatencyTracker {
-	// Range 1 microsecond .. 60 seconds, 3 significant figures.
-	return &LatencyTracker{h: hdrhistogram.New(1, 60_000_000, 3)}
+	// Range 1 microsecond .. 300 seconds. Chaos-drill recovery can produce
+	// multi-tens-of-seconds latencies; 300s gives generous headroom without bloating memory.
+	return &LatencyTracker{h: hdrhistogram.New(1, 300_000_000, 3)}
 }
 
 func (l *LatencyTracker) RecordAt(tsNs, nowNs int64) {
 	dUs := (nowNs - tsNs) / 1_000
 	if dUs < 1 {
 		dUs = 1
+	}
+	if dUs > 300_000_000 {
+		dUs = 300_000_000
 	}
 	_ = l.h.RecordValue(dUs)
 }
