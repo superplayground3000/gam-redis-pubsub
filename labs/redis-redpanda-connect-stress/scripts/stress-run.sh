@@ -31,6 +31,32 @@ EOF
   esac
 done
 
+NO_ARGS_RUN=$(( $# == 0 ? 1 : 0 ))
+cleanup() {
+  if (( NO_ARGS_RUN )); then
+    echo "[teardown] docker compose down -v"
+    docker compose down -v >/dev/null 2>&1 || true
+  fi
+}
+trap cleanup EXIT
+
+# Validate tiers against known SLO keys
+for t in "${TIERS[@]}"; do
+  if [[ -z "${TIER_P99_MS[$t]:-}" ]]; then
+    echo "error: unknown tier '${t}'. Known: ${!TIER_P99_MS[*]}" >&2
+    exit 2
+  fi
+done
+
+# Validate modes
+valid_modes=" throughput latency chaos "
+for m in "${MODES[@]}"; do
+  if [[ "${valid_modes}" != *" ${m} "* ]]; then
+    echo "error: unknown mode '${m}'. Known: throughput latency chaos" >&2
+    exit 2
+  fi
+done
+
 # Boot the lab (idempotent).
 echo "[boot] starting compose services (profile=${PROFILE})"
 PROFILE_QOS="${PROFILE}" docker compose up -d --wait
@@ -46,13 +72,14 @@ run_one() {
   if [[ "${mode}" == "chaos" ]]; then
     # Pre-flight: refuse if jetstream is already > 200MB
     local bytes
-    bytes=$(curl -fs "http://127.0.0.1:${NATS_MON_PORT:-17322}/jsz?streams=true" \
+    bytes=$(curl -fs "http://127.0.0.1:${NATS_MON_PORT:-17322}/jsz?streams=true&consumers=true&accounts=true" \
             | python3 -c 'import json,sys
 d=json.load(sys.stdin)
 b=0
 for a in d.get("account_details",[]):
  for s in a.get("stream_detail",[]):
-  if s["name"]=="APP_EVENTS": b=s["state"]["bytes"]
+  if s.get("name") == "APP_EVENTS":
+    b = s.get("state",{}).get("bytes", 0)
 print(b)')
     if (( bytes > 200*1024*1024 )); then
       echo "[abort] JetStream APP_EVENTS already at ${bytes} bytes (>200MB). Tear down (docker compose down -v) and retry." >&2
@@ -70,7 +97,6 @@ print(b)')
 
   echo "[run] tier=${tier} mode=${mode} profile=${PROFILE}"
   PROFILE_QOS="${PROFILE}" docker compose --profile tools run --rm \
-    -v "${LAB_DIR}/reports:/reports" \
     collector \
       --tier="${tier}" --mode="${mode}" --profile="${PROFILE}" \
       --duration="${DURATION_S}s" --warmup="${WARMUP_S}s" --drain="${DRAIN_S}s" \
@@ -80,7 +106,13 @@ print(b)')
       "${chaos_args[@]}" || true
 
   if [[ -n "${chaos_pid}" ]]; then
-    wait "${chaos_pid}" 2>/dev/null || true
+    set +e
+    wait "${chaos_pid}"
+    chaos_rc=$?
+    set -e
+    if (( chaos_rc != 0 )); then
+      echo "[chaos] WARN: kill-connect-sink.sh exited ${chaos_rc} (kept going; see container logs)" >&2
+    fi
   fi
 }
 
@@ -120,12 +152,6 @@ PY
   done
 done
 printf -- "---------------------------------------------------------------------\n"
-
-# Auto teardown for full-matrix run (all defaults, no args).
-if [[ $# -eq 0 ]]; then
-  echo "[teardown] docker compose down -v"
-  docker compose down -v
-fi
 
 if $all_pass; then
   exit 0
