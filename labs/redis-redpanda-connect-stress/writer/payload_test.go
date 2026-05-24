@@ -42,3 +42,14 @@ func TestPayloadJSONRoundTrip(t *testing.T) {
 		t.Errorf("TsNs mismatch")
 	}
 }
+
+func TestNewPayloadEventIDsAreUnique(t *testing.T) {
+	seen := map[string]bool{}
+	for i := 0; i < 100; i++ {
+		p := NewPayload(int64(i), 10)
+		if seen[p.EventID] {
+			t.Fatalf("duplicate EventID at i=%d: %s", i, p.EventID)
+		}
+		seen[p.EventID] = true
+	}
+}

@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+	"time"
+)
 
 func TestLimiterInitialZero(t *testing.T) {
 	l := NewLimiter()
@@ -30,5 +34,18 @@ func TestLimiterBurstScalesWithRate(t *testing.T) {
 	l.Set(10000)
 	if l.Burst() != 1000 {
 		t.Errorf("Burst=%d, want 1000 (rate/10)", l.Burst())
+	}
+}
+
+func TestLimiterWaitNAllowsPipelineDepth(t *testing.T) {
+	l := NewLimiter()
+	l.Set(10000) // 10k rps, burst = 1000
+	// Initial burst should let several pipeline-depth=50 batches through without blocking.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	for i := 0; i < 5; i++ {
+		if err := l.WaitN(ctx, 50); err != nil {
+			t.Fatalf("iter %d: WaitN(50) failed: %v", i, err)
+		}
 	}
 }

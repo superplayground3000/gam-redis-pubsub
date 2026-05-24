@@ -7,6 +7,10 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// Limiter wraps golang.org/x/time/rate with cheap observability reads.
+// r is the authoritative rate source (mutex-protected by the rate package).
+// current and burst are atomic shadows for the HTTP /metrics read-path; they
+// may transiently lag r for microseconds during a Set call — this is acceptable.
 type Limiter struct {
 	r       *rate.Limiter
 	current atomic.Int64
@@ -19,6 +23,9 @@ func NewLimiter() *Limiter {
 	return l
 }
 
+// Set updates the rate to rps events/sec. rps=0 pauses the writer: workers
+// drain the burst (~100 tokens) then block on WaitN until Set is called with a
+// non-zero rate. Burst is floored at 100 to prevent warmup ramps from starving workers.
 func (l *Limiter) Set(rps int) {
 	b := 100
 	if rps/10 > b {
