@@ -25,6 +25,9 @@ func scrapePromMetrics(ctx context.Context, url string) (map[string]float64, err
 		return nil, err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("scrape %s: HTTP %d", url, resp.StatusCode)
+	}
 	return parseProm(resp.Body)
 }
 

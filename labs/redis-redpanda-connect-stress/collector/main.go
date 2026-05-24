@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"syscall"
 	"time"
 )
@@ -56,6 +58,9 @@ func main() {
 	if *tier <= 0 {
 		log.Fatal("--tier required (>0)")
 	}
+	if *mode == "chaos" && *chaosAtS <= 0 {
+		log.Fatal("--chaos-at-s must be > 0 when --mode=chaos")
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -95,14 +100,28 @@ func main() {
 }
 
 func writeJSON(path string, v any) error {
-	f, err := os.Create(path)
+	tmp, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".tmp-*")
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	enc := json.NewEncoder(f)
+	tmpName := tmp.Name()
+	enc := json.NewEncoder(tmp)
 	enc.SetIndent("", "  ")
-	return enc.Encode(v)
+	if err := enc.Encode(v); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpName)
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpName)
+		return err
+	}
+	return os.Rename(tmpName, path)
 }
 
 func Run(ctx context.Context, cfg RunConfig) (Report, error) {
@@ -112,13 +131,25 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 	defer region.Close()
 
 	// 1. Trim streams to zero so we measure only this tier's traffic.
-	_ = central.Trim(ctx, "app.events")
-	_ = region.Trim(ctx, "region-events")
+	if err := central.Trim(ctx, "app.events"); err != nil {
+		return Report{}, fmt.Errorf("trim app.events: %w", err)
+	}
+	if err := region.Trim(ctx, "region-events"); err != nil {
+		return Report{}, fmt.Errorf("trim region-events: %w", err)
+	}
 
 	// 2. Reset writer counters.
 	if err := PostReset(ctx, cfg.WriterURL); err != nil {
 		return Report{}, err
 	}
+
+	// Best-effort pause writer on any return path (success or cancellation).
+	// Uses a fresh background context with timeout so it works even if ctx is cancelled.
+	defer func() {
+		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = PostRate(c, cfg.WriterURL, 0)
+	}()
 
 	// 3. Warmup at half rate.
 	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier/2); err != nil {
@@ -208,25 +239,32 @@ func buildReport(cfg RunConfig, startedAt time.Time, snaps []Snapshot, lat Laten
 		r.MissingPct = float64(r.Missing) / float64(r.Sent) * 100.0
 	}
 
-	// Per-second sent deltas → achieved rate avg/min, central XLen max, NATS pending max.
+	// Per-snapshot rate samples computed from actual wall clock between ticks,
+	// not assumed-1s intervals. Counter resets (negative delta) zero the sample.
 	var minRate float64 = 1e18
 	var sumRate, samples float64
 	var lastSent int64
+	var lastAt time.Time
 	var maxXLen, maxPending int64
 	for i, snap := range snaps {
 		sent := int64(snap.WriterMetrics["stress_writer_sent_total"])
 		if i > 0 {
-			delta := float64(sent - lastSent)
-			if delta < 0 {
-				delta = 0
-			}
-			sumRate += delta
-			samples++
-			if delta < minRate {
-				minRate = delta
+			deltaSec := snap.At.Sub(lastAt).Seconds()
+			if deltaSec > 0 {
+				deltaCount := float64(sent - lastSent)
+				if deltaCount < 0 {
+					deltaCount = 0
+				}
+				rate := deltaCount / deltaSec
+				sumRate += rate
+				samples++
+				if rate < minRate {
+					minRate = rate
+				}
 			}
 		}
 		lastSent = sent
+		lastAt = snap.At
 		if snap.CentralXLen > maxXLen {
 			maxXLen = snap.CentralXLen
 		}
