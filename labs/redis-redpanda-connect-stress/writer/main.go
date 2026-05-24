@@ -30,7 +30,7 @@ func main() {
 	defer rdb.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	defer cancel() // safety net; explicit cancel() in shutdown handler is the live path
 
 	lim := NewLimiter()
 	lim.Set(initialRate)
@@ -89,10 +89,14 @@ func envStr(k, def string) string {
 }
 
 func envInt(k string, def int) int {
-	if v := os.Getenv(k); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
+	v := os.Getenv(k)
+	if v == "" {
+		return def
 	}
-	return def
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		log.Printf("WARN: %s=%q is not a valid int, using default %d", k, v, def)
+		return def
+	}
+	return n
 }

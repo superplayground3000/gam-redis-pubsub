@@ -50,6 +50,10 @@ func (w *Worker) Run(ctx context.Context) {
 		_, err := pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
 		if err != nil {
+			// Conservative semantic: any pipeline error charges the full batch to Errors,
+			// even if some XADDs in the batch may have succeeded. We never inspect per-command
+			// results — the overhead of iterating the response isn't worth the precision for
+			// a stress lab where partial pipeline failures are extremely rare.
 			w.Counters.Errors.Add(int64(w.PipelineDepth))
 			if ctx.Err() == nil {
 				log.Printf("worker %d: pipeline error: %v", w.ID, err)
