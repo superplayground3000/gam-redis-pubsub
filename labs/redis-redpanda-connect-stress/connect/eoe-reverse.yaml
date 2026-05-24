@@ -55,7 +55,7 @@ output:
           url: redis://redis-region:6379
           stream: region-events
           body_key: value
-          max_length: 0
+          max_length: 100000
           max_in_flight: 64
           metadata:
             exclude_prefixes: ["nats_"]

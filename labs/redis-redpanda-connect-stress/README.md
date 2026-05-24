@@ -86,7 +86,9 @@ During the 10 k chaos run, in another shell, `uptime` should show 1-min load ave
 
 ## Known limitations
 
-- **Chaos timing**: the kill is scheduled with bash `sleep`, anchored to harness wall-clock — not the collector's sustain start. Container startup adds ~2 s drift, so the chaos hit lands ~2 s earlier than `DURATION_S/2` into sustain. Acceptable for a 30 s window; if you tighten `DURATION_S` below 15 s the drift matters more.
+- **Chaos timing is anchored to harness wall-clock, not collector sustain start**. There is up to ~3 s of drift due to `docker compose run` container startup. For DURATION_S=30 this is acceptable. If you tighten DURATION_S below 15 s, chaos timing accuracy degrades.
+- **`region-events` stream is now capped at MAXLEN ~ 100000**: messages older than ~30 seconds at 10 k/s get trimmed. This matters only if a chaos outage exceeds ~30 s at 10 k/s — then the region tail can be lost. For DURATION_S=30 + CHAOS_DOWN_S=8 it's never a problem.
+- **`CHAOS_DOWN_S` is the scripted sleep, not the true outage**: actual `connect-sink` unavailability also includes `docker stop` shutdown time (~1 s) + `docker start` + healthcheck readiness (~3-5 s). The chaos script now waits for the healthy status before returning, so the harness's chaos-window measurement is consistent — but the *reported* `down_at_s` in the JSON report reflects the harness wall-clock decision point, not the precise outage span.
 - **JetStream stream config is sticky**: `nats-init` skips `stream add` if `APP_EVENTS` already exists. If you change `--max-bytes` in the compose file, run `docker compose down -v` to clear the named volume before restarting.
 - **Connect Prometheus metrics**: the collector sums across all label variants of a given metric. If Redpanda Connect adds new labeled dimensions in a future version, totals stay correct.
 

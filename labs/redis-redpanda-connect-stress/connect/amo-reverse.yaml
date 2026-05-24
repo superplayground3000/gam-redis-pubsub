@@ -4,7 +4,7 @@
 #   - `deliver: new` -> on reconnect a fresh ephemeral consumer skips the
 #     backlog accumulated during the outage.
 # Net effect: messages produced while connect-sink was down NEVER reach
-# region-events. compare-streams.sh will report missing > 0 after a drill.
+# region-events. AMO silently drops messages produced during the outage.
 
 http:
   address: 0.0.0.0:4195
@@ -42,7 +42,7 @@ output:
           url: redis://redis-region:6379
           stream: region-events
           body_key: value
-          max_length: 0
+          max_length: 100000
           max_in_flight: 64
           metadata:
             exclude_prefixes: ["nats_"]
