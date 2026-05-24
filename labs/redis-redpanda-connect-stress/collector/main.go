@@ -248,7 +248,11 @@ func buildReport(cfg RunConfig, startedAt time.Time, snaps []Snapshot, lat Laten
 	var maxXLen, maxPending int64
 	for i, snap := range snaps {
 		sent := int64(snap.WriterMetrics["stress_writer_sent_total"])
-		if i > 0 {
+		// Only count snapshots while the writer's rate_target matches the tier (i.e.
+		// during sustain). Drain-window snapshots have rate_target=0 and would otherwise
+		// pull the average down toward zero.
+		rateTarget := int(snap.WriterMetrics["stress_writer_rate_target"])
+		if i > 0 && rateTarget == cfg.Tier {
 			deltaSec := snap.At.Sub(lastAt).Seconds()
 			if deltaSec > 0 {
 				deltaCount := float64(sent - lastSent)

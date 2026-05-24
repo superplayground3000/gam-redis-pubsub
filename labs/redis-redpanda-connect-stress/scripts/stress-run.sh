@@ -96,7 +96,9 @@ print(b)')
   fi
 
   echo "[run] tier=${tier} mode=${mode} profile=${PROFILE}"
+  # Run collector as the host user so report files land owned by the invoking user.
   PROFILE_QOS="${PROFILE}" docker compose --profile tools run --rm \
+    --user "$(id -u):$(id -g)" \
     collector \
       --tier="${tier}" --mode="${mode}" --profile="${PROFILE}" \
       --duration="${DURATION_S}s" --warmup="${WARMUP_S}s" --drain="${DRAIN_S}s" \

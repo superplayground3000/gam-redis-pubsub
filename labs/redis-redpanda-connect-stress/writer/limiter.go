@@ -23,9 +23,13 @@ func NewLimiter() *Limiter {
 	return l
 }
 
-// Set updates the rate to rps events/sec. rps=0 pauses the writer: workers
-// drain the burst (~100 tokens) then block on WaitN until Set is called with a
-// non-zero rate. Burst is floored at 100 to prevent warmup ramps from starving workers.
+// Set updates the rate to rps events/sec via SetLimit/SetBurst on the underlying
+// limiter. rps=0 pauses the writer: any workers already mid-WaitN see an "exceed
+// deadline" error (returned because the wait would be infinite with limit=0).
+// Worker.Run uses a 500ms per-call timeout so those errors are retried rather than
+// fatal; that same timeout also forces workers to refresh their view of the limiter
+// state quickly when Set transitions from 0 → N>0. Burst is floored at 100 to
+// prevent warmup ramps from starving workers.
 func (l *Limiter) Set(rps int) {
 	b := 100
 	if rps/10 > b {
