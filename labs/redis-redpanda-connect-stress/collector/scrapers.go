@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -43,14 +44,14 @@ func parseProm(r io.Reader) (map[string]float64, error) {
 		if i := strings.IndexByte(name, '{'); i >= 0 {
 			name = name[:i]
 		}
-		if _, dup := out[name]; dup {
-			continue
-		}
 		v, err := strconv.ParseFloat(fields[1], 64)
 		if err != nil {
 			continue
 		}
-		out[name] = v
+		// Sum across all label variants of the same bare metric name.
+		// Redpanda Connect emits e.g. input_received{label="..."} per component;
+		// we want the total, not the first one seen.
+		out[name] += v
 	}
 	return out, scn.Err()
 }
@@ -58,7 +59,7 @@ func parseProm(r io.Reader) (map[string]float64, error) {
 // PostRate calls POST /rate {rate: n} on the writer.
 func PostRate(ctx context.Context, writerURL string, n int) error {
 	body, _ := json.Marshal(map[string]int{"rate": n})
-	req, _ := http.NewRequestWithContext(ctx, "POST", writerURL+"/rate", strings.NewReader(string(body)))
+	req, _ := http.NewRequestWithContext(ctx, "POST", writerURL+"/rate", bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {

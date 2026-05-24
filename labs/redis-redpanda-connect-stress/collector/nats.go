@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 )
 
@@ -43,12 +44,16 @@ func ScrapeJSZ(ctx context.Context, baseURL, streamName string) (NATSSnap, error
 	if err := json.NewDecoder(resp.Body).Decode(&ar); err != nil {
 		return NATSSnap{}, err
 	}
-	var s NATSSnap
+	var (
+		s     NATSSnap
+		found bool
+	)
 	for _, acc := range ar.AccountDetails {
 		for _, st := range acc.StreamDetail {
 			if st.Name != streamName {
 				continue
 			}
+			found = true
 			s.Messages = st.State.Messages
 			s.Bytes = st.State.Bytes
 			for _, c := range st.ConsumerDetail {
@@ -57,6 +62,9 @@ func ScrapeJSZ(ctx context.Context, baseURL, streamName string) (NATSSnap, error
 				}
 			}
 		}
+	}
+	if !found {
+		return s, fmt.Errorf("stream %q not found in /jsz response", streamName)
 	}
 	return s, nil
 }

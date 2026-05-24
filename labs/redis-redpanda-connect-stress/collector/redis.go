@@ -20,6 +20,8 @@ func (s *StreamClient) XLen(ctx context.Context, key string) (int64, error) {
 	return s.rdb.XLen(ctx, key).Result()
 }
 
+// Trim flushes the stream entirely by trimming it to MAXLEN 0.
+// Used at the start of each tier run to reset the source/region streams.
 func (s *StreamClient) Trim(ctx context.Context, key string) error {
 	return s.rdb.XTrimMaxLen(ctx, key, 0).Err()
 }

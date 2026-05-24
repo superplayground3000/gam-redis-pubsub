@@ -35,6 +35,9 @@ func (s *Sampler) Tick(ctx context.Context) Snapshot {
 	c, cancel := context.WithTimeout(ctx, 1500*time.Millisecond)
 	defer cancel()
 
+	// Writer scrape errors are logged because the writer is the lab's source of truth;
+	// connect-src/sink and infra errors below are intentionally swallowed — at 1Hz during
+	// chaos drills they would flood logs, and the report will show 0/nil for that tick.
 	if m, err := scrapePromMetrics(c, s.WriterURL+"/metrics"); err == nil {
 		snap.WriterMetrics = m
 	} else {
