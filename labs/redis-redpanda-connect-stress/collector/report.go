@@ -47,4 +47,7 @@ type Report struct {
 	Chaos           *ChaosInfo     `json:"chaos"`
 	SLO             SLO            `json:"slo"`
 	Verdict         Verdict        `json:"verdict"`
+	ReceivedErrors    int64 `json:"received_errors"`
+	Trimmed           int64 `json:"trimmed"`
+	QuiescenceTimeout bool  `json:"quiescence_timeout"`
 }

@@ -27,6 +27,9 @@ func TestReportJSONShape(t *testing.T) {
 		Chaos:           nil,
 		SLO:             SLO{RateMinPct: 0.95, LatencyP99Ms: 1000},
 		Verdict:         Verdict{Pass: true, Checks: map[string]bool{"rate_ok": true, "missing_ok": true, "latency_p99_ok": true}},
+		ReceivedErrors:    7,
+		Trimmed:           225000,
+		QuiescenceTimeout: false,
 	}
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
@@ -40,6 +43,9 @@ func TestReportJSONShape(t *testing.T) {
 		`"latency_ms": {`,
 		`"chaos": null`,
 		`"pass": true`,
+		`"received_errors": 7`,
+		`"trimmed": 225000`,
+		`"quiescence_timeout": false`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q in:\n%s", want, s)
