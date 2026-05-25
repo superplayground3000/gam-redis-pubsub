@@ -24,8 +24,6 @@ type Sampler struct {
 	NATSStream   string
 	Central      *StreamClient
 	Region       *StreamClient
-	Latency      *LatencyTracker // DEPRECATED — Task 9 removes; receiver owns latency now
-	LastRegionID string          // DEPRECATED — Task 9 removes
 }
 
 // Tick takes a single snapshot of all instrumented services.
@@ -61,7 +59,3 @@ func (s *Sampler) Tick(ctx context.Context) Snapshot {
 	return snap
 }
 
-// Init is a transitional no-op kept for v1-compatibility during the v2 receiver
-// migration. Task 9 of the v2 plan removes the last call site, after which this
-// method can be deleted entirely.
-func (s *Sampler) Init() {}

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -130,7 +131,7 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 	region := NewStreamClient(cfg.RedisRegion)
 	defer region.Close()
 
-	// 1. Trim streams to zero so we measure only this tier's traffic.
+	// 1+2. Trim streams to zero so we measure only this tier's traffic.
 	if err := central.Trim(ctx, "app.events"); err != nil {
 		return Report{}, fmt.Errorf("trim app.events: %w", err)
 	}
@@ -138,26 +139,38 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		return Report{}, fmt.Errorf("trim region-events: %w", err)
 	}
 
-	// 2. Reset writer counters.
+	// 3. Reset writer counters.
 	if err := PostReset(ctx, cfg.WriterURL); err != nil {
 		return Report{}, err
 	}
 
-	// Best-effort pause writer on any return path (success or cancellation).
-	// Uses a fresh background context with timeout so it works even if ctx is cancelled.
+	// Best-effort pause writer on any return path.
 	defer func() {
 		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = PostRate(c, cfg.WriterURL, 0)
 	}()
 
-	// 3. Warmup at half rate.
+	// 4-6. Start the receiver — single goroutine, joined via WaitGroup.
+	receiver := NewReceiver(cfg.RedisRegion, "region-events")
+	defer receiver.Close()
+	receiverCtx, cancelRecv := context.WithCancel(ctx)
+	defer cancelRecv() // safety net; explicit cancel below is the live path
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		receiver.Run(receiverCtx)
+	}()
+
+	// 7. Warmup at half rate.
 	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier/2); err != nil {
 		return Report{}, err
 	}
 	sleep(ctx, cfg.Warmup)
 
-	// 4. Sustain at full rate.
+	// 8. Sustain at full rate.
 	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier); err != nil {
 		return Report{}, err
 	}
@@ -167,9 +180,7 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		ConnectSink: cfg.ConnectSink, NATSURL: cfg.NATSURL,
 		NATSStream: cfg.NATSStream,
 		Central:    central, Region: region,
-		Latency: NewLatencyTracker(),
 	}
-	sampler.Init()
 
 	startedAt := time.Now()
 	sustainEnd := startedAt.Add(cfg.Duration)
@@ -178,7 +189,6 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 	defer ticker.Stop()
 
 	var snaps []Snapshot
-	// Sustain window
 	for time.Now().Before(sustainEnd) {
 		select {
 		case <-ctx.Done():
@@ -188,10 +198,11 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		}
 	}
 
-	// 5. Drain.
+	// 9. Drain.
 	if err := PostRate(ctx, cfg.WriterURL, 0); err != nil {
 		return Report{}, err
 	}
+	// 10. drain ticker loop.
 	drainEnd := time.Now().Add(cfg.Drain)
 	for time.Now().Before(drainEnd) {
 		select {
@@ -202,29 +213,59 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		}
 	}
 
-	// 6. Final snapshot
+	// 11. Pipeline quiescence (profile-aware).
+	quiescenceTimedOut := waitForPipelineQuiescence(
+		ctx, cfg.Profile, central, cfg.NATSURL, cfg.NATSStream, 10*time.Second)
+
+	// 12. Tail-flush window for the receiver.
+	sleep(ctx, 500*time.Millisecond)
+
+	// Final tick to capture post-drain snapshot fields (Sent, Errors, Connect, NATS.Bytes).
 	final := sampler.Tick(ctx)
 	snaps = append(snaps, final)
 
-	return buildReport(cfg, startedAt, snaps, sampler.Latency.Summary()), nil
+	// 13. Cancel receiver; 14. wait for it to fully exit.
+	cancelRecv()
+	wg.Wait()
+
+	// 15. Synchronized end-of-run XLEN cut for trimmed math.
+	finalRegionXLen := readFinalRegionXLen(ctx, region, snaps)
+
+	// 16. Build report.
+	return buildReport(cfg, startedAt, snaps, receiver, finalRegionXLen, quiescenceTimedOut), nil
 }
 
-func buildReport(cfg RunConfig, startedAt time.Time, snaps []Snapshot, lat LatencySummary) Report {
+func buildReport(
+	cfg RunConfig,
+	startedAt time.Time,
+	snaps []Snapshot,
+	receiver *Receiver,
+	finalRegionXLen int64,
+	quiescenceTimedOut bool,
+) Report {
 	r := Report{
 		Tier: cfg.Tier, Mode: cfg.Mode, Profile: cfg.Profile,
 		StartedAt: startedAt, DurationS: int(cfg.Duration.Seconds()),
 		RateTarget: cfg.Tier,
-		Latency:    lat,
+		Latency:    receiver.Latency(),
 		SLO:        cfg.SLO,
 	}
 
-	// Sent + errors are end-of-run values from the last snapshot.
+	// Sent + errors + Connect + NATS.Bytes are end-of-run values from the last snapshot.
+	// Received is sourced from the streaming receiver, not the snapshot XLEN — receiver
+	// is untainted by region-events MAXLEN trimming.
+	r.Received = receiver.Count()
+	r.ReceivedErrors = receiver.Errors()
+	r.QuiescenceTimeout = quiescenceTimedOut
+	r.Redis.RegionXLenFinal = finalRegionXLen
+	r.Trimmed = r.Received - r.Redis.RegionXLenFinal
+	if r.Trimmed < 0 {
+		r.Trimmed = 0
+	}
 	if len(snaps) > 0 {
 		last := snaps[len(snaps)-1]
 		r.Sent = int64(last.WriterMetrics["stress_writer_sent_total"])
 		r.Errors = int64(last.WriterMetrics["stress_writer_errors_total"])
-		r.Received = last.RegionXLen
-		r.Redis.RegionXLenFinal = last.RegionXLen
 		r.Connect.SourceIn = int64(last.ConnectSrc["input_received"])
 		r.Connect.SourceOut = int64(last.ConnectSrc["output_sent"])
 		r.Connect.SinkIn = int64(last.ConnectSink["input_received"])
