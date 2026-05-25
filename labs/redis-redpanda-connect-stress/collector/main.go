@@ -308,3 +308,32 @@ func sleep(ctx context.Context, d time.Duration) {
 	case <-time.After(d):
 	}
 }
+
+// readFinalRegionXLen returns XLEN("region-events") with bounded retries.
+// On persistent failure it falls back to the last snapshot's RegionXLen so
+// that a transient Redis hiccup at end-of-run never corrupts the trimmed
+// math by leaving finalRegionXLen at zero. The fallback value is at most
+// one snapshot tick (~1s) stale. See spec §6.4.
+func readFinalRegionXLen(ctx context.Context, region xlenReader, snaps []Snapshot) int64 {
+	const attempts = 3
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		if x, err := region.XLen(ctx, "region-events"); err == nil {
+			return x
+		} else {
+			lastErr = err
+		}
+		if ctx.Err() != nil {
+			break
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	log.Printf("WARN: final XLEN(region-events) failed after %d attempts: %v; falling back to last snapshot", attempts, lastErr)
+	if len(snaps) > 0 {
+		return snaps[len(snaps)-1].RegionXLen
+	}
+	return 0
+}
