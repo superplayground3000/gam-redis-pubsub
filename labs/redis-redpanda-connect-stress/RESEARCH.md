@@ -44,3 +44,21 @@ A run passes iff: achieved rate ≥ `slo.rate_min_pct × target`, missing messag
 - Redpanda Connect docs: <https://docs.redpanda.com/redpanda-connect/about/>
 - NATS JetStream concepts: <https://docs.nats.io/nats-concepts/jetstream>
 - HDR Histogram: <https://github.com/HdrHistogram/hdrhistogram-go>
+
+## v2 measurement-vs-pipeline distinction
+
+The first v1 full-matrix run on 2026-05-25 revealed that three of the lab's "failures" were measurement artifacts, not pipeline failures:
+
+1. **Latency P99 was polling-window-biased.** v1 sampled 200 messages/s from `XRANGE`; at 10 k msg/s that captured ~2 % of messages and the reported `now − ts_ns` was inflated by up to one polling window (~1 s). v2's streaming `XREAD BLOCK` consumer reads every message at line rate, so `latency_ms.p99` now reflects true e2e propagation.
+2. **`missing` confused MAXLEN trim with loss.** v1 computed `missing = sent − XLEN(region-events)`. The region stream has `MAXLEN ~ 100000`; at 10 k × 30 s, 200 k older entries were trimmed by design. v1 reported them as "missing" and failed the verdict. v2 sources `received` from the streaming consumer (untainted) and surfaces `trimmed` separately so operators can see the storage decision didn't lose messages.
+3. **NATS state survived across matrix runs.** v1 ran 9 tier×mode combinations against the same persistent `nats-data` volume; the 256 MB JetStream cap accumulated bytes until the 10 k chaos run aborted on the 200 MB pre-flight. v2's harness purges `APP_EVENTS` after every run so each tier starts hermetic.
+
+The pipeline under test (writer → connect-source → JetStream → connect-sink → region Redis) is byte-identical between v1 and v2. The only changes are in the measurement layer (collector) and the harness's between-run hygiene.
+
+### Why a streaming consumer (not just a bigger XRANGE)
+
+A poll that samples 1 000 messages/s instead of 200 would still miss 90 % of messages at 10 k msg/s, and its reported "latency" would still include polling-window bias. The streaming model is the only one that observes *every* message at arrival time, which is both the right metric and a side benefit: the same consumer that records latency also provides the trim-free `received` count.
+
+### Why profile-aware quiescence
+
+The amo-reverse leg uses an ephemeral, deliver-new, `ack_wait: 2s`, `auto_replay_nacks: false` consumer. `num_pending` is meaningless for that consumer (it's recreated each connect-sink restart and ignores backlog by design — that's how AMO loses messages). v2's pipeline-quiescence wait checks `XLEN(app.events) == 0` for all profiles plus `NATS num_pending == 0` only for ALO/EOE; AMO falls through to `slo.allow_missing=true` so any unconsumed backlog at end-of-run is accepted as the modeled loss.
