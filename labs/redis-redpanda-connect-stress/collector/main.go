@@ -216,9 +216,15 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 	// 11. Pipeline quiescence (profile-aware).
 	quiescenceTimedOut := waitForPipelineQuiescence(
 		ctx, cfg.Profile, central, cfg.NATSURL, cfg.NATSStream, 10*time.Second)
+	if ctx.Err() != nil {
+		return Report{}, ctx.Err()
+	}
 
 	// 12. Tail-flush window for the receiver.
 	sleep(ctx, 500*time.Millisecond)
+	if ctx.Err() != nil {
+		return Report{}, ctx.Err()
+	}
 
 	// Final tick to capture post-drain snapshot fields (Sent, Errors, Connect, NATS.Bytes).
 	final := sampler.Tick(ctx)
