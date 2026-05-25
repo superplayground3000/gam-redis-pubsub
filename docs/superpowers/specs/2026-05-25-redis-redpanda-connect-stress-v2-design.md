@@ -151,33 +151,57 @@ func (r *Receiver) Run(ctx context.Context) {
 
 ## 6. Receiver lifecycle in `Run` (main.go)
 
+The lifecycle is precisely sequenced because the `trimmed` math (§7) requires a synchronized end-of-run cut between `receiver.Count()` and final `XLEN(region-events)`, and because per-run isolation requires explicit quiescence boundaries (see §6.3).
+
 ```
-1. Trim app.events                      (existing)
-2. Trim region-events                   (existing)
-3. PostReset                            (existing)
-4. receiver := NewReceiver(...)         (NEW)
-5. receiverCtx, cancelRecv := WithCancel(ctx)
-6. go receiver.Run(receiverCtx)         (NEW)
-7. PostRate(tier/2); sleep(warmup)      (existing)
-8. PostRate(tier); sustain ticker loop  (existing)
-9. PostRate(0); drain ticker loop       (existing)
-10. time.Sleep(500ms)                   (NEW — last-chance tail flush)
-11. cancelRecv()                        (NEW)
-12. wait for receiver.Run to return     (NEW — see §6.1)
-13. buildReport(...receiver...)         (modified)
+ 1. Trim app.events                                            (existing)
+ 2. Trim region-events                                         (existing)
+ 3. PostReset                                                  (existing)
+ 4. receiver := NewReceiver(...)                               (NEW)
+ 5. receiverCtx, cancelRecv := WithCancel(ctx)
+ 6. go receiver.Run(receiverCtx)                               (NEW)
+ 7. PostRate(tier/2); sleep(warmup)                            (existing)
+ 8. PostRate(tier); sustain ticker loop (1 Hz snaps)           (existing)
+ 9. PostRate(0)                                                (existing)
+10. drain ticker loop for DRAIN_S seconds (1 Hz snaps)         (existing)
+11. waitForSourceQuiescence(ctx, central, "app.events", 5s)    (NEW — §6.3)
+12. time.Sleep(500ms)  // tail-flush window for receiver        (NEW — §6.2)
+13. cancelRecv()                                               (NEW)
+14. wg.Wait() — receiver goroutine has fully exited            (NEW — §6.1)
+15. finalRegionXLen := region.XLen("region-events")            (NEW — §6.4)
+16. buildReport(... receiver.Count(), receiver.Latency(),
+                ... finalRegionXLen ...)                       (modified)
 ```
+
+After step 16 the collector writes JSON and exits. The harness then runs `nats stream purge APP_EVENTS` (see §9). This ordering is critical: the purge happens *after* the JSON report is final, and the next run's step 1+2 trims source/region streams *before* its receiver starts.
 
 ### 6.1 Receiver goroutine join
 
-`receiver.Run` is wrapped in a `sync.WaitGroup` so step 12 is `wg.Wait()`. This guarantees no in-flight `XREAD` is still running when `buildReport` reads `receiver.Count()` / `receiver.Latency()`, eliminating a TOCTOU race where the count could change between read and report.
+`receiver.Run` is wrapped in a `sync.WaitGroup`; step 14 is `wg.Wait()`. After this returns, no `XREAD` call is in flight and no further writes to `receiver.received` / `receiver.latency` will happen. Subsequent reads of `receiver.Count()` and `receiver.Latency()` are race-safe by happens-before from the WaitGroup release.
 
-### 6.2 Why 500 ms post-drain sleep
+### 6.2 Tail-flush window (step 12)
 
-`XREAD BLOCK 250ms` means the receiver checks for new messages roughly every 250 ms. If a message lands in `region-events` at drain-end and we cancel immediately, the receiver might exit before its next XREAD cycle picks it up. Sleeping 500 ms (= 2× block window) gives the receiver one more guaranteed cycle before cancellation.
+`XREAD BLOCK 250ms` means the receiver checks for new messages roughly every 250 ms. If a message lands in `region-events` at the very end of drain and we cancel immediately, the receiver might exit before its next XREAD cycle picks it up. Sleeping 500 ms (= 2× block window) before cancellation guarantees at least one more receiver cycle.
+
+The 500 ms is sized against the **receiver's block window**, not against pipeline propagation. Pipeline-side tail latency is bounded by §6.3 quiescence (which waits for source-side drain) plus §6.2 tail-flush (which waits for the receiver to see those drained messages).
+
+### 6.3 Source-side quiescence (step 11)
+
+Before declaring "drain complete," poll `XLEN(app.events)` until it reaches 0 or a 5 s timeout fires. This proves the writer's last messages have been pulled by connect-source and forwarded to JetStream. Without this, the run could declare end-of-run while messages are still working through the pipeline — those late deliveries would either be missed by the receiver (if they arrive after `wg.Wait`) or be counted but with no corresponding XLEN snapshot to derive `trimmed`.
+
+The 5 s timeout is a safety bound; healthy steady-state drain at 10 k msg/s clears the central stream in well under 1 s once `PostRate(0)` is sent.
+
+If the timeout fires (central stream still non-empty after 5 s — pipeline stalled), `report.Trimmed` is computed using whatever `region_xlen_final` says, and a new `report.QuiescenceTimeout: true` boolean is set so operators see the bound was hit. The verdict is unaffected (a stalled pipeline already shows up as `missing > 0`).
+
+### 6.4 Synchronized end-of-run cut (steps 14 → 15)
+
+`finalRegionXLen` is read **after** `wg.Wait()` returns, not from the last 1-Hz snapshot tick. This ensures `receiver.Count()` and `finalRegionXLen` refer to the same moment in time — the moment the receiver stopped reading. The `trimmed = received - finalRegionXLen` formula in §7 is then well-defined.
+
+A small race window remains: between `cancelRecv()` and the underlying Redis stream actually stopping new arrivals, a message could be `XADD`'d by connect-sink and seen in the `XLEN` but not by the receiver. In steady-state this is impossible because `PostRate(0)` has been called and source quiescence has been confirmed; only in pathological "writer still producing" failure modes could it happen, and that is itself a separate failure the verdict will catch via `Sent` divergence.
 
 ## 7. Report semantics changes
 
-### 7.1 Field meaning changes (no schema add/remove yet)
+### 7.1 Field meaning changes (additive only — no removed or renamed fields)
 
 | Field | v1 meaning | v2 meaning |
 |---|---|---|
@@ -190,16 +214,21 @@ func (r *Receiver) Run(ctx context.Context) {
 ```go
 type Report struct {
     ...existing fields...
-    ReceivedErrors  int64 `json:"received_errors"` // transient XREAD errors from receiver
-    Trimmed         int64 `json:"trimmed"`         // = max(0, received - region_xlen_final)
+    ReceivedErrors    int64 `json:"received_errors"`     // transient XREAD errors from receiver
+    Trimmed           int64 `json:"trimmed"`             // = max(0, received - finalRegionXLen)
+    QuiescenceTimeout bool  `json:"quiescence_timeout"`  // true if source-side XLEN didn't hit 0 in §6.3 window
 }
 ```
 
-`trimmed` is informational. It's `received − region_xlen_final`, clamped to `[0, +∞)`. If positive (10 k tier), the report tells operators "this many messages were delivered but trimmed by MAXLEN" — the silent v1 failure mode becomes a visible diagnostic. If zero (low tiers), nothing notable.
+`trimmed` is informational. It's `received − finalRegionXLen`, where `finalRegionXLen` is the post-`wg.Wait` synchronized XLEN cut (§6.4), not the last polling snapshot. Clamped to `[0, +∞)`. If positive (10 k tier), the report says "this many messages were delivered but trimmed by MAXLEN" — the silent v1 failure mode becomes a visible diagnostic. If zero (low tiers), nothing notable.
 
-`received_errors` lets operators see when the receiver itself had trouble (network blip, redis restart during chaos drill). The count is **not** used to compute the verdict.
+`received_errors` lets operators see when the receiver itself had trouble (network blip, redis restart during chaos drill). The count is **not** used to compute the verdict — its purpose is diagnostic, so that an operator looking at a borderline `missing > 0` report can rule out receiver flakiness as the cause.
+
+`quiescence_timeout` is `true` if the §6.3 source-quiescence poll hit its 5 s timeout. In a healthy run it is always `false`; in a stalled pipeline (genuine failure) it is `true` and accompanies a non-zero `missing`.
 
 ### 7.3 `buildReport` changes (collector main.go)
+
+`buildReport` takes one new parameter — `finalRegionXLen int64` — read in step 15 of §6.
 
 Replace:
 ```go
@@ -209,9 +238,10 @@ r.Redis.RegionXLenFinal = last.RegionXLen
 
 With:
 ```go
-r.Received       = receiver.Count()
-r.ReceivedErrors = receiver.Errors()
-r.Redis.RegionXLenFinal = last.RegionXLen
+r.Received          = receiver.Count()
+r.ReceivedErrors    = receiver.Errors()
+r.QuiescenceTimeout = quiescenceTimedOut       // boolean passed in from Run()
+r.Redis.RegionXLenFinal = finalRegionXLen      // synchronized post-receiver-stop XLEN
 r.Trimmed = r.Received - r.Redis.RegionXLenFinal
 if r.Trimmed < 0 {
     r.Trimmed = 0
@@ -249,14 +279,21 @@ type Sampler struct {
 
 ## 9. Harness change (`stress-run.sh`)
 
-In `run_one`, after the `docker compose run --rm collector ...` invocation and after the `wait "${chaos_pid}"` block, add a single line:
+In `run_one`, after the `docker compose run --rm collector ...` invocation has fully exited (the collector has written its JSON report and returned) and after the `wait "${chaos_pid}"` block, add a single line:
 
 ```bash
 docker exec rrcs-nats nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
   || echo "[purge] WARN: nats stream purge APP_EVENTS failed (continuing)" >&2
 ```
 
-The purge is non-fatal. If it fails (first-run state, transient docker exec issue), the pre-flight check on the next run will catch a genuinely-broken NATS state. Quiet output on success.
+The purge runs **after** the collector exit; the collector's §6 lifecycle has by then completed source-side quiescence (§6.3) and recorded a synchronized `finalRegionXLen`. There is no in-flight pipeline traffic at purge time. The purge is non-fatal — if it fails (first-run state, transient docker exec issue), the pre-flight check on subsequent chaos runs will catch a genuinely-broken NATS state.
+
+### 9.1 Per-run isolation guarantee
+
+Combined isolation from steps 1+2 of §6 (trim `app.events` and `region-events` at run start) and the post-collector NATS purge in step 9, each run starts with empty Redis streams and an empty JetStream. The only carryover paths are:
+
+- **Delayed source-side traffic** from a prior run: prevented by the §6.3 quiescence wait in the *prior* run.
+- **In-flight JetStream replication or consumer state**: bounded by JetStream's own consumer durables — since this lab uses a single-replica file-storage stream with a 5-minute dedup window, post-purge any prior-run msg-ID dedup state expires within 5 minutes. For a back-to-back matrix this is plenty of time (one run takes ~45 s).
 
 ### 9.1 What stays
 
