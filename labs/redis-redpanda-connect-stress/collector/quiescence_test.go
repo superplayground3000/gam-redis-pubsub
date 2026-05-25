@@ -49,25 +49,31 @@ func itoa(n int64) string {
 }
 
 // fakeStreamClient is a test-only stand-in for *StreamClient.
-// Implements only the XLen method that waitForPipelineQuiescence and
+// Implements the xlenReader interface that waitForPipelineQuiescence and
 // readFinalRegionXLen (Task 8) require.
-// mu guards lens and err so goroutines in tests can call setXLen concurrently
-// with the polling loop calling XLen.
+// mu guards lens, lags, and err so goroutines in tests can call setXLen/setLag
+// concurrently with the polling loop calling XLen/GroupLag.
 type fakeStreamClient struct {
 	t    *testing.T
 	mu   sync.Mutex
 	lens map[string]int64
+	lags map[string]int64 // keyed by "stream/group"
 	err  error
 }
 
 func newFakeStreamClient(t *testing.T) *fakeStreamClient {
-	return &fakeStreamClient{t: t, lens: map[string]int64{}}
+	return &fakeStreamClient{t: t, lens: map[string]int64{}, lags: map[string]int64{}}
 }
 
 func (f *fakeStreamClient) setXLen(stream string, n int64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lens[stream] = n
+}
+func (f *fakeStreamClient) setLag(stream, group string, n int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lags[stream+"/"+group] = n
 }
 func (f *fakeStreamClient) setError(err error) {
 	f.mu.Lock()
@@ -87,9 +93,21 @@ func (f *fakeStreamClient) XLen(ctx context.Context, key string) (int64, error) 
 	return f.lens[key], nil
 }
 
+func (f *fakeStreamClient) GroupLag(ctx context.Context, stream, group string) (int64, error) {
+	if ctx.Err() != nil {
+		return 0, ctx.Err()
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.err != nil {
+		return 0, f.err
+	}
+	return f.lags[stream+"/"+group], nil
+}
+
 func TestWaitQuiescenceAloReturnsFalseWhenBothQueuesDrain(t *testing.T) {
 	central := newFakeStreamClient(t)
-	central.setXLen("app.events", 5)
+	central.setLag("app.events", "propagator", 5)
 	pending := &atomic.Int64{}
 	pending.Store(3)
 	srv := jszServer(t, pending)
@@ -97,7 +115,7 @@ func TestWaitQuiescenceAloReturnsFalseWhenBothQueuesDrain(t *testing.T) {
 
 	go func() {
 		time.Sleep(400 * time.Millisecond)
-		central.setXLen("app.events", 0)
+		central.setLag("app.events", "propagator", 0)
 		pending.Store(0)
 	}()
 
@@ -111,7 +129,7 @@ func TestWaitQuiescenceAloReturnsFalseWhenBothQueuesDrain(t *testing.T) {
 
 func TestWaitQuiescenceAloReturnsTrueWhenSourceStuck(t *testing.T) {
 	central := newFakeStreamClient(t)
-	central.setXLen("app.events", 100)
+	central.setLag("app.events", "propagator", 100)
 	pending := &atomic.Int64{}
 	pending.Store(0)
 	srv := jszServer(t, pending)
@@ -127,7 +145,7 @@ func TestWaitQuiescenceAloReturnsTrueWhenSourceStuck(t *testing.T) {
 
 func TestWaitQuiescenceAloReturnsTrueWhenSinkStuck(t *testing.T) {
 	central := newFakeStreamClient(t)
-	central.setXLen("app.events", 0)
+	central.setLag("app.events", "propagator", 0)
 	pending := &atomic.Int64{}
 	pending.Store(50)
 	srv := jszServer(t, pending)
@@ -143,7 +161,7 @@ func TestWaitQuiescenceAloReturnsTrueWhenSinkStuck(t *testing.T) {
 
 func TestWaitQuiescenceAmoSkipsPendingCheck(t *testing.T) {
 	central := newFakeStreamClient(t)
-	central.setXLen("app.events", 0)
+	central.setLag("app.events", "propagator", 0)
 	pending := &atomic.Int64{}
 	pending.Store(9999) // would stall ALO/EOE; AMO must ignore.
 	srv := jszServer(t, pending)
@@ -159,7 +177,7 @@ func TestWaitQuiescenceAmoSkipsPendingCheck(t *testing.T) {
 
 func TestWaitQuiescenceAmoStillRequiresSourceDrain(t *testing.T) {
 	central := newFakeStreamClient(t)
-	central.setXLen("app.events", 7)
+	central.setLag("app.events", "propagator", 7)
 	pending := &atomic.Int64{}
 	pending.Store(0)
 	srv := jszServer(t, pending)

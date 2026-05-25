@@ -10,6 +10,7 @@ import (
 // Defining it as an interface lets quiescence_test.go pass a fake without a real Redis.
 type xlenReader interface {
 	XLen(ctx context.Context, key string) (int64, error)
+	GroupLag(ctx context.Context, stream, group string) (int64, error)
 }
 
 // waitForPipelineQuiescence polls every 250 ms until either the profile-specific
@@ -37,8 +38,10 @@ func waitForPipelineQuiescence(
 			log.Printf("WARN: pipeline did not quiesce within %s (profile=%s)", deadline, profile)
 			return true
 		}
+		// Source is quiesced when the consumer group has read every entry in app.events.
+		// Note: Redis streams don't shrink on ack, so XLEN is not the right metric here.
 		sourceOK := false
-		if x, err := central.XLen(ctx, "app.events"); err == nil && x == 0 {
+		if lag, err := central.GroupLag(ctx, "app.events", "propagator"); err == nil && lag == 0 {
 			sourceOK = true
 		}
 		sinkOK := true
