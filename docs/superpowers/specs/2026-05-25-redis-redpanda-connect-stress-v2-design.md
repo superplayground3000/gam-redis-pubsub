@@ -164,15 +164,14 @@ The lifecycle is precisely sequenced because the `trimmed` math (§7) requires a
  8. PostRate(tier); sustain ticker loop (1 Hz snaps)           (existing)
  9. PostRate(0)                                                (existing)
 10. drain ticker loop for DRAIN_S seconds (1 Hz snaps)         (existing)
-11. waitForPipelineQuiescence(ctx, 10s)                        (NEW — §6.3)
-       - poll XLEN(app.events) == 0          (source drained)
-       - poll NATS num_pending == 0          (sink drained)
+11. quiescenceTimedOut := waitForPipelineQuiescence(            (NEW — §6.3)
+                            ctx, cfg.Profile, 10*time.Second)
 12. time.Sleep(500ms)  // tail-flush window for receiver        (NEW — §6.2)
 13. cancelRecv()                                               (NEW)
 14. wg.Wait() — receiver goroutine has fully exited            (NEW — §6.1)
-15. finalRegionXLen := region.XLen("region-events")            (NEW — §6.4)
-16. buildReport(... receiver.Count(), receiver.Latency(),
-                ... finalRegionXLen ...)                       (modified)
+15. finalRegionXLen := region.XLen(ctx, "region-events")       (NEW — §6.4)
+16. buildReport(cfg, startedAt, snaps, receiver,
+                finalRegionXLen, quiescenceTimedOut)            (modified)
 ```
 
 After step 16 the collector writes JSON and exits. The harness then runs `nats stream purge APP_EVENTS` (see §9). This ordering is critical: the purge happens *after* the JSON report is final, and the next run's step 1+2 trims source/region streams *before* its receiver starts.
@@ -191,11 +190,28 @@ The 500 ms is sized against the **receiver's block window**, not against pipelin
 
 Before declaring "drain complete," wait for the pipeline to be empty. What "empty" means depends on the QoS profile — see §6.3.1 for the profile-aware ruleset.
 
-The quiescence check polls every 250 ms with a 10 s total deadline, returning success when its profile-specific condition holds for one consecutive poll. The collector knows the profile from its `--profile` flag (already in `RunConfig.Profile`).
+**Function signature:**
+
+```go
+// waitForPipelineQuiescence polls every 250 ms until either:
+//   - the profile-specific quiescence condition (§6.3.1) holds for one poll, OR
+//   - deadline elapses.
+// Returns true if the deadline fired (the pipeline did not quiesce in time),
+// false if quiescence was observed.
+func waitForPipelineQuiescence(
+    ctx context.Context,
+    profile string,
+    central *StreamClient,
+    natsURL, natsStream string,
+    deadline time.Duration,
+) (timedOut bool)
+```
+
+The function lives in collector/main.go alongside `Run` (or a sibling file `quiescence.go` — implementation choice, not a spec constraint). It uses the existing `central.XLen` and `ScrapeJSZ` helpers; no new infrastructure.
 
 The 10 s deadline accommodates the worst-case ALO/EOE chaos drill: ~80 k messages backlogged in NATS at 10 k tier × 8 s outage, draining at ~10 k msg/s after `connect-sink` restarts = ~8 s. Steady-state drain finishes in well under 1 s for any profile.
 
-If the deadline fires, `report.QuiescenceTimeout: true` is set, `finalRegionXLen` is read anyway, and the report is written. The verdict is unaffected by the timeout itself — a genuine pipeline failure shows up as `missing > 0` for ALO/EOE, and for AMO `missing > 0` is allowed by the SLO.
+If the deadline fires, the function returns `timedOut=true`. The caller stores this in `quiescenceTimedOut` (lifecycle step 11), proceeds to steps 12–15 anyway (the receiver is canceled, `finalRegionXLen` is read, the report is written). The verdict itself is unaffected by `quiescence_timeout` — a genuine pipeline failure already shows up as `missing > 0` for ALO/EOE, and for AMO `missing > 0` is allowed by the SLO.
 
 #### 6.3.1 Profile-aware quiescence conditions
 
@@ -214,7 +230,12 @@ The §9 NATS purge happens after the collector exits, regardless of profile. For
 
 `finalRegionXLen` is read **after** `wg.Wait()` returns, not from the last 1-Hz snapshot tick. This ensures `receiver.Count()` and `finalRegionXLen` refer to the same moment in time — the moment the receiver stopped reading. The `trimmed = received - finalRegionXLen` formula in §7 is then well-defined.
 
-A small race window remains: between `cancelRecv()` and the underlying Redis stream actually stopping new arrivals, a message could be `XADD`'d by connect-sink and seen in the `XLEN` but not by the receiver. In steady-state this is impossible because `PostRate(0)` has been called and source quiescence has been confirmed; only in pathological "writer still producing" failure modes could it happen, and that is itself a separate failure the verdict will catch via `Sent` divergence.
+A residual race window between `cancelRecv()` and `XLen("region-events")` is possible if `connect-sink` writes to `region-events` after we cancel the receiver but before we read `XLEN`. The size of this window varies by profile:
+
+- **ALO/EOE**: §6.3 quiescence has confirmed `num_pending == 0` and source `XLEN == 0`. There is no in-flight JetStream message that could result in a late `XADD` to `region-events`. The race window is bounded only by Redis command-pipeline latency between cancelRecv and XLen (< 1 ms). Negligible.
+- **AMO**: §6.3 confirmed only source `XLEN == 0`. The AMO ephemeral consumer can still be processing the last few messages that connect-source published just before source quiescence. Those messages may land in `region-events` after `cancelRecv()` but before the `XLEN` read, inflating `finalRegionXLen` relative to `receiver.Count()` by a small number (≤ Connect's `max_in_flight: 64`). This makes `trimmed` clamp to 0 (correct — no trim happened) and inflates `missing` by the same small number. Since AMO's verdict allows `missing > 0`, the report's PASS/FAIL outcome is unaffected; only the precise missing-count is slightly noisier. The noise floor is the AMO consumer's `max_in_flight` of 64, well below any tier's expected loss magnitude.
+
+Both regimes converge to "trimmed math is correct or harmlessly conservative; verdict is unaffected." No further synchronization is needed.
 
 ## 7. Report semantics changes
 
@@ -245,26 +266,50 @@ type Report struct {
 
 ### 7.3 `buildReport` changes (collector main.go)
 
-`buildReport` takes one new parameter — `finalRegionXLen int64` — read in step 15 of §6.
+**Signature changes** from v1 to v2:
 
-Replace:
 ```go
-r.Received = last.RegionXLen
-r.Redis.RegionXLenFinal = last.RegionXLen
+// v1
+func buildReport(cfg RunConfig, startedAt time.Time, snaps []Snapshot, lat LatencySummary) Report
+
+// v2
+func buildReport(
+    cfg RunConfig,
+    startedAt time.Time,
+    snaps []Snapshot,
+    receiver *Receiver,           // NEW — source of truth for received-count and latency
+    finalRegionXLen int64,        // NEW — synchronized §6.4 cut
+    quiescenceTimedOut bool,      // NEW — propagated to report.QuiescenceTimeout
+) Report
 ```
 
-With:
+The `lat LatencySummary` parameter is removed because the sampler no longer tracks latency in v2; `receiver.Latency()` replaces it.
+
+**Body changes**: replace this block from v1
 ```go
-r.Received          = receiver.Count()
-r.ReceivedErrors    = receiver.Errors()
-r.QuiescenceTimeout = quiescenceTimedOut       // boolean passed in from Run()
-r.Redis.RegionXLenFinal = finalRegionXLen      // synchronized post-receiver-stop XLEN
+last := snaps[len(snaps)-1]
+r.Received = last.RegionXLen
+r.Redis.RegionXLenFinal = last.RegionXLen
+// ... (lat parameter used later for r.Latency)
+```
+
+with
+```go
+r.Received             = receiver.Count()
+r.ReceivedErrors       = receiver.Errors()
+r.QuiescenceTimeout    = quiescenceTimedOut
+r.Redis.RegionXLenFinal = finalRegionXLen
 r.Trimmed = r.Received - r.Redis.RegionXLenFinal
 if r.Trimmed < 0 {
     r.Trimmed = 0
 }
-r.Latency = receiver.Latency()  // was: latency tracker from sampler
+r.Latency = receiver.Latency()
+// `last := snaps[len(snaps)-1]` is still used below for the OTHER end-of-run
+// fields (Sent, Errors, Connect.*, NATS.Bytes) — those stay sourced from
+// the snapshot loop.
 ```
+
+All other v1 logic in `buildReport` is unchanged — `Sent`, `Errors` (from writer Prom metrics), `MissingPct`, sustain-window rate avg/min, `Redis.CentralXLenMax`, `NATS.PendingMax`, `Chaos` block, `Verdict`.
 
 The rest of `buildReport` is unchanged — `Sent`, `Missing = Sent - Received` clamped, `MissingPct`, rate avg/min from sustain-window snapshot deltas, max XLen, max NATS pending, chaos block, verdict computation.
 
