@@ -121,7 +121,10 @@ print(b)')
   # is unreachable the next run's pre-flight will catch a genuinely-broken
   # state. The collector's pipeline-quiescence (spec §6.3) ensures no
   # in-flight messages are lost by purging now.
-  docker exec rrcs-nats nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
+  # Uses natsio/nats-box because the nats:alpine server image doesn't include
+  # the nats CLI.
+  docker run --rm --network rrcs-net natsio/nats-box:0.14.5 \
+    nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
     || echo "[purge] WARN: nats stream purge APP_EVENTS failed (continuing)" >&2
 }
 
