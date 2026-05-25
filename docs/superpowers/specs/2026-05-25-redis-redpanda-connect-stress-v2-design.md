@@ -172,7 +172,8 @@ The lifecycle is precisely sequenced because the `trimmed` math (§7) requires a
 12. time.Sleep(500ms)  // tail-flush window for receiver        (NEW — §6.2)
 13. cancelRecv()                                               (NEW)
 14. wg.Wait() — receiver goroutine has fully exited            (NEW — §6.1)
-15. finalRegionXLen, _ := region.XLen(ctx, "region-events")    (NEW — §6.4)
+15. finalRegionXLen := readFinalRegionXLen(                     (NEW — §6.4)
+        ctx, region, snaps)
 16. buildReport(cfg, startedAt, snaps, receiver,
                 finalRegionXLen, quiescenceTimedOut)            (modified)
 ```
@@ -235,7 +236,43 @@ The §9 NATS purge happens after the collector exits, regardless of profile. For
 
 `finalRegionXLen` is read **after** `wg.Wait()` returns, not from the last 1-Hz snapshot tick. This ensures `receiver.Count()` and `finalRegionXLen` refer to the same moment in time — the moment the receiver stopped reading. The `trimmed = received - finalRegionXLen` formula in §7 is then well-defined.
 
-A residual race window between `cancelRecv()` and `XLen("region-events")` is possible if `connect-sink` writes to `region-events` after we cancel the receiver but before we read `XLEN`. The size of this window varies by profile:
+**Error handling — `readFinalRegionXLen` helper:**
+
+```go
+// readFinalRegionXLen returns XLEN("region-events") with bounded retries.
+// On persistent failure it falls back to the last snapshot's RegionXLen so
+// that a transient Redis hiccup at end-of-run never corrupts the trimmed
+// math by leaving finalRegionXLen at zero (which would make trimmed == received).
+// The fallback value is at most one snapshot tick (~1s) stale.
+func readFinalRegionXLen(ctx context.Context, region *StreamClient, snaps []Snapshot) int64 {
+    const attempts = 3
+    for i := 0; i < attempts; i++ {
+        if x, err := region.XLen(ctx, "region-events"); err == nil {
+            return x
+        } else if ctx.Err() != nil {
+            // Caller cancellation — stop retrying and fall through.
+            break
+        } else if i == attempts-1 {
+            log.Printf("WARN: final XLEN(region-events) failed after %d attempts: %v; falling back to last snapshot", attempts, err)
+        }
+        select {
+        case <-ctx.Done():
+            // fall through to fallback
+        case <-time.After(100 * time.Millisecond):
+        }
+    }
+    if len(snaps) > 0 {
+        return snaps[len(snaps)-1].RegionXLen
+    }
+    return 0
+}
+```
+
+The three retries handle transient blips (network jitter, Redis briefly busy). The fallback to the last snapshot's `RegionXLen` is bounded — snapshot interval is 1 s, so the staleness is ≤ 1 s of stream growth. The verdict outcome is unaffected: `Sent` and `Received` come from sources unrelated to this XLen, so the worst that can happen is `trimmed` is off by ≤ 1 s of stream growth (negligible vs the ~225 k typical trim at 10 k tier).
+
+**Residual cancel→XLen race:**
+
+A small race window between `cancelRecv()` and `XLen("region-events")` is possible if `connect-sink` writes to `region-events` after we cancel the receiver but before we read `XLEN`. The size of this window varies by profile:
 
 - **ALO/EOE**: §6.3 quiescence has confirmed `num_pending == 0` and source `XLEN == 0`. There is no in-flight JetStream message that could result in a late `XADD` to `region-events`. The race window is bounded only by Redis command-pipeline latency between cancelRecv and XLen (< 1 ms). Negligible.
 - **AMO**: §6.3 confirmed only source `XLEN == 0`. The AMO ephemeral consumer can still be processing the last few messages that connect-source published just before source quiescence. Those messages may land in `region-events` after `cancelRecv()` but before the `XLEN` read, inflating `finalRegionXLen` relative to `receiver.Count()` by a small number (≤ Connect's `max_in_flight: 64`). This makes `trimmed` clamp to 0 (correct — no trim happened) and inflates `missing` by the same small number. Since AMO's verdict allows `missing > 0`, the report's PASS/FAIL outcome is unaffected; only the precise missing-count is slightly noisier. The noise floor is the AMO consumer's `max_in_flight` of 64, well below any tier's expected loss magnitude.
