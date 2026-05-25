@@ -24,11 +24,11 @@ type Sampler struct {
 	NATSStream   string
 	Central      *StreamClient
 	Region       *StreamClient
-	Latency      *LatencyTracker
-	LastRegionID string
+	Latency      *LatencyTracker // DEPRECATED — Task 9 removes; receiver owns latency now
+	LastRegionID string          // DEPRECATED — Task 9 removes
 }
 
-// Tick takes a single snapshot AND pulls latency samples from region-events.
+// Tick takes a single snapshot of all instrumented services.
 func (s *Sampler) Tick(ctx context.Context) Snapshot {
 	now := time.Now()
 	snap := Snapshot{At: now}
@@ -58,29 +58,10 @@ func (s *Sampler) Tick(ctx context.Context) Snapshot {
 	if n, err := ScrapeJSZ(c, s.NATSURL, s.NATSStream); err == nil {
 		snap.NATS = n
 	}
-
-	// Latency samples from region-events
-	msgs, newLast, err := s.Region.XRangeSinceID(c, "region-events", s.LastRegionID, 200)
-	if err == nil {
-		nowNs := time.Now().UnixNano()
-		for _, m := range msgs {
-			v, ok := m.Values["value"].(string)
-			if !ok {
-				continue
-			}
-			ts, err := extractTsNs(v)
-			if err != nil {
-				continue
-			}
-			s.Latency.RecordAt(ts, nowNs)
-		}
-		s.LastRegionID = newLast
-	}
 	return snap
 }
 
-func (s *Sampler) Init() {
-	if s.LastRegionID == "" {
-		s.LastRegionID = "0-0"
-	}
-}
+// Init is a transitional no-op kept for v1-compatibility during the v2 receiver
+// migration. Task 9 of the v2 plan removes the last call site, after which this
+// method can be deleted entirely.
+func (s *Sampler) Init() {}
