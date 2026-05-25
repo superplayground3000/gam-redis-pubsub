@@ -116,6 +116,13 @@ print(b)')
       echo "[chaos] WARN: kill-connect-sink.sh exited ${chaos_rc} (kept going; see container logs)" >&2
     fi
   fi
+
+  # Purge JetStream so the next run starts hermetic. Non-fatal — if NATS
+  # is unreachable the next run's pre-flight will catch a genuinely-broken
+  # state. The collector's pipeline-quiescence (spec §6.3) ensures no
+  # in-flight messages are lost by purging now.
+  docker exec rrcs-nats nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
+    || echo "[purge] WARN: nats stream purge APP_EVENTS failed (continuing)" >&2
 }
 
 mkdir -p reports
@@ -128,14 +135,14 @@ done
 
 # Render summary table.
 echo
-printf "%-9s %-12s %-15s %-9s %-9s %s\n" "tier" "mode" "rate_achieved" "missing" "p99 ms" "verdict"
-printf -- "---------------------------------------------------------------------\n"
+printf "%-9s %-12s %-15s %-9s %-9s %-9s %s\n" "tier" "mode" "rate_achieved" "missing" "trimmed" "p99 ms" "verdict"
+printf -- "-------------------------------------------------------------------------------\n"
 all_pass=true
 for tier in "${TIERS[@]}"; do
   for mode in "${MODES[@]}"; do
     f="reports/${tier}-${mode}-${PROFILE}.json"
     if [[ ! -f "$f" ]]; then
-      printf "%-9s %-12s %-15s %-9s %-9s %s\n" "$tier" "$mode" "-" "-" "-" "MISSING"
+      printf "%-9s %-12s %-15s %-9s %-9s %-9s %s\n" "$tier" "$mode" "-" "-" "-" "-" "MISSING"
       all_pass=false
       continue
     fi
@@ -145,15 +152,16 @@ path, tier, mode = sys.argv[1], sys.argv[2], sys.argv[3]
 r = json.load(open(path))
 ach = r.get("rate_achieved_avg", 0)
 miss = r.get("missing", 0)
+trim = r.get("trimmed", 0)
 p99 = r.get("latency_ms", {}).get("p99", 0)
 verdict = "PASS" if r.get("verdict", {}).get("pass") else "FAIL"
-print(f"{tier:<9} {mode:<12} {ach:6.1f}/{tier:<8} {miss:<9} {p99:<9.1f} {verdict}")
+print(f"{tier:<9} {mode:<12} {ach:6.1f}/{tier:<8} {miss:<9} {trim:<9} {p99:<9.1f} {verdict}")
 PY
     pass=$(python3 -c 'import json,sys;print(1 if json.load(open(sys.argv[1]))["verdict"]["pass"] else 0)' "$f" 2>/dev/null || echo 0)
     [[ "$pass" == "1" ]] || all_pass=false
   done
 done
-printf -- "---------------------------------------------------------------------\n"
+printf -- "-------------------------------------------------------------------------------\n"
 
 if $all_pass; then
   exit 0
