@@ -189,18 +189,26 @@ The 500 ms is sized against the **receiver's block window**, not against pipelin
 
 ### 6.3 Pipeline quiescence (step 11)
 
-Before declaring "drain complete," wait for **both** sides of the pipeline to be empty. Source-side alone is not enough — messages can be in flight in JetStream (pulled from `app.events`, dispatched to the `region-writer` consumer, not yet processed by `connect-sink`) and would either be lost on a premature NATS purge (§9) or arrive in `region-events` after the receiver has stopped.
+Before declaring "drain complete," wait for the pipeline to be empty. What "empty" means depends on the QoS profile — see §6.3.1 for the profile-aware ruleset.
 
-The quiescence check polls every 250 ms with a 10 s total deadline, returning success when both conditions hold simultaneously for one consecutive poll:
+The quiescence check polls every 250 ms with a 10 s total deadline, returning success when its profile-specific condition holds for one consecutive poll. The collector knows the profile from its `--profile` flag (already in `RunConfig.Profile`).
 
-1. `XLEN("app.events") == 0` — no source-side backlog left for `connect-source` to forward.
-2. NATS `/jsz` reports `num_pending == 0` for the `region-writer` consumer on `APP_EVENTS` — `connect-sink` has both dispatched and ACKed every message. Per the alo-reverse YAML (`durable: region-writer`, `ack_wait: 30s`), an ACK is only sent after the message has been written to `region-events`, so `num_pending == 0` implies every message has landed in the region stream.
+The 10 s deadline accommodates the worst-case ALO/EOE chaos drill: ~80 k messages backlogged in NATS at 10 k tier × 8 s outage, draining at ~10 k msg/s after `connect-sink` restarts = ~8 s. Steady-state drain finishes in well under 1 s for any profile.
 
-Both checks reuse existing collector code: `Central.XLen` (redis.go) and `ScrapeJSZ` (nats.go, returns `NATSSnap{MaxPending}` across all consumers of the named stream). No new infrastructure.
+If the deadline fires, `report.QuiescenceTimeout: true` is set, `finalRegionXLen` is read anyway, and the report is written. The verdict is unaffected by the timeout itself — a genuine pipeline failure shows up as `missing > 0` for ALO/EOE, and for AMO `missing > 0` is allowed by the SLO.
 
-The 10 s deadline accommodates the worst-case chaos drill: ~80 k messages backlogged in NATS at 10 k tier × 8 s outage, draining at ~10 k msg/s after `connect-sink` restarts = ~8 s. Steady-state drain finishes in well under 1 s.
+#### 6.3.1 Profile-aware quiescence conditions
 
-If the deadline fires (one or both queues still non-empty after 10 s — pipeline stalled), `report.QuiescenceTimeout: true` is set, `finalRegionXLen` is read anyway, and the report is written. The verdict is unaffected: a genuinely stalled pipeline already shows up as `missing > 0` because the receiver won't have seen the stuck messages. `quiescence_timeout=true` is purely diagnostic.
+| Profile | Quiescence condition | Rationale |
+|---|---|---|
+| `alo`, `eoe` | `XLEN("app.events") == 0` **AND** `ScrapeJSZ(...).MaxPending == 0` for the `region-writer` consumer | The reverse leg uses a durable consumer with `ack_wait: 30s` and ACK only after `region-events` write. `num_pending == 0` therefore implies every dispatched message has landed in the region stream. |
+| `amo` | `XLEN("app.events") == 0` only — **NATS pending check is skipped** | The amo-reverse YAML uses an *ephemeral, deliver-new, `ack_wait: 2s`, `auto_replay_nacks: false`* consumer. By design, the AMO consumer **ignores any backlog** that accumulated while `connect-sink` was down (it consumes only from "now"). Those backlogged messages stay in `APP_EVENTS` indefinitely as the AMO loss mode — they will never be delivered and `num_pending` either reports them forever (false-hang) or the ephemeral consumer is gone entirely (no useful signal). Waiting for source quiescence is sufficient; the AMO verdict allows `missing > 0` (`slo.allow_missing=true`), so unconsumed messages are *expected and correct behavior*. |
+
+Both code paths reuse existing collector helpers: `Central.XLen` (redis.go) and `ScrapeJSZ` (nats.go). No new infrastructure.
+
+#### 6.3.2 Profile-aware purge safety
+
+The §9 NATS purge happens after the collector exits, regardless of profile. For ALO/EOE this is safe because quiescence proved `num_pending == 0` (no in-flight work to lose). For AMO it is also safe — the purge discards the unconsumed backlog that AMO was going to abandon anyway. There is no message in AMO that "would have been delivered but for the purge"; AMO's loss happens at the ephemeral-consumer boundary, not at purge time.
 
 ### 6.4 Synchronized end-of-run cut (steps 14 → 15)
 
@@ -233,7 +241,7 @@ type Report struct {
 
 `received_errors` lets operators see when the receiver itself had trouble (network blip, redis restart during chaos drill). The count is **not** used to compute the verdict — its purpose is diagnostic, so that an operator looking at a borderline `missing > 0` report can rule out receiver flakiness as the cause.
 
-`quiescence_timeout` is `true` if the §6.3 pipeline-quiescence poll hit its 10 s deadline (either `XLEN(app.events)` did not reach 0, or NATS `num_pending` for the `region-writer` consumer did not reach 0). In a healthy run it is always `false`; in a stalled pipeline (genuine failure) it is `true` and accompanies a non-zero `missing`.
+`quiescence_timeout` is `true` if the §6.3 pipeline-quiescence poll hit its 10 s deadline. The exact stall condition depends on profile: for ALO/EOE either `XLEN(app.events)` or NATS `num_pending` failed to reach 0; for AMO only `XLEN(app.events)` is checked. In a healthy run it is always `false`. In a stalled ALO/EOE pipeline it is `true` and accompanies a non-zero `missing`; in AMO `missing > 0` is expected so this flag is the operator's signal that the *source side* (not the loss-tolerated sink side) is stuck.
 
 ### 7.3 `buildReport` changes (collector main.go)
 
@@ -295,7 +303,7 @@ docker exec rrcs-nats nats --server nats://nats:4222 stream purge APP_EVENTS -f 
   || echo "[purge] WARN: nats stream purge APP_EVENTS failed (continuing)" >&2
 ```
 
-The purge runs **after** the collector exit; the collector's §6 lifecycle has by then completed pipeline quiescence (§6.3 — both `XLEN(app.events)==0` AND NATS `num_pending==0`), so at purge time the stream has zero unprocessed messages. Any messages connect-sink has already pulled and processed are also already ACKed and reflected in `region-events`. The purge is non-fatal — if it fails (first-run state, transient docker exec issue), the pre-flight check on subsequent chaos runs will catch a genuinely-broken NATS state.
+The purge runs **after** the collector exit; the collector's §6 lifecycle has by then completed profile-aware pipeline quiescence (§6.3.1). For ALO/EOE, `num_pending==0` proves nothing in JetStream is in flight, so purge cannot lose a "would-have-been-delivered" message. For AMO, the purge intentionally discards the unconsumed backlog — that backlog is the lab's *modeled* AMO loss; AMO's verdict allows it via `slo.allow_missing=true`. The purge is non-fatal — if it fails (first-run state, transient docker exec issue), the pre-flight check on subsequent chaos runs will catch a genuinely-broken NATS state.
 
 ### 9.1 Per-run isolation guarantee
 
