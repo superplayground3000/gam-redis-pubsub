@@ -92,6 +92,19 @@ During the 10 k chaos run, in another shell, `uptime` should show 1-min load ave
 - **JetStream stream config is sticky**: `nats-init` skips `stream add` if `APP_EVENTS` already exists. If you change `--max-bytes` in the compose file, run `docker compose down -v` to clear the named volume before restarting.
 - **Connect Prometheus metrics**: the collector sums across all label variants of a given metric. If Redpanda Connect adds new labeled dimensions in a future version, totals stay correct.
 
+## v2 measurement model
+
+As of 2026-05-25 the collector samples differently from v1. The pipeline under test is unchanged.
+
+- **`received` is now untainted by MAXLEN trimming.** The collector runs a streaming `XREAD BLOCK` consumer on `region-events` for the entire run. Every message that arrives is counted, even if it is later trimmed away when the stream exceeds 100 000 entries. At 10 k tier × 30 s, expect `received ≈ 300 000`.
+- **`trimmed` is a new diagnostic field.** It equals `received − XLEN(region-events)` clamped to ≥0 — the number of messages that were delivered but trimmed by `MAXLEN ~ 100000`. At 10 k tier, expect `trimmed ≈ 225 000` (the older entries). At 10 and 1000 tiers, `trimmed = 0` because production volume stays under the cap.
+- **`missing` now reflects real in-transit loss.** Computed as `sent − received`, both untainted by trim. For ALO/EOE under any tier or mode, expect `missing = 0`. For AMO chaos drills, expect `missing > 0` (the AMO loss mode under test, allowed by `slo.allow_missing=true`).
+- **`latency_ms.*` is now true per-message e2e latency.** v1's polling-window bias is gone. At 10 k throughput, expect sub-second P99 (real pipeline propagation), not the 4–35 s figures v1 reported.
+- **`received_errors`** counts transient XREAD failures from the streaming receiver. In a healthy run it is 0. A non-zero value tells operators that some samples may have been missed; it is not part of the verdict.
+- **`quiescence_timeout`** is `true` if the post-drain pipeline-quiescence wait (10 s deadline) did not see both source (`XLEN(app.events)==0`) and sink (`NATS num_pending==0` for ALO/EOE only) drain in time. A healthy run reports `false`.
+
+Between every tier run the harness now runs `nats stream purge APP_EVENTS` so accumulated bytes never trip the 200 MB pre-flight. The 256 MB stream cap is still a ceiling for in-flight bytes within one run.
+
 ## Useful checks (between runs)
 
 ```bash
@@ -105,6 +118,9 @@ docker exec rrcs-nats nats stream info APP_EVENTS
 # Writer live state
 curl -s http://localhost:17081/metrics
 curl -s -X POST -d '{"rate":0}' -H 'content-type: application/json' http://localhost:17081/rate
+
+# v2 report fields — what to look for in reports/{tier}-{mode}-{profile}.json
+jq '.received, .trimmed, .missing, .latency_ms.p99, .quiescence_timeout' reports/10000-throughput-alo.json
 ```
 
 ## Tear down
