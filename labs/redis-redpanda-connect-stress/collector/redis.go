@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -27,14 +28,19 @@ func (s *StreamClient) Trim(ctx context.Context, key string) error {
 }
 
 // GroupLag returns the number of entries in `stream` not yet read by consumer
-// group `group`. Returns 0 if the group doesn't exist (a stream that has never
-// been read is trivially caught-up for our quiescence purposes — pre-flight
-// trim leaves no entries to lag behind).
+// group `group`. Returns (0, nil) if the stream exists but the group doesn't —
+// a stream that has never had the consumer registered is trivially caught-up
+// for our quiescence purposes. Returns the underlying error for any other
+// Redis failure so callers can distinguish "really drained" from "couldn't ask".
 func (s *StreamClient) GroupLag(ctx context.Context, stream, group string) (int64, error) {
 	groups, err := s.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		// Stream missing entirely (e.g., trimmed before any reads) → 0 lag.
-		return 0, nil
+		// "no such key" → stream doesn't exist yet. Treat as 0 lag (drained).
+		// Other errors (network, perm, etc.) → propagate so quiescence can retry.
+		if strings.Contains(strings.ToLower(err.Error()), "no such key") {
+			return 0, nil
+		}
+		return 0, err
 	}
 	for _, g := range groups {
 		if g.Name == group {

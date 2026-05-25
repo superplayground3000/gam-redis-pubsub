@@ -220,8 +220,11 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		return Report{}, ctx.Err()
 	}
 
-	// 12. Tail-flush window for the receiver.
-	sleep(ctx, 500*time.Millisecond)
+	// 12. Tail-flush window for the receiver. 1500ms (= 6× the XREAD block
+	// window) accommodates connect-sink's internal in-flight buffer (up to
+	// max_in_flight=64 messages) flushing to region-events after JetStream
+	// num_pending drops to 0 but before the receiver is cancelled.
+	sleep(ctx, 1500*time.Millisecond)
 	if ctx.Err() != nil {
 		return Report{}, ctx.Err()
 	}
