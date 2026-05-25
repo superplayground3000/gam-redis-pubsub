@@ -164,7 +164,9 @@ The lifecycle is precisely sequenced because the `trimmed` math (§7) requires a
  8. PostRate(tier); sustain ticker loop (1 Hz snaps)           (existing)
  9. PostRate(0)                                                (existing)
 10. drain ticker loop for DRAIN_S seconds (1 Hz snaps)         (existing)
-11. waitForSourceQuiescence(ctx, central, "app.events", 5s)    (NEW — §6.3)
+11. waitForPipelineQuiescence(ctx, 10s)                        (NEW — §6.3)
+       - poll XLEN(app.events) == 0          (source drained)
+       - poll NATS num_pending == 0          (sink drained)
 12. time.Sleep(500ms)  // tail-flush window for receiver        (NEW — §6.2)
 13. cancelRecv()                                               (NEW)
 14. wg.Wait() — receiver goroutine has fully exited            (NEW — §6.1)
@@ -185,13 +187,20 @@ After step 16 the collector writes JSON and exits. The harness then runs `nats s
 
 The 500 ms is sized against the **receiver's block window**, not against pipeline propagation. Pipeline-side tail latency is bounded by §6.3 quiescence (which waits for source-side drain) plus §6.2 tail-flush (which waits for the receiver to see those drained messages).
 
-### 6.3 Source-side quiescence (step 11)
+### 6.3 Pipeline quiescence (step 11)
 
-Before declaring "drain complete," poll `XLEN(app.events)` until it reaches 0 or a 5 s timeout fires. This proves the writer's last messages have been pulled by connect-source and forwarded to JetStream. Without this, the run could declare end-of-run while messages are still working through the pipeline — those late deliveries would either be missed by the receiver (if they arrive after `wg.Wait`) or be counted but with no corresponding XLEN snapshot to derive `trimmed`.
+Before declaring "drain complete," wait for **both** sides of the pipeline to be empty. Source-side alone is not enough — messages can be in flight in JetStream (pulled from `app.events`, dispatched to the `region-writer` consumer, not yet processed by `connect-sink`) and would either be lost on a premature NATS purge (§9) or arrive in `region-events` after the receiver has stopped.
 
-The 5 s timeout is a safety bound; healthy steady-state drain at 10 k msg/s clears the central stream in well under 1 s once `PostRate(0)` is sent.
+The quiescence check polls every 250 ms with a 10 s total deadline, returning success when both conditions hold simultaneously for one consecutive poll:
 
-If the timeout fires (central stream still non-empty after 5 s — pipeline stalled), `report.Trimmed` is computed using whatever `region_xlen_final` says, and a new `report.QuiescenceTimeout: true` boolean is set so operators see the bound was hit. The verdict is unaffected (a stalled pipeline already shows up as `missing > 0`).
+1. `XLEN("app.events") == 0` — no source-side backlog left for `connect-source` to forward.
+2. NATS `/jsz` reports `num_pending == 0` for the `region-writer` consumer on `APP_EVENTS` — `connect-sink` has both dispatched and ACKed every message. Per the alo-reverse YAML (`durable: region-writer`, `ack_wait: 30s`), an ACK is only sent after the message has been written to `region-events`, so `num_pending == 0` implies every message has landed in the region stream.
+
+Both checks reuse existing collector code: `Central.XLen` (redis.go) and `ScrapeJSZ` (nats.go, returns `NATSSnap{MaxPending}` across all consumers of the named stream). No new infrastructure.
+
+The 10 s deadline accommodates the worst-case chaos drill: ~80 k messages backlogged in NATS at 10 k tier × 8 s outage, draining at ~10 k msg/s after `connect-sink` restarts = ~8 s. Steady-state drain finishes in well under 1 s.
+
+If the deadline fires (one or both queues still non-empty after 10 s — pipeline stalled), `report.QuiescenceTimeout: true` is set, `finalRegionXLen` is read anyway, and the report is written. The verdict is unaffected: a genuinely stalled pipeline already shows up as `missing > 0` because the receiver won't have seen the stuck messages. `quiescence_timeout=true` is purely diagnostic.
 
 ### 6.4 Synchronized end-of-run cut (steps 14 → 15)
 
@@ -224,7 +233,7 @@ type Report struct {
 
 `received_errors` lets operators see when the receiver itself had trouble (network blip, redis restart during chaos drill). The count is **not** used to compute the verdict — its purpose is diagnostic, so that an operator looking at a borderline `missing > 0` report can rule out receiver flakiness as the cause.
 
-`quiescence_timeout` is `true` if the §6.3 source-quiescence poll hit its 5 s timeout. In a healthy run it is always `false`; in a stalled pipeline (genuine failure) it is `true` and accompanies a non-zero `missing`.
+`quiescence_timeout` is `true` if the §6.3 pipeline-quiescence poll hit its 10 s deadline (either `XLEN(app.events)` did not reach 0, or NATS `num_pending` for the `region-writer` consumer did not reach 0). In a healthy run it is always `false`; in a stalled pipeline (genuine failure) it is `true` and accompanies a non-zero `missing`.
 
 ### 7.3 `buildReport` changes (collector main.go)
 
@@ -286,14 +295,16 @@ docker exec rrcs-nats nats --server nats://nats:4222 stream purge APP_EVENTS -f 
   || echo "[purge] WARN: nats stream purge APP_EVENTS failed (continuing)" >&2
 ```
 
-The purge runs **after** the collector exit; the collector's §6 lifecycle has by then completed source-side quiescence (§6.3) and recorded a synchronized `finalRegionXLen`. There is no in-flight pipeline traffic at purge time. The purge is non-fatal — if it fails (first-run state, transient docker exec issue), the pre-flight check on subsequent chaos runs will catch a genuinely-broken NATS state.
+The purge runs **after** the collector exit; the collector's §6 lifecycle has by then completed pipeline quiescence (§6.3 — both `XLEN(app.events)==0` AND NATS `num_pending==0`), so at purge time the stream has zero unprocessed messages. Any messages connect-sink has already pulled and processed are also already ACKed and reflected in `region-events`. The purge is non-fatal — if it fails (first-run state, transient docker exec issue), the pre-flight check on subsequent chaos runs will catch a genuinely-broken NATS state.
 
 ### 9.1 Per-run isolation guarantee
 
-Combined isolation from steps 1+2 of §6 (trim `app.events` and `region-events` at run start) and the post-collector NATS purge in step 9, each run starts with empty Redis streams and an empty JetStream. The only carryover paths are:
+Combined isolation from steps 1+2 of §6 (trim `app.events` and `region-events` at run start), the §6.3 pipeline quiescence at run end, and the post-collector NATS purge in step 9, each run starts with empty Redis streams and an empty JetStream. The only carryover paths and how they are blocked:
 
-- **Delayed source-side traffic** from a prior run: prevented by the §6.3 quiescence wait in the *prior* run.
-- **In-flight JetStream replication or consumer state**: bounded by JetStream's own consumer durables — since this lab uses a single-replica file-storage stream with a 5-minute dedup window, post-purge any prior-run msg-ID dedup state expires within 5 minutes. For a back-to-back matrix this is plenty of time (one run takes ~45 s).
+- **Source-side residue (`app.events`)**: prior run's §6.3 quiescence asserts `XLEN(app.events)==0` before that run's exit; the new run's step 1 trim is then a no-op-safety, not load-bearing. Even if the prior run's quiescence timed out, the new run's trim destroys the residue before the receiver starts.
+- **JetStream residue (`APP_EVENTS`)**: prior run's §6.3 quiescence asserts `num_pending==0`, then the harness purges the stream. The new run's step 4 receiver therefore starts against an empty stream.
+- **Region-side residue (`region-events`)**: prior run's receiver completes (§6.1 `wg.Wait`) before the prior run's `finalRegionXLen` is read. The new run's step 2 trim then clears whatever messages were left.
+- **JetStream dedup state**: `--dupe-window 5m` keeps msg-ID dedup state for 5 minutes. Because the writer generates a fresh UUID per `event_id`, the dedup window cannot collide between runs.
 
 ### 9.1 What stays
 
