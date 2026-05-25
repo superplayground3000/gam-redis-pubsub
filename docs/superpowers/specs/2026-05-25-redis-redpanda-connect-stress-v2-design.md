@@ -159,17 +159,20 @@ The lifecycle is precisely sequenced because the `trimmed` math (§7) requires a
  3. PostReset                                                  (existing)
  4. receiver := NewReceiver(...)                               (NEW)
  5. receiverCtx, cancelRecv := WithCancel(ctx)
- 6. go receiver.Run(receiverCtx)                               (NEW)
+ 6. var wg sync.WaitGroup; wg.Add(1)                            (NEW)
+    go func() { defer wg.Done(); receiver.Run(receiverCtx) }()
  7. PostRate(tier/2); sleep(warmup)                            (existing)
  8. PostRate(tier); sustain ticker loop (1 Hz snaps)           (existing)
  9. PostRate(0)                                                (existing)
 10. drain ticker loop for DRAIN_S seconds (1 Hz snaps)         (existing)
 11. quiescenceTimedOut := waitForPipelineQuiescence(            (NEW — §6.3)
-                            ctx, cfg.Profile, 10*time.Second)
+                            ctx, cfg.Profile, central,
+                            cfg.NATSURL, cfg.NATSStream,
+                            10*time.Second)
 12. time.Sleep(500ms)  // tail-flush window for receiver        (NEW — §6.2)
 13. cancelRecv()                                               (NEW)
 14. wg.Wait() — receiver goroutine has fully exited            (NEW — §6.1)
-15. finalRegionXLen := region.XLen(ctx, "region-events")       (NEW — §6.4)
+15. finalRegionXLen, _ := region.XLen(ctx, "region-events")    (NEW — §6.4)
 16. buildReport(cfg, startedAt, snaps, receiver,
                 finalRegionXLen, quiescenceTimedOut)            (modified)
 ```
@@ -178,13 +181,15 @@ After step 16 the collector writes JSON and exits. The harness then runs `nats s
 
 ### 6.1 Receiver goroutine join
 
-`receiver.Run` is wrapped in a `sync.WaitGroup`; step 14 is `wg.Wait()`. After this returns, no `XREAD` call is in flight and no further writes to `receiver.received` / `receiver.latency` will happen. Subsequent reads of `receiver.Count()` and `receiver.Latency()` are race-safe by happens-before from the WaitGroup release.
+The receiver goroutine is launched in step 6 with `wg.Add(1)` and a deferred `wg.Done()` inside the goroutine; step 14 is `wg.Wait()`. `wg.Add(1)` MUST be called from the caller's goroutine before the receiver goroutine starts (Go memory model requirement). After `wg.Wait()` returns, no `XREAD` call is in flight and no further writes to `receiver.received` / `receiver.latency` will happen. Subsequent reads of `receiver.Count()` / `receiver.Errors()` / `receiver.Latency()` are race-safe by happens-before from the WaitGroup release.
 
 ### 6.2 Tail-flush window (step 12)
 
 `XREAD BLOCK 250ms` means the receiver checks for new messages roughly every 250 ms. If a message lands in `region-events` at the very end of drain and we cancel immediately, the receiver might exit before its next XREAD cycle picks it up. Sleeping 500 ms (= 2× block window) before cancellation guarantees at least one more receiver cycle.
 
-The 500 ms is sized against the **receiver's block window**, not against pipeline propagation. Pipeline-side tail latency is bounded by §6.3 quiescence (which waits for source-side drain) plus §6.2 tail-flush (which waits for the receiver to see those drained messages).
+The 500 ms is sized against the **receiver's block window**, not against pipeline propagation. The two timing concerns are layered:
+- §6.3 quiescence (step 11) ensures the **pipeline** is empty — no more messages will be written to `region-events`.
+- §6.2 tail-flush (step 12) ensures the **receiver** has had time to see whatever §6.3 left it.
 
 ### 6.3 Pipeline quiescence (step 11)
 
@@ -254,7 +259,7 @@ type Report struct {
     ...existing fields...
     ReceivedErrors    int64 `json:"received_errors"`     // transient XREAD errors from receiver
     Trimmed           int64 `json:"trimmed"`             // = max(0, received - finalRegionXLen)
-    QuiescenceTimeout bool  `json:"quiescence_timeout"`  // true if source-side XLEN didn't hit 0 in §6.3 window
+    QuiescenceTimeout bool  `json:"quiescence_timeout"`  // true if §6.3 deadline fired before quiescence (profile-specific condition; see §7.2)
 }
 ```
 
@@ -309,9 +314,7 @@ r.Latency = receiver.Latency()
 // the snapshot loop.
 ```
 
-All other v1 logic in `buildReport` is unchanged — `Sent`, `Errors` (from writer Prom metrics), `MissingPct`, sustain-window rate avg/min, `Redis.CentralXLenMax`, `NATS.PendingMax`, `Chaos` block, `Verdict`.
-
-The rest of `buildReport` is unchanged — `Sent`, `Missing = Sent - Received` clamped, `MissingPct`, rate avg/min from sustain-window snapshot deltas, max XLen, max NATS pending, chaos block, verdict computation.
+All other v1 logic in `buildReport` is unchanged — `Sent` and `Errors` (from writer Prom metrics on the last snapshot), `Missing = Sent - Received` clamped to ≥0, `MissingPct`, sustain-window rate avg/min from snapshot deltas, `Redis.CentralXLenMax`, `NATS.PendingMax`, `Connect.*`, `NATS.Bytes`, `Chaos` block, `Verdict`.
 
 ### 7.4 `ComputeVerdict` — unchanged
 
@@ -352,14 +355,14 @@ The purge runs **after** the collector exit; the collector's §6 lifecycle has b
 
 ### 9.1 Per-run isolation guarantee
 
-Combined isolation from steps 1+2 of §6 (trim `app.events` and `region-events` at run start), the §6.3 pipeline quiescence at run end, and the post-collector NATS purge in step 9, each run starts with empty Redis streams and an empty JetStream. The only carryover paths and how they are blocked:
+Combined isolation from steps 1+2 of §6 (trim `app.events` and `region-events` at run start), the §6.3 pipeline quiescence at run end, and the post-collector NATS purge in §9, each run starts with empty Redis streams and an empty JetStream. The only carryover paths and how they are blocked:
 
-- **Source-side residue (`app.events`)**: prior run's §6.3 quiescence asserts `XLEN(app.events)==0` before that run's exit; the new run's step 1 trim is then a no-op-safety, not load-bearing. Even if the prior run's quiescence timed out, the new run's trim destroys the residue before the receiver starts.
-- **JetStream residue (`APP_EVENTS`)**: prior run's §6.3 quiescence asserts `num_pending==0`, then the harness purges the stream. The new run's step 4 receiver therefore starts against an empty stream.
+- **Source-side residue (`app.events`)**: prior run's §6.3 quiescence asserts `XLEN(app.events)==0` before that run's exit (for all profiles); the new run's step 1 trim is then a no-op-safety, not load-bearing. Even if the prior run's quiescence timed out, the new run's trim destroys the residue before the receiver starts.
+- **JetStream residue (`APP_EVENTS`)**: for ALO/EOE, prior run's §6.3 quiescence asserts `num_pending==0` and the harness purges the stream. For AMO, §6.3 does not gate on `num_pending` (consumer is ephemeral and ignores backlog by design), but the harness purge still discards everything in the stream. Either way, the new run's step 4 receiver starts against an empty stream.
 - **Region-side residue (`region-events`)**: prior run's receiver completes (§6.1 `wg.Wait`) before the prior run's `finalRegionXLen` is read. The new run's step 2 trim then clears whatever messages were left.
 - **JetStream dedup state**: `--dupe-window 5m` keeps msg-ID dedup state for 5 minutes. Because the writer generates a fresh UUID per `event_id`, the dedup window cannot collide between runs.
 
-### 9.1 What stays
+### 9.2 What stays from v1
 
 - `--max-bytes 256MB` on the stream. Still a runaway ceiling.
 - 200 MB pre-flight before chaos runs. Still a sanity guard.
@@ -387,18 +390,21 @@ Renderer change: the inline Python `print(f"...")` in `stress-run.sh` gets one e
 ```
 labs/redis-redpanda-connect-stress/
 ├── collector/
-│   ├── receiver.go            NEW (~70 LOC)
-│   ├── receiver_test.go       NEW (~50 LOC, no Redis needed — exercises a small in-memory helper)
-│   ├── snapshot.go            MODIFIED — drop latency/lastID, shrink Sampler
-│   ├── main.go                MODIFIED — receiver lifecycle, buildReport fields
-│   └── report.go              MODIFIED — add ReceivedErrors, Trimmed fields
+│   ├── receiver.go            NEW (~70 LOC, see §5)
+│   ├── receiver_test.go       NEW (~50 LOC, no Redis needed — exercises payload parse + counters via a small in-memory helper)
+│   ├── quiescence.go          NEW (~40 LOC) — waitForPipelineQuiescence per §6.3
+│   ├── snapshot.go            MODIFIED — drop Latency/LastRegionID from Sampler; Tick no longer touches latency
+│   ├── main.go                MODIFIED — receiver lifecycle (§6 steps 4-15), buildReport signature (§7.3)
+│   └── report.go              MODIFIED — add ReceivedErrors, Trimmed, QuiescenceTimeout fields
 ├── scripts/
-│   └── stress-run.sh          MODIFIED — purge between runs, +1 column in summary
+│   └── stress-run.sh          MODIFIED — purge APP_EVENTS after each run; +1 column (`trimmed`) in summary table
 ├── README.md                  MODIFIED — document the new fields and what trimmed=N means
 └── RESEARCH.md                MODIFIED — explain v2 measurement-vs-pipeline distinction
 ```
 
-No changes to: writer (any file), connect YAMLs, docker-compose.yml, .env.example, tier-defs.sh, kill-connect-sink.sh, latency.go, verdict.go, redis.go, scrapers.go, nats.go.
+`quiescence.go` is a separate file rather than living in `main.go` so the helper can be unit-tested via a small fake `*StreamClient` and an HTTP test server for JSZ. This is implementation guidance, not a hard spec requirement — the implementer may inline it in `main.go` if preferred.
+
+No changes to: writer (any file), connect YAMLs, docker-compose.yml, .env.example, tier-defs.sh, kill-connect-sink.sh, latency.go, verdict.go, verdict_test.go, redis.go, scrapers.go, nats.go.
 
 ## 12. Testing approach
 
@@ -415,7 +421,8 @@ This is a lab, not a service. Same hand-run pattern as v1.
 ### Risks
 
 - **Receiver back-pressure at 10 k**. If the receiver can't drain `XREAD` fast enough (≥10 k msg/s through a single goroutine + atomic operations), it falls behind. Mitigation: `COUNT 1000` per XREAD plus a single atomic-counter increment is comfortably <100 ns per message in Go; 10 k/s = 1 ms of receiver CPU per second of wall clock. Headroom is ~100×.
-- **NATS purge timing race**. If the purge runs while connect-source is still flushing, some in-flight messages could be lost across the boundary. Mitigation: the purge runs *after* the collector finishes (which includes drain + 500 ms tail), so by that point connect-source has no in-flight work; `app.events` is also trimmed at the start of the next run.
+- **NATS purge timing race**. The purge runs after the collector exits; collector exit is gated on §6.3 pipeline quiescence (`num_pending==0` for ALO/EOE; source `XLEN==0` for AMO). For ALO/EOE this means no in-flight JetStream messages could be lost. For AMO, the purge intentionally discards the abandoned backlog — that loss is the AMO mode under test, not a measurement bug.
+- **AMO end-of-run race**. As documented in §6.4, AMO can have ≤64 messages in-flight inside connect-sink at the moment §6.3 quiescence completes. These messages may land in `region-events` after `cancelRecv()` but before `XLEN`, inflating `Missing` by ≤64. AMO's verdict allows `missing > 0`, so the PASS/FAIL outcome is unaffected; only the precise missing-count is slightly noisier.
 
 ### Known limitations carried forward
 
