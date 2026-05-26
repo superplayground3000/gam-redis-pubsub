@@ -121,7 +121,7 @@ func TestWaitQuiescenceAloReturnsFalseWhenBothQueuesDrain(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	timedOut := waitForPipelineQuiescence(ctx, "alo", central, srv.URL, "APP_EVENTS", 2*time.Second)
+	timedOut := waitForPipelineQuiescence(ctx, central, srv.URL, "APP_EVENTS", 2*time.Second)
 	if timedOut {
 		t.Errorf("expected quiescence (timedOut=false), got true")
 	}
@@ -137,7 +137,7 @@ func TestWaitQuiescenceAloReturnsTrueWhenSourceStuck(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	timedOut := waitForPipelineQuiescence(ctx, "alo", central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
+	timedOut := waitForPipelineQuiescence(ctx, central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
 	if !timedOut {
 		t.Errorf("expected timeout, got quiescence")
 	}
@@ -153,40 +153,8 @@ func TestWaitQuiescenceAloReturnsTrueWhenSinkStuck(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	timedOut := waitForPipelineQuiescence(ctx, "alo", central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
+	timedOut := waitForPipelineQuiescence(ctx, central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
 	if !timedOut {
 		t.Errorf("expected timeout, got quiescence")
-	}
-}
-
-func TestWaitQuiescenceAmoSkipsPendingCheck(t *testing.T) {
-	central := newFakeStreamClient(t)
-	central.setLag("app.events", "propagator", 0)
-	pending := &atomic.Int64{}
-	pending.Store(9999) // would stall ALO/EOE; AMO must ignore.
-	srv := jszServer(t, pending)
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	timedOut := waitForPipelineQuiescence(ctx, "amo", central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
-	if timedOut {
-		t.Errorf("expected quiescence for AMO with high pending, got timeout")
-	}
-}
-
-func TestWaitQuiescenceAmoStillRequiresSourceDrain(t *testing.T) {
-	central := newFakeStreamClient(t)
-	central.setLag("app.events", "propagator", 7)
-	pending := &atomic.Int64{}
-	pending.Store(0)
-	srv := jszServer(t, pending)
-	defer srv.Close()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	timedOut := waitForPipelineQuiescence(ctx, "amo", central, srv.URL, "APP_EVENTS", 500*time.Millisecond)
-	if !timedOut {
-		t.Errorf("expected AMO to time out on stuck source, got quiescence")
 	}
 }
