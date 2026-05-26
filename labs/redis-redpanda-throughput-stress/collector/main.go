@@ -16,8 +16,7 @@ import (
 
 type RunConfig struct {
 	Tier         int
-	Mode         string
-	Profile      string
+	Mode         string // "batch" | "single"
 	Duration     time.Duration
 	Warmup       time.Duration
 	Drain        time.Duration
@@ -28,39 +27,33 @@ type RunConfig struct {
 	NATSStream   string
 	ConnectSrc   string
 	ConnectSink  string
-	ChaosAtS     float64
-	ChaosDurS    int
 	SLO          SLO
 }
 
 func main() {
 	var (
-		tier         = flag.Int("tier", 0, "target msg/s (required)")
-		mode         = flag.String("mode", "throughput", "throughput|latency|chaos")
-		profile      = flag.String("profile", "alo", "alo|amo|eoe")
-		duration     = flag.Duration("duration", 30*time.Second, "sustain window")
-		warmup       = flag.Duration("warmup", 5*time.Second, "warmup window")
-		drain        = flag.Duration("drain", 10*time.Second, "drain window")
-		out          = flag.String("out", "/reports/run.json", "report JSON path")
-		writerURL    = flag.String("writer", "http://writer:8081", "writer URL")
-		central      = flag.String("redis-central", "redis-central:6379", "")
-		region       = flag.String("redis-region", "redis-region:6379", "")
-		natsURL      = flag.String("nats", "http://nats:8222", "NATS monitoring URL")
-		natsStream   = flag.String("nats-stream", "APP_EVENTS", "JetStream stream name")
-		connectSrc   = flag.String("connect-src", "http://connect-source:4195", "")
-		connectSink  = flag.String("connect-sink", "http://connect-sink:4195", "")
-		chaosAtS     = flag.Float64("chaos-at-s", 0, "seconds into sustain to record chaos lag (harness drives the kill)")
-		chaosDur     = flag.Int("chaos-duration", 8, "outage seconds (recorded only)")
-		sloRatePct   = flag.Float64("slo-rate-pct", 0.95, "")
-		sloP99Ms     = flag.Float64("slo-p99-ms", 1000, "")
-		sloAllowMiss = flag.Bool("slo-allow-missing", false, "")
+		tier        = flag.Int("tier", 0, "target msg/s (required)")
+		mode        = flag.String("mode", "batch", "batch|single")
+		duration    = flag.Duration("duration", 30*time.Second, "sustain window")
+		warmup      = flag.Duration("warmup", 5*time.Second, "warmup window")
+		drain       = flag.Duration("drain", 10*time.Second, "drain window")
+		out         = flag.String("out", "/reports/run.json", "report JSON path")
+		writerURL   = flag.String("writer", "http://writer:8081", "writer URL")
+		central     = flag.String("redis-central", "redis-central:6379", "")
+		region      = flag.String("redis-region", "redis-region:6379", "")
+		natsURL     = flag.String("nats", "http://nats:8222", "NATS monitoring URL")
+		natsStream  = flag.String("nats-stream", "APP_EVENTS", "JetStream stream name")
+		connectSrc  = flag.String("connect-src", "http://connect-source:4195", "")
+		connectSink = flag.String("connect-sink", "http://connect-sink:4195", "")
+		sloRatePct  = flag.Float64("slo-rate-pct", 0.90, "")
+		sloP99Ms    = flag.Float64("slo-p99-ms", -1, "<=0 means no p99 gate (calibration mode)")
 	)
 	flag.Parse()
 	if *tier <= 0 {
 		log.Fatal("--tier required (>0)")
 	}
-	if *mode == "chaos" && *chaosAtS <= 0 {
-		log.Fatal("--chaos-at-s must be > 0 when --mode=chaos")
+	if *mode != "batch" && *mode != "single" {
+		log.Fatalf("--mode must be batch|single, got %q", *mode)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -72,18 +65,20 @@ func main() {
 		cancel()
 	}()
 
+	slo := SLO{RateMinPct: *sloRatePct}
+	if *sloP99Ms > 0 {
+		v := *sloP99Ms
+		slo.LatencyP99MsMax = &v
+	}
+
 	cfg := RunConfig{
-		Tier: *tier, Mode: *mode, Profile: *profile,
+		Tier: *tier, Mode: *mode,
 		Duration: *duration, Warmup: *warmup, Drain: *drain,
 		WriterURL:    *writerURL,
 		RedisCentral: *central, RedisRegion: *region,
 		NATSURL: *natsURL, NATSStream: *natsStream,
 		ConnectSrc: *connectSrc, ConnectSink: *connectSink,
-		ChaosAtS: *chaosAtS, ChaosDurS: *chaosDur,
-		SLO: SLO{
-			RateMinPct: *sloRatePct, LatencyP99Ms: *sloP99Ms,
-			AllowMissing: *sloAllowMiss,
-		},
+		SLO: slo,
 	}
 
 	r, err := Run(ctx, cfg)
@@ -131,31 +126,26 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 	region := NewStreamClient(cfg.RedisRegion)
 	defer region.Close()
 
-	// 1+2. Trim streams to zero so we measure only this tier's traffic.
 	if err := central.Trim(ctx, "app.events"); err != nil {
 		return Report{}, fmt.Errorf("trim app.events: %w", err)
 	}
 	if err := region.Trim(ctx, "region-events"); err != nil {
 		return Report{}, fmt.Errorf("trim region-events: %w", err)
 	}
-
-	// 3. Reset writer counters.
 	if err := PostReset(ctx, cfg.WriterURL); err != nil {
 		return Report{}, err
 	}
 
-	// Best-effort pause writer on any return path.
 	defer func() {
 		c, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
-		_ = PostRate(c, cfg.WriterURL, 0)
+		_ = PostRate(c, cfg.WriterURL, 0, "")
 	}()
 
-	// 4-6. Start the receiver — single goroutine, joined via WaitGroup.
 	receiver := NewReceiver(cfg.RedisRegion, "region-events")
 	defer receiver.Close()
 	receiverCtx, cancelRecv := context.WithCancel(ctx)
-	defer cancelRecv() // safety net; explicit cancel below is the live path
+	defer cancelRecv()
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -164,14 +154,13 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		receiver.Run(receiverCtx)
 	}()
 
-	// 7. Warmup at half rate.
-	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier/2); err != nil {
+	// Arm the writer's mode before warmup (rate=tier/2, mode=cfg.Mode).
+	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier/2, cfg.Mode); err != nil {
 		return Report{}, err
 	}
 	sleep(ctx, cfg.Warmup)
 
-	// 8. Sustain at full rate.
-	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier); err != nil {
+	if err := PostRate(ctx, cfg.WriterURL, cfg.Tier, ""); err != nil {
 		return Report{}, err
 	}
 
@@ -184,7 +173,6 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 
 	startedAt := time.Now()
 	sustainEnd := startedAt.Add(cfg.Duration)
-
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
@@ -198,11 +186,9 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		}
 	}
 
-	// 9. Drain.
-	if err := PostRate(ctx, cfg.WriterURL, 0); err != nil {
+	if err := PostRate(ctx, cfg.WriterURL, 0, ""); err != nil {
 		return Report{}, err
 	}
-	// 10. drain ticker loop.
 	drainEnd := time.Now().Add(cfg.Drain)
 	for time.Now().Before(drainEnd) {
 		select {
@@ -213,34 +199,22 @@ func Run(ctx context.Context, cfg RunConfig) (Report, error) {
 		}
 	}
 
-	// 11. Pipeline quiescence (profile-aware).
 	quiescenceTimedOut := waitForPipelineQuiescence(
-		ctx, cfg.Profile, central, cfg.NATSURL, cfg.NATSStream, 10*time.Second)
+		ctx, central, cfg.NATSURL, cfg.NATSStream, 10*time.Second)
 	if ctx.Err() != nil {
 		return Report{}, ctx.Err()
 	}
 
-	// 12. Tail-flush window for the receiver. 1500ms (= 6× the XREAD block
-	// window) accommodates connect-sink's internal in-flight buffer (up to
-	// max_in_flight=64 messages) flushing to region-events after JetStream
-	// num_pending drops to 0 but before the receiver is cancelled.
-	sleep(ctx, 1500*time.Millisecond)
+	sleep(ctx, 1500*time.Millisecond) // tail-flush; see spec §5 step 10
 	if ctx.Err() != nil {
 		return Report{}, ctx.Err()
 	}
 
-	// Final tick to capture post-drain snapshot fields (Sent, Errors, Connect, NATS.Bytes).
-	final := sampler.Tick(ctx)
-	snaps = append(snaps, final)
-
-	// 13. Cancel receiver; 14. wait for it to fully exit.
+	snaps = append(snaps, sampler.Tick(ctx))
 	cancelRecv()
 	wg.Wait()
 
-	// 15. Synchronized end-of-run XLEN cut for trimmed math.
 	finalRegionXLen := readFinalRegionXLen(ctx, region, snaps)
-
-	// 16. Build report.
 	return buildReport(cfg, startedAt, snaps, receiver, finalRegionXLen, quiescenceTimedOut), nil
 }
 
@@ -253,16 +227,12 @@ func buildReport(
 	quiescenceTimedOut bool,
 ) Report {
 	r := Report{
-		Tier: cfg.Tier, Mode: cfg.Mode, Profile: cfg.Profile,
+		Tier: cfg.Tier, Mode: cfg.Mode,
 		StartedAt: startedAt, DurationS: int(cfg.Duration.Seconds()),
-		RateTarget: cfg.Tier,
-		Latency:    receiver.Latency(),
-		SLO:        cfg.SLO,
+		RateTarget:  cfg.Tier,
+		SyncLatency: receiver.Latency(),
+		SLO:         cfg.SLO,
 	}
-
-	// Sent + errors + Connect + NATS.Bytes are end-of-run values from the last snapshot.
-	// Received is sourced from the streaming receiver, not the snapshot XLEN — receiver
-	// is untainted by region-events MAXLEN trimming.
 	r.Received = receiver.Count()
 	r.ReceivedErrors = receiver.Errors()
 	r.QuiescenceTimeout = quiescenceTimedOut
@@ -270,6 +240,11 @@ func buildReport(
 	r.Trimmed = r.Received - r.Redis.RegionXLenFinal
 	if r.Trimmed < 0 {
 		r.Trimmed = 0
+	}
+	r.ReceivedByPattern = map[string]int64{
+		"employee": receiver.CountByPattern("employee"),
+		"role":     receiver.CountByPattern("role"),
+		"org":      receiver.CountByPattern("org"),
 	}
 	if len(snaps) > 0 {
 		last := snaps[len(snaps)-1]
@@ -289,8 +264,6 @@ func buildReport(
 		r.MissingPct = float64(r.Missing) / float64(r.Sent) * 100.0
 	}
 
-	// Per-snapshot rate samples computed from actual wall clock between ticks,
-	// not assumed-1s intervals. Counter resets (negative delta) zero the sample.
 	var minRate float64 = 1e18
 	var sumRate, samples float64
 	var lastSent int64
@@ -298,9 +271,6 @@ func buildReport(
 	var maxXLen, maxPending int64
 	for i, snap := range snaps {
 		sent := int64(snap.WriterMetrics["stress_writer_sent_total"])
-		// Only count snapshots while the writer's rate_target matches the tier (i.e.
-		// during sustain). Drain-window snapshots have rate_target=0 and would otherwise
-		// pull the average down toward zero.
 		rateTarget := int(snap.WriterMetrics["stress_writer_rate_target"])
 		if i > 0 && rateTarget == cfg.Tier {
 			deltaSec := snap.At.Sub(lastAt).Seconds()
@@ -333,20 +303,11 @@ func buildReport(
 	r.Redis.CentralXLenMax = maxXLen
 	r.NATS.PendingMax = maxPending
 
-	if cfg.Mode == "chaos" && cfg.ChaosAtS > 0 {
-		r.Chaos = &ChaosInfo{
-			Action:         "kill-connect-sink",
-			DownAtS:        int(cfg.ChaosAtS),
-			DurationS:      cfg.ChaosDurS,
-			RecoveryLagMax: maxPending,
-		}
-	}
-
 	r.Verdict = ComputeVerdict(VerdictInput{
-		Mode: cfg.Mode, RateTarget: cfg.Tier,
+		RateTarget:      cfg.Tier,
 		RateAchievedAvg: r.RateAchievedAvg,
 		Missing:         r.Missing,
-		LatencyP99Ms:    r.Latency.P99Ms,
+		LatencyP99Ms:    r.SyncLatency.P99Ms,
 		SLO:             cfg.SLO,
 	})
 	return r
@@ -359,11 +320,6 @@ func sleep(ctx context.Context, d time.Duration) {
 	}
 }
 
-// readFinalRegionXLen returns XLEN("region-events") with bounded retries.
-// On persistent failure it falls back to the last snapshot's RegionXLen so
-// that a transient Redis hiccup at end-of-run never corrupts the trimmed
-// math by leaving finalRegionXLen at zero. The fallback value is at most
-// one snapshot tick (~1s) stale. See spec §6.4.
 func readFinalRegionXLen(ctx context.Context, region xlenReader, snaps []Snapshot) int64 {
 	const attempts = 3
 	var lastErr error

@@ -59,19 +59,23 @@ func parseProm(r io.Reader) (map[string]float64, error) {
 	return out, scn.Err()
 }
 
-// PostRate calls POST /rate {rate: n} on the writer.
-func PostRate(ctx context.Context, writerURL string, n int) error {
-	body, _ := json.Marshal(map[string]int{"rate": n})
-	req, _ := http.NewRequestWithContext(ctx, "POST", writerURL+"/rate", bytes.NewReader(body))
+// PostRate calls POST /rate {rate: n, mode?: mode} on the writer.
+// Empty mode omits the mode field, leaving the writer's current mode unchanged.
+func PostRate(ctx context.Context, baseURL string, rate int, mode string) error {
+	body := map[string]any{"rate": rate}
+	if mode != "" {
+		body["mode"] = mode
+	}
+	buf, _ := json.Marshal(body)
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, baseURL+"/rate", bytes.NewReader(buf))
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return fmt.Errorf("POST /rate: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("rate %d: %s: %s", n, resp.Status, b)
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("POST /rate: status %d", resp.StatusCode)
 	}
 	return nil
 }
