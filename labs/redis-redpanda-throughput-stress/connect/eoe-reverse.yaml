@@ -1,0 +1,76 @@
+# QoS profile: exactly-once-effective (EOE).
+# Differences vs ALO reverse:
+#   - A `cache add` (SET NX EX) on key `event:<event_id>` runs BEFORE the
+#     fan-out. If the add fails (event already processed) the message is
+#     dropped — no SET, no XADD. region-events therefore contains each
+#     event_id at most once, even when NATS redelivers after a crash.
+
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+
+input:
+  label: jetstream_source
+  nats_jetstream:
+    urls: [nats://nats:4222]
+    subject: app.events.>
+    durable: region-writer
+    deliver: all
+    ack_wait: 30s
+
+pipeline:
+  threads: 2
+  processors:
+    # Dedup gate: SET NX EX on event:<id>. If the key already exists, the
+    # cache `add` operator errors, and the next mapping drops the message.
+    - try:
+        - cache:
+            resource: dedup_cache
+            operator: add
+            key: event:${! this.event_id }
+            value: "1"
+            ttl: 86400s
+    - mapping: |
+        if errored() {
+          root = deleted()
+        } else {
+          meta key        = this.key
+          meta event_id   = this.event_id
+          meta pattern    = this.pattern
+          meta t_send_ms  = this.t_send_ms.string()
+          meta applied_ms = (timestamp_unix_nano() / 1000000).string()
+          root = this.value
+        }
+
+output:
+  label: region_sink
+  broker:
+    pattern: fan_out
+    outputs:
+      - cache:
+          target: region_kv
+          key: ${! meta("key") }
+          max_in_flight: 64
+      - redis_streams:
+          url: redis://redis-region:6379
+          stream: region-events
+          body_key: value
+          max_length: 100000
+          max_in_flight: 64
+          metadata:
+            exclude_prefixes: ["nats_"]
+
+cache_resources:
+  - label: region_kv
+    redis:
+      url: redis://redis-region:6379
+      kind: simple
+  - label: dedup_cache
+    redis:
+      url: redis://redis-region:6379
+      kind: simple
+
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
