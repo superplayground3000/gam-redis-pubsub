@@ -1,64 +1,60 @@
-# RESEARCH — redis-redpanda-connect-stress
+# RESEARCH — redis-redpanda-throughput-stress
 
-## What stress proves
+## What this lab proves vs parent
 
-This lab demonstrates two things about Redpanda Connect that the parent `redis-redpanda-qos-resilience` lab cannot:
+The parent (`../redis-redpanda-connect-stress/`) is a 3-axis matrix: tiers × modes × profiles, with chaos drills and per-tier p99 ceilings. It asks: "do the QoS guarantees hold under load?"
 
-1. **Connect sustains real throughput.** The parent lab runs at 1 msg/s — enough to observe QoS semantics in human time, but not enough to surface throughput, batching, or backpressure behavior. This lab pushes 10 / 1 000 / 10 000 msg/s and verifies the pipeline keeps up.
-2. **QoS guarantees hold under load.** The same chaos drill the parent uses (kill `connect-sink` for ~8 s) is run at every tier — including 10 k msg/s. At that rate, ~80 000 messages back up in JetStream during the outage. The lab verifies they all reach `region-events` after recovery (under ALO/EOE) within a bounded latency.
+This lab strips that to one axis. It asks: **"where does this pipeline top out, and how much of the ceiling comes from writer-side batching?"**
 
-## Why a fork, not an extension
+- One profile (ALO), no chaos.
+- Two writer modes (batch vs single-XADD), exposed as a hot-swap on `POST /rate`.
+- Six tiers from 5k to 50k msg/s.
+- Three hashtag-wrapped key patterns (`employee`, `role`, `org`), 60 000 unique keys, weighted picker.
+- Calibration-mode verdict: rate floor + `missing == 0` are gated; p99 sync-latency is reported but un-gated until calibrated.
 
-- The parent's WebSocket dashboard, per-key keyspace notifications, and last-value-per-key model all break at high throughput. Stripping them would gut the parent lab; forking lets each lab stay true to its purpose.
-- The parent runs unbounded; this lab caps Redis streams, JetStream bytes, and every container's CPU+memory so a stress run cannot stutter the host.
+## Sync-latency = `applied_ms − t_send_ms`
 
-## Why a wide key space + monotonic seq
+Parent's "latency" was computed at the receiver: `receiver_now − ts_ns`, including XREAD polling and regional XADD round-trip. Useful, but not strictly "central Redis vs regional Redis".
 
-At 10 k msg/s, the parent's 9-cycling-keys model results in ~1 111 writes/s per key — pure last-write-wins churn at Redis with no observability value. Wide key space (100 000 distinct keys) ensures no key is hammered; verification shifts from per-key last-value to **count match + sampled e2e latency**.
+This lab reads two timestamps from each `region-events` stream entry:
 
-## Why live `POST /rate` instead of writer recreate
+- `t_send_ms` — writer-stamped, immediately before central XADD.
+- `applied_ms` — Connect-sink-stamped (via `meta applied_ms = (timestamp_unix_nano() / 1000000).string()` in `connect/reverse.yaml`), immediately before regional fan-out.
 
-Recreating the writer container between tiers takes ~5 s × 9 = ~45 s of wasted wall-clock per matrix run, and the reconnect storm can interfere with the previous tier's drain (which would corrupt counts). A live HTTP rate endpoint lets the harness flip targets in <100 ms with zero connection churn.
+Sync latency = `applied_ms − t_send_ms`. Covers writer → central XADD ack → Connect-source pull → JetStream publish/ack → Connect-sink consume. Does **not** include the final SET round-trip to regional — sub-millisecond on a single host, dominated by Connect/JetStream cost.
 
-## Why a one-shot collector instead of a live dashboard
+## Why hot-swap mode (not container restart)
 
-Two reasons:
+Twelve mode-switches per matrix run × ~5 s container recreate = 60 s wasted + a reconnect storm against central Redis. The writer's `POST /rate` now accepts `{ "mode": "batch"|"single" }` alongside `rate`; mode swap is atomic (single `atomic.Int32`) and observed by every worker at the top of each loop iteration. Zero connection churn.
 
-1. **Sampling rate**: at 10 k msg/s, a WebSocket-driven UI would either drop frames or flood the browser. The collector samples at 1 Hz — fast enough to catch backpressure, slow enough to never become the bottleneck.
-2. **Reproducibility**: post-run JSON reports are diffable and storable. A live dashboard is a moment in time; a JSON file is a permanent artifact.
+## Why hashtags on three patterns
 
-## Why `MAXLEN ~` and `--max-bytes`
+Real workloads pin related keys to the same Cluster slot via `{...}` hashtags. Even though this lab runs single-Redis nodes (not a cluster), keeping the hashtag shape:
 
-A 30 s run at 10 k msg/s produces ~300 k messages × ~300 bytes = ~90 MB in Redis and ~120 MB in NATS. Across 9 runs that compounds. `XADD ... MAXLEN ~ 100000` and JetStream `--max-bytes=256MB` bound the storage so a runaway run can't fill the disk or push the host into swap.
+- Surfaces realistic key-allocation patterns for the Connect/JetStream pipeline (longer keys, JSON-envelope size).
+- Lets a future Cluster topology slot-pin without rewriting the writer.
+- Forces the receiver to handle per-pattern accounting, which is the more interesting per-message report than parent's anonymous `stress:<int>` keys.
 
-## Verdict logic in one sentence
+20 000 unique IDs per pattern × 3 patterns = 60 000 keys. At 50k/s × 30 s = 1.5 M writes, that's ~25 hits per key — enough churn to exercise downstream cache writes, not so much that the pipeline becomes a per-key hot loop.
 
-A run passes iff: achieved rate ≥ `slo.rate_min_pct × target`, missing messages = 0 (unless profile = AMO), and (for latency/chaos modes) p99 latency ≤ tier SLO.
+## Why STREAM_MAXLEN = 2 000 000 (was 100 000 in parent)
+
+50k/s × 30s = 1.5 M peak. Parent's 100 k cap trimmed aggressively at 10k; at 50k it would discard 93% of entries before the receiver could read them. 2 M caps the stream at ~33% headroom over peak. Receiver is still untainted by MAXLEN trimming (streaming `XREAD BLOCK` reads every entry as it arrives; trim only matters for end-of-run XLEN), but the larger cap lets operators eyeball stream contents post-run.
+
+## Why calibration-mode verdict
+
+There's no reference number for what p99 sync-latency *should* be at, say, 30k batch mode on a given host. Hard-coding a guess turns the verdict into noise. Ship with `TIER_P99_MS=""` for every tier; collector's `--slo-p99-ms <= 0` flag skips the p99 gate; run the full matrix once on real hardware; pick ceilings; commit them. Future runs gate on real numbers.
+
+## Quiescence note (inherited from parent v2)
+
+Source-side quiescence uses `GroupLag("app.events", "propagator") == 0`, NOT `XLEN("app.events") == 0`. Redis streams don't shrink on ack, so XLEN never returns to zero during a run. The parent lab fixed this in commit `bdf31a9` ("Redis streams don't shrink on ack, so XLEN is not the right metric here"). We inherit the fixed signal. Sink-side uses `ScrapeJSZ.MaxPending == 0`. Both required; tail-flush 1500ms after observation before cancelling the receiver (parent commit `1e9e7b2`).
 
 ## Pointers
 
-- Design spec: [`../../docs/superpowers/specs/2026-05-24-redis-redpanda-connect-stress-design.md`](../../docs/superpowers/specs/2026-05-24-redis-redpanda-connect-stress-design.md)
-- Implementation plan: [`../../docs/superpowers/plans/2026-05-24-redis-redpanda-connect-stress.md`](../../docs/superpowers/plans/2026-05-24-redis-redpanda-connect-stress.md)
-- Parent lab RESEARCH: [`../redis-redpanda-qos-resilience/RESEARCH.md`](../redis-redpanda-qos-resilience/RESEARCH.md)
-- Production architecture deep-dive that informed both labs: [`../../redis-redpanda-design-ptr/research.md`](../../redis-redpanda-design-ptr/research.md)
+- Design spec: [`../../docs/superpowers/specs/2026-05-26-redis-redpanda-throughput-stress-design.md`](../../docs/superpowers/specs/2026-05-26-redis-redpanda-throughput-stress-design.md)
+- Implementation plan: [`../../docs/superpowers/plans/2026-05-26-redis-redpanda-throughput-stress.md`](../../docs/superpowers/plans/2026-05-26-redis-redpanda-throughput-stress.md)
+- Parent lab: [`../redis-redpanda-connect-stress/RESEARCH.md`](../redis-redpanda-connect-stress/RESEARCH.md)
 - Redpanda Connect docs: <https://docs.redpanda.com/redpanda-connect/about/>
-- NATS JetStream concepts: <https://docs.nats.io/nats-concepts/jetstream>
+- Redis Cluster hashtags: <https://redis.io/docs/latest/operate/oss_and_stack/reference/cluster-spec/#hash-tags>
+- NATS JetStream: <https://docs.nats.io/nats-concepts/jetstream>
 - HDR Histogram: <https://github.com/HdrHistogram/hdrhistogram-go>
-
-## v2 measurement-vs-pipeline distinction
-
-The first v1 full-matrix run on 2026-05-25 revealed that three of the lab's "failures" were measurement artifacts, not pipeline failures:
-
-1. **Latency P99 was polling-window-biased.** v1 sampled 200 messages/s from `XRANGE`; at 10 k msg/s that captured ~2 % of messages and the reported `now − ts_ns` was inflated by up to one polling window (~1 s). v2's streaming `XREAD BLOCK` consumer reads every message at line rate, so `latency_ms.p99` now reflects true e2e propagation.
-2. **`missing` confused MAXLEN trim with loss.** v1 computed `missing = sent − XLEN(region-events)`. The region stream has `MAXLEN ~ 100000`; at 10 k × 30 s, 200 k older entries were trimmed by design. v1 reported them as "missing" and failed the verdict. v2 sources `received` from the streaming consumer (untainted) and surfaces `trimmed` separately so operators can see the storage decision didn't lose messages.
-3. **NATS state survived across matrix runs.** v1 ran 9 tier×mode combinations against the same persistent `nats-data` volume; the 256 MB JetStream cap accumulated bytes until the 10 k chaos run aborted on the 200 MB pre-flight. v2's harness purges `APP_EVENTS` after every run so each tier starts hermetic.
-
-The pipeline under test (writer → connect-source → JetStream → connect-sink → region Redis) is byte-identical between v1 and v2. The only changes are in the measurement layer (collector) and the harness's between-run hygiene.
-
-### Why a streaming consumer (not just a bigger XRANGE)
-
-A poll that samples 1 000 messages/s instead of 200 would still miss 90 % of messages at 10 k msg/s, and its reported "latency" would still include polling-window bias. The streaming model is the only one that observes *every* message at arrival time, which is both the right metric and a side benefit: the same consumer that records latency also provides the trim-free `received` count.
-
-### Why profile-aware quiescence
-
-The amo-reverse leg uses an ephemeral, deliver-new, `ack_wait: 2s`, `auto_replay_nacks: false` consumer. `num_pending` is meaningless for that consumer (it's recreated each connect-sink restart and ignores backlog by design — that's how AMO loses messages). v2's pipeline-quiescence wait checks `XLEN(app.events) == 0` for all profiles plus `NATS num_pending == 0` only for ALO/EOE; AMO falls through to `slo.allow_missing=true` so any unconsumed backlog at end-of-run is accepted as the modeled loss.
