@@ -102,7 +102,7 @@ services:
       redis-central: { condition: service_healthy }
       nats-init: { condition: service_completed_successfully }
     volumes:
-      - ./connect/${PROFILE_QOS:-alo}-forward.yaml:/connect.yaml:ro
+      - ./connect/forward.yaml:/connect.yaml:ro
     command: ["run", "/connect.yaml"]
     ports:
       - "${CONNECT_SRC_PORT:-18195}:4195"
@@ -123,7 +123,7 @@ services:
       redis-region: { condition: service_healthy }
       nats-init: { condition: service_completed_successfully }
     volumes:
-      - ./connect/${PROFILE_QOS:-alo}-reverse.yaml:/connect.yaml:ro
+      - ./connect/reverse.yaml:/connect.yaml:ro
     command: ["run", "/connect.yaml"]
     ports:
       - "${CONNECT_SINK_PORT:-18196}:4195"
