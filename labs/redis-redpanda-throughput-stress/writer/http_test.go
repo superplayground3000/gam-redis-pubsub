@@ -94,6 +94,19 @@ func TestRate_RejectsOutOfRangeRate(t *testing.T) {
 	}
 }
 
+func TestRate_BothFieldsApplied(t *testing.T) {
+	s, mode := newTestServer()
+	s.Lim.Set(0)
+	_ = mode.SetByName("batch")
+	code, _ := doRate(t, s, `{"rate": 12345, "mode": "single"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d", code)
+	}
+	if s.Lim.Current() != 12345 || mode.Get() != ModeSingle {
+		t.Fatalf("after apply: rate=%d mode=%v, want 12345 single", s.Lim.Current(), mode.Get())
+	}
+}
+
 func TestRate_InvalidModeDoesNotMutateRate(t *testing.T) {
 	s, _ := newTestServer()
 	s.Lim.Set(5000) // baseline

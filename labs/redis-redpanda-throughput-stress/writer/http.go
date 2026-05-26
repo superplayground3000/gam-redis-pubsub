@@ -91,9 +91,11 @@ func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	// All validated. Now apply.
-	if rq.Rate != nil {
-		s.Lim.Set(*rq.Rate)
-	}
+	// Apply mode BEFORE rate so any brief intermediate state observed by a
+	// concurrent worker is (old rate, new mode), not (new rate, old mode).
+	// The former is always safe: a worker briefly runs the new mode at the
+	// still-lower old rate. The latter could let a worker burst at the new
+	// (potentially higher) rate while still in the old mode.
 	if newMode != nil {
 		// SetByName is idempotent-on-success; we already validated, but call it
 		// so the atomic store is the single source of truth.
@@ -102,6 +104,9 @@ func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
 		} else {
 			_ = s.Mode.SetByName("single")
 		}
+	}
+	if rq.Rate != nil {
+		s.Lim.Set(*rq.Rate)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(rateResp{

@@ -27,10 +27,12 @@ type Worker struct {
 
 // Run drives this worker's send loop. Two control-plane signals are honored:
 //   - rate: re-read every iteration via Lim.Current(); WaitN bounds latency to ~500ms.
-//   - mode: re-read at iteration top AND after WaitN. A /rate mode flip is observed
-//     within ~one in-flight batch (typically <100ms at 50k/s with depth≈5000); the
-//     batch in flight when the flip arrives completes in the old mode. This matches
-//     the spec's "re-read at top of every iteration" contract.
+//   - mode: re-read at the TOP of every iteration via Mode.Get(). A /rate mode
+//     flip takes effect on the next iteration that hasn't yet entered WaitN.
+//     Any batch already in flight (post-WaitN or mid-Exec) completes in the
+//     mode that was active when its iteration started — that's the spec's
+//     "re-read at top of every iteration" contract. Typical observed latency
+//     at 50k/s with adaptive depth is one batch (~100ms).
 func (w *Worker) Run(ctx context.Context) {
 	w.rng = rand.New(rand.NewSource(int64(w.ID)*1_000_003 + time.Now().UnixNano()))
 	var seq int64
@@ -61,14 +63,6 @@ func (w *Worker) Run(ctx context.Context) {
 				return
 			}
 			continue
-		}
-		// Re-check mode after WaitN so a mid-wait flip is observed on this batch,
-		// not deferred to the next iteration. Tokens are already spent — we
-		// honor depth here; the next iteration picks up the new mode for batch
-		// sizing as well.
-		if w.Mode.Get() != mode {
-			mode = w.Mode.Get()
-			// No depth adjustment — tokens already reserved.
 		}
 		w.Counters.Inflight.Add(1)
 		pipe := w.RDB.Pipeline()
