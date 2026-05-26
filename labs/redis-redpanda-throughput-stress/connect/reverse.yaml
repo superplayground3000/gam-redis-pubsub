@@ -37,13 +37,13 @@ output:
       - cache:
           target: region_kv
           key: ${! meta("key") }
-          max_in_flight: 64
+          max_in_flight: 256
       - redis_streams:
           url: redis://redis-region:6379
           stream: region-events
           body_key: value
-          max_length: 100000
-          max_in_flight: 64
+          max_length: 2000000
+          max_in_flight: 256
           metadata:
             exclude_prefixes: ["nats_"]
 

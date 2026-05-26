@@ -47,7 +47,7 @@ output:
     headers:
       Nats-Msg-Id: ${! meta("event_id") }
       Content-Type: application/json
-    max_in_flight: 256
+    max_in_flight: 1024
 
 logger:
   level: INFO
