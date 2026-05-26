@@ -25,6 +25,12 @@ type Worker struct {
 	rng          *rand.Rand
 }
 
+// Run drives this worker's send loop. Two control-plane signals are honored:
+//   - rate: re-read every iteration via Lim.Current(); WaitN bounds latency to ~500ms.
+//   - mode: re-read at iteration top AND after WaitN. A /rate mode flip is observed
+//     within ~one in-flight batch (typically <100ms at 50k/s with depth≈5000); the
+//     batch in flight when the flip arrives completes in the old mode. This matches
+//     the spec's "re-read at top of every iteration" contract.
 func (w *Worker) Run(ctx context.Context) {
 	w.rng = rand.New(rand.NewSource(int64(w.ID)*1_000_003 + time.Now().UnixNano()))
 	var seq int64
@@ -56,9 +62,21 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			continue
 		}
+		// Re-check mode after WaitN so a mid-wait flip is observed on this batch,
+		// not deferred to the next iteration. Tokens are already spent — we
+		// honor depth here; the next iteration picks up the new mode for batch
+		// sizing as well.
+		if w.Mode.Get() != mode {
+			mode = w.Mode.Get()
+			// No depth adjustment — tokens already reserved.
+		}
 		w.Counters.Inflight.Add(1)
 		pipe := w.RDB.Pipeline()
-		patternsThisBatch := make([]int, 0, depth)
+		type pendingCmd struct {
+			cmd     *redis.StringCmd
+			pattern int
+		}
+		pending := make([]pendingCmd, 0, depth)
 		for i := 0; i < depth; i++ {
 			seq++
 			pat := w.Picker.Pick(w.rng)
@@ -77,7 +95,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			p := NewPayload(base|seq, w.PayloadBytes)
 			body, _ := p.JSON()
-			pipe.XAdd(ctx, &redis.XAddArgs{
+			cmd := pipe.XAdd(ctx, &redis.XAddArgs{
 				Stream: w.StreamKey,
 				MaxLen: w.StreamMaxLen,
 				Approx: true,
@@ -89,20 +107,32 @@ func (w *Worker) Run(ctx context.Context) {
 					"t_send_ms": p.TsNs / 1_000_000,
 				},
 			})
-			patternsThisBatch = append(patternsThisBatch, pat)
+			pending = append(pending, pendingCmd{cmd: cmd, pattern: pat})
 		}
-		_, err = pipe.Exec(ctx)
+		_, execErr := pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
-		if err != nil {
-			w.Counters.Errors.Add(int64(depth))
-			if ctx.Err() == nil {
-				log.Printf("worker %d: pipeline error: %v", w.ID, err)
+
+		// Per-command accounting. Even on Exec returning non-nil, individual cmds
+		// may have succeeded — credit them to Sent/SentByPattern, charge only the
+		// failed ones to Errors. See go-redis Pipeline.Exec which returns the
+		// first-failed-cmd error; per-cmd .Err() is the source of truth.
+		var sentDelta, errDelta int64
+		for _, pc := range pending {
+			if pc.cmd.Err() == nil {
+				sentDelta++
+				w.Counters.SentByPattern[pc.pattern].Add(1)
+			} else {
+				errDelta++
 			}
-		} else {
-			w.Counters.Sent.Add(int64(depth))
-			for _, pat := range patternsThisBatch {
-				w.Counters.SentByPattern[pat].Add(1)
-			}
+		}
+		if sentDelta > 0 {
+			w.Counters.Sent.Add(sentDelta)
+		}
+		if errDelta > 0 {
+			w.Counters.Errors.Add(errDelta)
+		}
+		if execErr != nil && ctx.Err() == nil {
+			log.Printf("worker %d: pipeline error (%d/%d cmds failed): %v", w.ID, errDelta, len(pending), execErr)
 		}
 	}
 }

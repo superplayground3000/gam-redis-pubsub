@@ -93,3 +93,15 @@ func TestRate_RejectsOutOfRangeRate(t *testing.T) {
 		t.Fatalf("status = %d, want 400", code)
 	}
 }
+
+func TestRate_InvalidModeDoesNotMutateRate(t *testing.T) {
+	s, _ := newTestServer()
+	s.Lim.Set(5000) // baseline
+	code, _ := doRate(t, s, `{"rate": 9999, "mode": "yolo"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if s.Lim.Current() != 5000 {
+		t.Fatalf("rate mutated to %d despite mode validation failure, want 5000", s.Lim.Current())
+	}
+}

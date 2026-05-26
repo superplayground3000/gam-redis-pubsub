@@ -69,17 +69,38 @@ func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
+	// Validate first (no state mutation).
 	if rq.Rate != nil {
 		if *rq.Rate < 0 || *rq.Rate > s.MaxRate {
 			http.Error(w, fmt.Sprintf("rate %d out of range [0,%d]", *rq.Rate, s.MaxRate), http.StatusBadRequest)
 			return
 		}
+	}
+	var newMode *Mode
+	if rq.Mode != nil {
+		switch *rq.Mode {
+		case "batch":
+			m := ModeBatch
+			newMode = &m
+		case "single":
+			m := ModeSingle
+			newMode = &m
+		default:
+			http.Error(w, fmt.Sprintf("invalid mode %q: want batch|single", *rq.Mode), http.StatusBadRequest)
+			return
+		}
+	}
+	// All validated. Now apply.
+	if rq.Rate != nil {
 		s.Lim.Set(*rq.Rate)
 	}
-	if rq.Mode != nil {
-		if err := s.Mode.SetByName(*rq.Mode); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
+	if newMode != nil {
+		// SetByName is idempotent-on-success; we already validated, but call it
+		// so the atomic store is the single source of truth.
+		if *newMode == ModeBatch {
+			_ = s.Mode.SetByName("batch")
+		} else {
+			_ = s.Mode.SetByName("single")
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
