@@ -16,14 +16,32 @@ type Snapshot struct {
 	NATS          NATSSnap
 }
 
+// WriterOK reports whether this snapshot's writer /metrics scrape succeeded.
+// We detect by presence of the always-emitted stress_writer_sent_total counter.
+func (s Snapshot) WriterOK() bool {
+	_, ok := s.WriterMetrics["stress_writer_sent_total"]
+	return ok
+}
+
+// ConnectSrcOK / ConnectSinkOK — same idea for the Connect scrapes.
+func (s Snapshot) ConnectSrcOK() bool {
+	_, ok := s.ConnectSrc["input_received"]
+	return ok
+}
+
+func (s Snapshot) ConnectSinkOK() bool {
+	_, ok := s.ConnectSink["input_received"]
+	return ok
+}
+
 type Sampler struct {
-	WriterURL    string
-	ConnectSrc   string
-	ConnectSink  string
-	NATSURL      string
-	NATSStream   string
-	Central      *StreamClient
-	Region       *StreamClient
+	WriterURL   string
+	ConnectSrc  string
+	ConnectSink string
+	NATSURL     string
+	NATSStream  string
+	Central     *StreamClient
+	Region      *StreamClient
 }
 
 // Tick takes a single snapshot of all instrumented services.
@@ -58,4 +76,3 @@ func (s *Sampler) Tick(ctx context.Context) Snapshot {
 	}
 	return snap
 }
-

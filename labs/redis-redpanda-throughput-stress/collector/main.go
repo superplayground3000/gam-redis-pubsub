@@ -246,15 +246,43 @@ func buildReport(
 		"role":     receiver.CountByPattern("role"),
 		"org":      receiver.CountByPattern("org"),
 	}
-	if len(snaps) > 0 {
-		last := snaps[len(snaps)-1]
-		r.Sent = int64(last.WriterMetrics["stress_writer_sent_total"])
-		r.Errors = int64(last.WriterMetrics["stress_writer_errors_total"])
-		r.Connect.SourceIn = int64(last.ConnectSrc["input_received"])
-		r.Connect.SourceOut = int64(last.ConnectSrc["output_sent"])
-		r.Connect.SinkIn = int64(last.ConnectSink["input_received"])
-		r.Connect.SinkOut = int64(last.ConnectSink["output_sent"])
-		r.NATS.Bytes = last.NATS.Bytes
+	// Carry-forward the most recent successful scrape per source. A failed final
+	// scrape would otherwise silently zero r.Sent and make r.Missing meaningless.
+	// Track separately because writer/connect/nats can each fail independently.
+	var lastWriterOK, lastSrcOK, lastSinkOK *Snapshot
+	for i := len(snaps) - 1; i >= 0; i-- {
+		s := &snaps[i]
+		if lastWriterOK == nil && s.WriterOK() {
+			lastWriterOK = s
+		}
+		if lastSrcOK == nil && s.ConnectSrcOK() {
+			lastSrcOK = s
+		}
+		if lastSinkOK == nil && s.ConnectSinkOK() {
+			lastSinkOK = s
+		}
+		if lastWriterOK != nil && lastSrcOK != nil && lastSinkOK != nil {
+			break
+		}
+	}
+	if lastWriterOK != nil {
+		r.Sent = int64(lastWriterOK.WriterMetrics["stress_writer_sent_total"])
+		r.Errors = int64(lastWriterOK.WriterMetrics["stress_writer_errors_total"])
+	}
+	if lastSrcOK != nil {
+		r.Connect.SourceIn = int64(lastSrcOK.ConnectSrc["input_received"])
+		r.Connect.SourceOut = int64(lastSrcOK.ConnectSrc["output_sent"])
+	}
+	if lastSinkOK != nil {
+		r.Connect.SinkIn = int64(lastSinkOK.ConnectSink["input_received"])
+		r.Connect.SinkOut = int64(lastSinkOK.ConnectSink["output_sent"])
+	}
+	// NATS bytes: use the last non-zero value (or 0 if never sampled successfully).
+	for i := len(snaps) - 1; i >= 0; i-- {
+		if snaps[i].NATS.Bytes > 0 {
+			r.NATS.Bytes = snaps[i].NATS.Bytes
+			break
+		}
 	}
 	r.Missing = r.Sent - r.Received
 	if r.Missing < 0 {
@@ -262,6 +290,17 @@ func buildReport(
 	}
 	if r.Sent > 0 {
 		r.MissingPct = float64(r.Missing) / float64(r.Sent) * 100.0
+	}
+	if r.Received > r.Sent && r.Sent > 0 {
+		log.Printf("WARN: received (%d) > sent (%d) — possible scrape failure; missing is unreliable", r.Received, r.Sent)
+	}
+	r.LatencyParseErrors = receiver.LatencyParseErrors()
+	if r.LatencyParseErrors > 0 {
+		log.Printf("WARN: %d latency-field parse failures detected (out of %d received). sync_latency histogram excludes these — interpret with caution.", r.LatencyParseErrors, r.Received)
+	}
+	r.NegativeLatencyDeltas = receiver.NegativeLatencyDeltas()
+	if r.NegativeLatencyDeltas > 0 {
+		log.Printf("WARN: %d negative sync-latency deltas observed (clock skew or wrong-field path). Clamped to 1ms in histogram.", r.NegativeLatencyDeltas)
 	}
 
 	var minRate float64 = 1e18
@@ -310,6 +349,9 @@ func buildReport(
 		LatencyP99Ms:    r.SyncLatency.P99Ms,
 		SLO:             cfg.SLO,
 	})
+	if cfg.SLO.LatencyP99MsMax == nil {
+		log.Printf("WARN: p99 latency gate is SKIPPED (calibration mode). Run produced p99=%.1fms but verdict ignored it. Set --slo-p99-ms to gate.", r.SyncLatency.P99Ms)
+	}
 	return r
 }
 

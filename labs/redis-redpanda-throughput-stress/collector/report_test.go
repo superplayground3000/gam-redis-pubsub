@@ -19,11 +19,13 @@ func TestReport_JSONShape(t *testing.T) {
 		ReceivedByPattern: map[string]int64{
 			"employee": 497612, "role": 497615, "org": 497614,
 		},
-		Trimmed:           0,
-		Missing:           2665,
-		SyncLatency:       LatencySummary{P50Ms: 142.3, P95Ms: 612.1, P99Ms: 1180.4, P999Ms: 1843.2, MaxMs: 2010.7, Samples: 1492841},
-		ReceivedErrors:    0,
-		QuiescenceTimeout: false,
+		Trimmed:               0,
+		Missing:               2665,
+		SyncLatency:           LatencySummary{P50Ms: 142.3, P95Ms: 612.1, P99Ms: 1180.4, P999Ms: 1843.2, MaxMs: 2010.7, Samples: 1492841},
+		ReceivedErrors:        0,
+		LatencyParseErrors:    0,
+		NegativeLatencyDeltas: 0,
+		QuiescenceTimeout:     false,
 		Verdict: Verdict{
 			Pass:   true,
 			Detail: VerdictDetail{RateFloorOk: true, MissingOk: true, P99LatencyOk: nil},
@@ -42,6 +44,8 @@ func TestReport_JSONShape(t *testing.T) {
 		`"count": 1492841`,
 		`"received_by_pattern"`,
 		`"p99_latency_ok": null`,
+		`"latency_parse_errors":`,
+		`"negative_latency_deltas":`,
 	} {
 		if !strings.Contains(s, want) {
 			t.Errorf("missing %q in JSON:\n%s", want, s)

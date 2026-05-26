@@ -59,6 +59,27 @@ func TestReceiver_ProcessCountsAndPatternsAndLatency(t *testing.T) {
 	}
 }
 
+func TestReceiver_LatencyParseErrorsCounted(t *testing.T) {
+	r := &Receiver{stream: "region-events", latency: NewLatencyTracker()}
+	streams := []redis.XStream{{
+		Stream: "region-events",
+		Messages: []redis.XMessage{
+			{ID: "1-0", Values: map[string]any{"pattern": "employee"}},                                           // missing t_send_ms + applied_ms
+			{ID: "2-0", Values: map[string]any{"pattern": "role", "t_send_ms": "not-an-int", "applied_ms": "1"}}, // bad parse
+		},
+	}}
+	r.processStreams(streams)
+	if r.Count() != 2 {
+		t.Fatalf("Count = %d, want 2", r.Count())
+	}
+	if r.LatencyParseErrors() != 2 {
+		t.Fatalf("LatencyParseErrors = %d, want 2", r.LatencyParseErrors())
+	}
+	if r.Latency().Samples != 0 {
+		t.Fatalf("latency Samples = %d, want 0 (all parses failed)", r.Latency().Samples)
+	}
+}
+
 func TestReceiver_UnknownPatternStillCounted(t *testing.T) {
 	r := &Receiver{stream: "region-events", latency: NewLatencyTracker()}
 	now := time.Now().UnixMilli()

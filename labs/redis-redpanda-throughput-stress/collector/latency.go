@@ -40,7 +40,8 @@ func readMsField(fields map[string]any, name string) (int64, error) {
 }
 
 type LatencyTracker struct {
-	h *hdrhistogram.Histogram
+	h        *hdrhistogram.Histogram
+	negCount int64
 }
 
 func NewLatencyTracker() *LatencyTracker {
@@ -48,9 +49,15 @@ func NewLatencyTracker() *LatencyTracker {
 	return &LatencyTracker{h: hdrhistogram.New(1, 300_000, 3)}
 }
 
+// NegativeDeltas returns the count of RecordMs calls that received a negative
+// input (clock skew or wrong-field path). The negative value was clamped to 1
+// for histogram correctness, but the count is preserved for diagnostics.
+func (l *LatencyTracker) NegativeDeltas() int64 { return l.negCount }
+
 // RecordMs clamps negatives to 1 (clock-skew artifact) and ceils to the histogram max.
 func (l *LatencyTracker) RecordMs(d int64) {
 	if d < 1 {
+		l.negCount++
 		d = 1
 	}
 	if d > 300_000 {

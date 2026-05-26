@@ -10,11 +10,12 @@ import (
 )
 
 type Receiver struct {
-	rdb      *redis.Client
-	stream   string
-	latency  *LatencyTracker
-	received atomic.Int64
-	errCount atomic.Int64
+	rdb              *redis.Client
+	stream           string
+	latency          *LatencyTracker
+	received         atomic.Int64
+	errCount         atomic.Int64
+	latencyParseErrs atomic.Int64
 	// Per-pattern counters: index aligns with PatternEmployee/PatternRole/PatternOrg.
 	byPattern [3]atomic.Int64
 	lastID    string
@@ -28,10 +29,12 @@ func NewReceiver(addr, stream string) *Receiver {
 	}
 }
 
-func (r *Receiver) Count() int64            { return r.received.Load() }
-func (r *Receiver) Errors() int64           { return r.errCount.Load() }
-func (r *Receiver) Latency() LatencySummary { return r.latency.Summary() }
-func (r *Receiver) Close() error            { return r.rdb.Close() }
+func (r *Receiver) Count() int64                 { return r.received.Load() }
+func (r *Receiver) Errors() int64                { return r.errCount.Load() }
+func (r *Receiver) Latency() LatencySummary      { return r.latency.Summary() }
+func (r *Receiver) LatencyParseErrors() int64    { return r.latencyParseErrs.Load() }
+func (r *Receiver) NegativeLatencyDeltas() int64 { return r.latency.NegativeDeltas() }
+func (r *Receiver) Close() error                 { return r.rdb.Close() }
 
 func (r *Receiver) CountByPattern(name string) int64 {
 	switch name {
@@ -51,6 +54,8 @@ func (r *Receiver) processStreams(streams []redis.XStream) {
 			r.received.Add(1)
 			if d, err := extractSyncLatencyMs(msg.Values); err == nil {
 				r.latency.RecordMs(d)
+			} else {
+				r.latencyParseErrs.Add(1)
 			}
 			if v, ok := msg.Values["pattern"].(string); ok {
 				switch v {

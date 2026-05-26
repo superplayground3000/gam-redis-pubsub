@@ -68,5 +68,16 @@ func TestLatencyTracker_ClampsNegative(t *testing.T) {
 	}
 }
 
+func TestLatencyTracker_NegativeDeltasCounted(t *testing.T) {
+	lt := NewLatencyTracker()
+	lt.RecordMs(-5)
+	lt.RecordMs(-1)
+	lt.RecordMs(0)
+	lt.RecordMs(10) // positive — should not increment negCount
+	if lt.NegativeDeltas() != 3 {
+		t.Fatalf("NegativeDeltas = %d, want 3", lt.NegativeDeltas())
+	}
+}
+
 // Compile-time sanity: latency.go references redis.XMessage internally.
 var _ redis.XMessage
