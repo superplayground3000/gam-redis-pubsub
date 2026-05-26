@@ -1,13 +1,11 @@
 package main
 
 type SLO struct {
-	RateMinPct   float64 `json:"rate_min_pct"`
-	LatencyP99Ms float64 `json:"latency_p99_ms"`
-	AllowMissing bool    `json:"allow_missing"`
+	RateMinPct      float64  `json:"rate_min_pct"`
+	LatencyP99MsMax *float64 `json:"latency_p99_ms_max"` // nil = calibration mode (gate skipped)
 }
 
 type VerdictInput struct {
-	Mode            string
 	RateTarget      int
 	RateAchievedAvg float64
 	Missing         int64
@@ -15,25 +13,28 @@ type VerdictInput struct {
 	SLO             SLO
 }
 
+type VerdictDetail struct {
+	RateFloorOk  bool  `json:"rate_floor_ok"`
+	MissingOk    bool  `json:"missing_ok"`
+	P99LatencyOk *bool `json:"p99_latency_ok"` // nil when SLO.LatencyP99MsMax is nil
+}
+
 type Verdict struct {
-	Pass   bool            `json:"pass"`
-	Checks map[string]bool `json:"checks"`
+	Pass   bool          `json:"pass"`
+	Detail VerdictDetail `json:"detail"`
 }
 
 func ComputeVerdict(in VerdictInput) Verdict {
-	checks := map[string]bool{}
-	checks["rate_ok"] = float64(in.RateTarget) == 0 ||
+	d := VerdictDetail{}
+	d.RateFloorOk = in.RateTarget == 0 ||
 		in.RateAchievedAvg/float64(in.RateTarget) >= in.SLO.RateMinPct
-	checks["missing_ok"] = in.SLO.AllowMissing || in.Missing == 0
-	if in.Mode == "latency" || in.Mode == "chaos" {
-		checks["latency_p99_ok"] = in.LatencyP99Ms <= in.SLO.LatencyP99Ms
+	d.MissingOk = in.Missing == 0
+
+	pass := d.RateFloorOk && d.MissingOk
+	if in.SLO.LatencyP99MsMax != nil {
+		ok := in.LatencyP99Ms <= *in.SLO.LatencyP99MsMax
+		d.P99LatencyOk = &ok
+		pass = pass && ok
 	}
-	pass := true
-	for _, ok := range checks {
-		if !ok {
-			pass = false
-			break
-		}
-	}
-	return Verdict{Pass: pass, Checks: checks}
+	return Verdict{Pass: pass, Detail: d}
 }
