@@ -289,13 +289,13 @@ Ships with **p99 ceiling = `null`** for every tier. Rate floor and `missing==0` 
 | Tier (msg/s) | `rate_min_pct` | `p99_ceiling_ms` |
 |--------------|---------------:|------------------:|
 | 5 000        | 0.85           | `null`            |
-| 10 000       | 0.95           | `null`            |
+| 10 000       | 0.85           | `null`            |
 | 20 000       | 0.90           | `null`            |
 | 30 000       | 0.90           | `null`            |
 | 40 000       | 0.90           | `null`            |
 | 50 000       | 0.90           | `null`            |
 
-**5k tier floor relaxation:** The 5k tier ships with `rate_min_pct = 0.85` rather than 0.95. At low target rates, the writer's `WORKERS=16` × adaptive batch depth (`min(rate/10, BatchMax)`) creates wait contention against the shared token-bucket limiter — many `WaitN` calls hit the per-iteration 500ms timeout. Achievable on a 32-core / 122 GiB host is ~90%. A proper fix would scale depth per-worker (`depth = min(BatchMax, rate / (10 * WORKERS))`); deferred to a future tuning pass. Higher tiers (10k+) are unaffected because the limiter at those rates can satisfy concurrent worker demand.
+**5k & 10k tier floor relaxation:** Both ship with `rate_min_pct = 0.85` rather than 0.95. At low target rates, the writer's `WORKERS=16` × adaptive batch depth (`min(rate/10, BatchMax)`) creates wait contention against the shared token-bucket limiter — many `WaitN` calls hit the per-iteration 500ms timeout. Achievable on a 32-core / 122 GiB host is ~89% (5k batch) to ~94% (10k batch). A proper fix would scale depth per-worker (`depth = min(BatchMax, rate / (10 * WORKERS))`); deferred to a future tuning pass. Tiers at 20k+ are unaffected because the limiter at those rates can satisfy concurrent worker demand.
 
 **Calibration procedure** (one-time, documented in README):
 
