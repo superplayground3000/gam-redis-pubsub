@@ -1,81 +1,83 @@
 package main
 
 import (
-	"encoding/json"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/redis/go-redis/v9"
 )
 
-func TestNewReceiverInitialState(t *testing.T) {
-	r := NewReceiver("redis-region:6379", "region-events")
-	defer r.Close()
-	if c := r.Count(); c != 0 {
-		t.Errorf("Count()=%d, want 0", c)
+func TestReceiver_ProcessCountsAndPatternsAndLatency(t *testing.T) {
+	r := &Receiver{
+		stream:  "region-events",
+		latency: NewLatencyTracker(),
 	}
-	if e := r.Errors(); e != 0 {
-		t.Errorf("Errors()=%d, want 0", e)
+	now := time.Now().UnixMilli()
+	mk := func(id string, pat string, latMs int64) redis.XMessage {
+		return redis.XMessage{
+			ID: id,
+			Values: map[string]any{
+				"value":      `{"event_id":"x","ts_ns":1,"seq":1,"pad":""}`,
+				"key":        "lb:company:active:{employee:1}",
+				"event_id":   "x",
+				"pattern":    pat,
+				"t_send_ms":  strconv.FormatInt(now-latMs, 10),
+				"applied_ms": strconv.FormatInt(now, 10),
+			},
+		}
 	}
-	s := r.Latency()
-	if s.Samples != 0 {
-		t.Errorf("Latency().Samples=%d, want 0", s.Samples)
+	streams := []redis.XStream{{
+		Stream: "region-events",
+		Messages: []redis.XMessage{
+			mk("1-0", "employee", 10),
+			mk("2-0", "role", 50),
+			mk("3-0", "org", 100),
+			mk("4-0", "employee", 200),
+		},
+	}}
+	r.processStreams(streams)
+
+	if r.Count() != 4 {
+		t.Fatalf("Count = %d, want 4", r.Count())
+	}
+	if r.CountByPattern("employee") != 2 {
+		t.Errorf("employee = %d, want 2", r.CountByPattern("employee"))
+	}
+	if r.CountByPattern("role") != 1 {
+		t.Errorf("role = %d, want 1", r.CountByPattern("role"))
+	}
+	if r.CountByPattern("org") != 1 {
+		t.Errorf("org = %d, want 1", r.CountByPattern("org"))
+	}
+	sum := r.Latency()
+	if sum.Samples != 4 {
+		t.Fatalf("latency Samples = %d, want 4", sum.Samples)
+	}
+	if sum.MaxMs < 150 {
+		t.Errorf("MaxMs = %v, want >= 150", sum.MaxMs)
 	}
 }
 
-func makeXStream(stream string, msgs []redis.XMessage) []redis.XStream {
-	return []redis.XStream{{Stream: stream, Messages: msgs}}
-}
-
-func makePayload(t *testing.T, tsNs int64) string {
-	t.Helper()
-	b, err := json.Marshal(map[string]any{
-		"event_id": "abc",
-		"ts_ns":    tsNs,
-		"seq":      int64(1),
-		"pad":      "xxxx",
-	})
-	if err != nil {
-		t.Fatal(err)
+func TestReceiver_UnknownPatternStillCounted(t *testing.T) {
+	r := &Receiver{stream: "region-events", latency: NewLatencyTracker()}
+	now := time.Now().UnixMilli()
+	streams := []redis.XStream{{
+		Stream: "region-events",
+		Messages: []redis.XMessage{{
+			ID: "1-0",
+			Values: map[string]any{
+				"pattern":    "garbage",
+				"t_send_ms":  strconv.FormatInt(now-1, 10),
+				"applied_ms": strconv.FormatInt(now, 10),
+			},
+		}},
+	}}
+	r.processStreams(streams)
+	if r.Count() != 1 {
+		t.Fatalf("Count = %d, want 1", r.Count())
 	}
-	return string(b)
-}
-
-func TestReceiverProcessStreamsCountsAndAdvancesLastID(t *testing.T) {
-	r := NewReceiver("127.0.0.1:0", "region-events")
-	defer r.Close()
-	now := time.Now().UnixNano()
-	msgs := []redis.XMessage{
-		{ID: "1-0", Values: map[string]any{"value": makePayload(t, now-50_000_000)}},
-		{ID: "1-1", Values: map[string]any{"value": makePayload(t, now-20_000_000)}},
-		{ID: "2-0", Values: map[string]any{"value": makePayload(t, now-10_000_000)}},
-	}
-	r.processStreams(makeXStream("region-events", msgs), now)
-	if c := r.Count(); c != 3 {
-		t.Errorf("Count()=%d, want 3", c)
-	}
-	if r.lastID != "2-0" {
-		t.Errorf("lastID=%q, want %q", r.lastID, "2-0")
-	}
-	if s := r.Latency(); s.Samples != 3 {
-		t.Errorf("Latency().Samples=%d, want 3", s.Samples)
-	}
-}
-
-func TestReceiverProcessStreamsCountsBadPayloadButSkipsLatency(t *testing.T) {
-	r := NewReceiver("127.0.0.1:0", "region-events")
-	defer r.Close()
-	now := time.Now().UnixNano()
-	msgs := []redis.XMessage{
-		{ID: "1-0", Values: map[string]any{"value": "not json"}},
-		{ID: "1-1", Values: map[string]any{"other": "no value field"}},
-		{ID: "1-2", Values: map[string]any{"value": makePayload(t, now-30_000_000)}},
-	}
-	r.processStreams(makeXStream("region-events", msgs), now)
-	if c := r.Count(); c != 3 {
-		t.Errorf("Count()=%d, want 3 (all three messages counted regardless of payload)", c)
-	}
-	if s := r.Latency(); s.Samples != 1 {
-		t.Errorf("Latency().Samples=%d, want 1 (only the valid payload recorded)", s.Samples)
+	if got := r.CountByPattern("garbage"); got != 0 {
+		t.Errorf("unknown pattern bucket = %d, want 0", got)
 	}
 }
