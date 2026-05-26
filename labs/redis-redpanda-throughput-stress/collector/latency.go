@@ -32,11 +32,15 @@ func readMsField(fields map[string]any, name string) (int64, error) {
 	if !ok {
 		return 0, fmt.Errorf("field %q has type %T, want string", name, v)
 	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("field %q not int: %w", name, err)
+	if n, err := strconv.ParseInt(s, 10, 64); err == nil {
+		return n, nil
 	}
-	return n, nil
+	// Fallback: Bloblang's `(int_expr).string()` on a float-typed expression
+	// renders as "1.77...e+12". Parse as float and truncate.
+	if f, err := strconv.ParseFloat(s, 64); err == nil {
+		return int64(f), nil
+	}
+	return 0, fmt.Errorf("field %q not int or float: %q", name, s)
 }
 
 type LatencyTracker struct {

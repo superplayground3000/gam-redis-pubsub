@@ -26,7 +26,7 @@ pipeline:
         meta event_id   = this.event_id
         meta pattern    = this.pattern
         meta t_send_ms  = this.t_send_ms.string()
-        meta applied_ms = (timestamp_unix_nano() / 1000000).string()
+        meta applied_ms = (timestamp_unix_nano() / 1000000).floor().string()
         root = this.value
 
 output:

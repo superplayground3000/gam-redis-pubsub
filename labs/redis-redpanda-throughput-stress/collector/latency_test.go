@@ -79,5 +79,22 @@ func TestLatencyTracker_NegativeDeltasCounted(t *testing.T) {
 	}
 }
 
+func TestExtractSyncLatencyMs_FloatString(t *testing.T) {
+	// Reproduces the Bloblang scientific-notation regression: collector must
+	// accept "1.77...e+12" as if it were the integer 1770000000000.
+	fields := map[string]any{
+		"t_send_ms":  "1779782642100",
+		"applied_ms": "1.7797826422187412e+12",
+	}
+	got, err := extractSyncLatencyMs(fields)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	// Expect roughly 118 (= 1779782642218 - 1779782642100). Allow ±2 for float truncation.
+	if got < 116 || got > 120 {
+		t.Fatalf("got %d, want ~118 (±2 for float trunc)", got)
+	}
+}
+
 // Compile-time sanity: latency.go references redis.XMessage internally.
 var _ redis.XMessage
