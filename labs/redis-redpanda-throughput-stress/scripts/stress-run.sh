@@ -57,6 +57,16 @@ done
 echo "[boot] starting compose services"
 docker compose up -d --wait
 
+# Pre-flight: purge JetStream BEFORE the first run. nats-init preserves an
+# existing APP_EVENTS stream across restarts, and the durable consumer
+# region-writer with deliver=all would otherwise replay stale messages into
+# the current run's region-events stream — inflating counts and corrupting
+# the verdict. (Per-run purge happens after each tier in run_one.)
+echo "[boot] purging stale APP_EVENTS (pre-flight)"
+docker run --rm --network rrts-net natsio/nats-box:0.14.5 \
+  nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
+  || echo "[purge] WARN: pre-flight purge failed (may be fresh boot — continuing)" >&2
+
 run_one() {
   local tier="$1" mode="$2"
   local rate_min_pct="${TIER_RATE_MIN_PCT[$tier]}"
