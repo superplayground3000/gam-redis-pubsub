@@ -16,7 +16,7 @@ services:
       - "${REDIS_CENTRAL_PORT:-18379}:6379"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "512m" }
+        limits: { cpus: "4.0", memory: "1g" }
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -39,7 +39,7 @@ services:
       - "${REDIS_REGION_PORT:-18380}:6379"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "512m" }
+        limits: { cpus: "4.0", memory: "1g" }
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 2s
@@ -56,7 +56,7 @@ services:
       - "${NATS_MON_PORT:-18322}:8222"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "1g" }
+        limits: { cpus: "4.0", memory: "2g" }
     volumes:
       - nats-data:/data
     healthcheck:
@@ -86,9 +86,9 @@ services:
             --retention limits \
             --discard old \
             --max-age 1h \
-            --max-bytes 256MB \
+            --max-bytes 2GB \
             --max-msgs=-1 \
-            --max-msg-size=1MB \
+            --max-msg-size=4KB \
             --dupe-window 5m \
             --defaults
         fi
@@ -108,7 +108,7 @@ services:
       - "${CONNECT_SRC_PORT:-18195}:4195"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "1g" }
+        limits: { cpus: "6.0", memory: "2g" }
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
       interval: 2s
@@ -129,7 +129,7 @@ services:
       - "${CONNECT_SINK_PORT:-18196}:4195"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "1g" }
+        limits: { cpus: "6.0", memory: "2g" }
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
       interval: 2s
@@ -146,19 +146,21 @@ services:
     environment:
       REDIS_ADDR: redis-central:6379
       STREAM_KEY: app.events
-      STREAM_MAXLEN: "${STREAM_MAXLEN:-100000}"
-      WORKERS: "${WORKERS:-8}"
-      PIPELINE_DEPTH: "${PIPELINE_DEPTH:-50}"
+      STREAM_MAXLEN: "${STREAM_MAXLEN:-2000000}"
+      WORKERS: "${WORKERS:-16}"
+      BATCH_MAX: "${BATCH_MAX:-500}"
       INITIAL_RATE: "0"
-      KEY_SPACE_SIZE: "${KEY_SPACE_SIZE:-100000}"
-      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-200}"
-      MAX_RATE: "${MAX_RATE:-20000}"
+      INITIAL_MODE: "${INITIAL_MODE:-batch}"
+      PATTERN_WEIGHTS: "${PATTERN_WEIGHTS:-33,33,34}"
+      PATTERN_CARDINALITY: "${PATTERN_CARDINALITY:-20000}"
+      PAYLOAD_BYTES: "${PAYLOAD_BYTES:-1024}"
+      MAX_RATE: "${MAX_RATE:-60000}"
       HEALTH_ADDR: ":8081"
     ports:
       - "${WRITER_PORT:-18081}:8081"
     deploy:
       resources:
-        limits: { cpus: "2.0", memory: "256m" }
+        limits: { cpus: "4.0", memory: "1g" }
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/healthz"]
       interval: 2s
@@ -181,7 +183,7 @@ services:
       - ./reports:/reports
     deploy:
       resources:
-        limits: { cpus: "0.5", memory: "128m" }
+        limits: { cpus: "1.0", memory: "256m" }
     networks: [rrts]
 
 networks:
