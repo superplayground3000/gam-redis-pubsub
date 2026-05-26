@@ -307,11 +307,27 @@ func buildReport(
 	var sumRate, samples float64
 	var lastSent int64
 	var lastAt time.Time
+	var hasLast bool
 	var maxXLen, maxPending int64
-	for i, snap := range snaps {
+	for _, snap := range snaps {
+		// CentralXLen + NATS.MaxPending tracking has its own validity model
+		// (sampler returns 0 on scrape failure for these — they're max-tracked, so
+		// failure can't inflate; we just keep the max-so-far).
+		if snap.CentralXLen > maxXLen {
+			maxXLen = snap.CentralXLen
+		}
+		if snap.NATS.MaxPending > maxPending {
+			maxPending = snap.NATS.MaxPending
+		}
+		// Rate sampling: only consider snapshots with a valid writer scrape.
+		// A failed scrape would yield sent=0/rateTarget=0 and corrupt the delta
+		// against the next successful snapshot.
+		if !snap.WriterOK() {
+			continue
+		}
 		sent := int64(snap.WriterMetrics["stress_writer_sent_total"])
 		rateTarget := int(snap.WriterMetrics["stress_writer_rate_target"])
-		if i > 0 && rateTarget == cfg.Tier {
+		if hasLast && rateTarget == cfg.Tier {
 			deltaSec := snap.At.Sub(lastAt).Seconds()
 			if deltaSec > 0 {
 				deltaCount := float64(sent - lastSent)
@@ -328,12 +344,7 @@ func buildReport(
 		}
 		lastSent = sent
 		lastAt = snap.At
-		if snap.CentralXLen > maxXLen {
-			maxXLen = snap.CentralXLen
-		}
-		if snap.NATS.MaxPending > maxPending {
-			maxPending = snap.NATS.MaxPending
-		}
+		hasLast = true
 	}
 	if samples > 0 {
 		r.RateAchievedAvg = sumRate / samples
