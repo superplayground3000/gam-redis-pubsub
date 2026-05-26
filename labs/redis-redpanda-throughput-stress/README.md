@@ -1,41 +1,43 @@
-# redis-redpanda-connect-stress
+# redis-redpanda-throughput-stress
 
-Stress-test harness for the Redis → Redpanda Connect → NATS JetStream → Redpanda Connect → Redis pipeline. Forked from [`../redis-redpanda-qos-resilience/`](../redis-redpanda-qos-resilience/); both labs can run side by side.
+Throughput-focused stress harness for the Redis → Redpanda Connect → NATS JetStream → Redpanda Connect → Redis pipeline. Forked from [`../redis-redpanda-connect-stress/`](../redis-redpanda-connect-stress/) (which itself forks `../redis-redpanda-qos-resilience/`); all three labs coexist on different host port ranges.
 
 ## What this demonstrates
 
-Three QoS-aware behaviors at three throughput tiers (10, 1 000, 10 000 msg/s):
+Two writer modes (pipelined batch vs single-XADD) across six tiers (5k, 10k, 20k, 30k, 40k, 50k msg/s) on three hashtag-wrapped key patterns:
 
-1. **Throughput** — pipeline sustains target rate end-to-end.
-2. **Latency** — e2e p99 stays within a tier-specific SLO (200 ms / 1 s / 5 s).
-3. **Chaos resilience** — a mid-run `connect-sink` kill does not violate QoS (zero loss under ALO/EOE; bounded loss under AMO).
+- `lb:company:active:{employee:<int>}`
+- `lb:functions:active:{role:<sha1-hex>}`
+- `lb:functions:active:{org:<int>}`
 
-See [`RESEARCH.md`](RESEARCH.md) for design rationale.
+with 60 000 unique keys (20 000 per pattern) and a per-message sync-latency report (`applied_ms − t_send_ms`) covering writer → central Redis → Connect → JetStream → Connect → regional Redis.
+
+ALO only. No chaos drill. No QoS profile comparison.
 
 ## Run it
 
 ```bash
-cd labs/redis-redpanda-connect-stress
-cp .env.example .env              # optional; defaults work
-bash scripts/stress-run.sh        # full default matrix (3 tiers × 3 modes, alo)
+cd labs/redis-redpanda-throughput-stress
+cp .env.example .env             # optional
+bash scripts/stress-run.sh       # default matrix: 6 tiers × 2 modes = 12 runs
 ```
 
-Total time: ~7–10 min wall-clock for the full default matrix. Each per-tier run writes a JSON report to `reports/{tier}-{mode}-{profile}.json` and the harness prints a summary table at the end.
+Total wall-clock: ~10–15 min for the full default matrix. Each run writes `reports/{tier}-{mode}.json` and a summary table prints at the end.
 
 ### Subset runs
 
 ```bash
 # Single tier + single mode (no auto-teardown)
-bash scripts/stress-run.sh --tiers=10000 --modes=chaos
+bash scripts/stress-run.sh --tiers=50000 --modes=batch
 
-# Multiple modes at one tier
-bash scripts/stress-run.sh --tiers=1000 --modes=throughput,latency
+# Multiple tiers, both modes
+bash scripts/stress-run.sh --tiers=10000,20000
 
-# Different QoS profile
-bash scripts/stress-run.sh --profile=eoe
+# All tiers, single mode only
+bash scripts/stress-run.sh --modes=single
 ```
 
-A no-arg run is treated as a full matrix and auto-tears down at the end (`docker compose down -v`). Any argument (including just `--profile=`) suppresses teardown so you can inspect state.
+No-arg runs auto-teardown (`docker compose down -v`). Any explicit arg suppresses teardown.
 
 ### Knobs
 
@@ -44,83 +46,72 @@ A no-arg run is treated as a full matrix and auto-tears down at the end (`docker
 | `DURATION_S`  | `30`    | sustain window per tier                       |
 | `WARMUP_S`    | `5`     | half-rate warmup window                       |
 | `DRAIN_S`     | `10`    | post-sustain drain window                     |
-| `CHAOS_DOWN_S`| `8`     | how long `connect-sink` is stopped for chaos  |
-| `PROFILE_QOS` | `alo`   | which Connect YAMLs are mounted               |
-| `WORKERS`     | `8`     | writer goroutines                             |
+| `WORKERS`     | `16`    | writer goroutines                             |
+| `BATCH_MAX`   | `500`   | ceiling on adaptive batch depth (batch mode)  |
+| `PATTERN_WEIGHTS`     | `33,33,34` | per-write pattern weighted picker       |
+| `PATTERN_CARDINALITY` | `20000`    | unique IDs per pattern                  |
+| `PAYLOAD_BYTES` | `1024`| JSON pad bytes per event                      |
+| `STREAM_MAXLEN` | `2000000` | central + region stream MAXLEN ~ cap      |
+| `MAX_RATE`    | `60000` | hard ceiling on `POST /rate`                   |
+| `INITIAL_MODE`| `batch` | starting write mode                            |
 
 ## Ports (host)
 
-| Service           | Host port | Notes                              |
-|-------------------|-----------|------------------------------------|
-| writer            | 17081     | `/healthz`, `/metrics`, `/rate`, `/reset` |
-| redis-central     | 17379     | `redis-cli -p 17379`               |
-| redis-region      | 17380     | `redis-cli -p 17380`               |
-| nats (client)     | 17222     |                                    |
-| nats (monitoring) | 17322     | `/jsz`, `/healthz`, `/varz`        |
-| connect-source    | 17195     | `/ready`, `/metrics`               |
-| connect-sink      | 17196     | `/ready`, `/metrics`               |
+| Service           | Host port | Notes                                     |
+|-------------------|-----------|-------------------------------------------|
+| writer            | 18081     | `/healthz`, `/metrics`, `/rate`, `/reset` |
+| redis-central     | 18379     | `redis-cli -p 18379`                      |
+| redis-region      | 18380     | `redis-cli -p 18380`                      |
+| nats (client)     | 18222     |                                           |
+| nats (monitoring) | 18322     | `/jsz`, `/healthz`, `/varz`               |
+| connect-source    | 18195     | `/ready`, `/metrics`                      |
+| connect-sink      | 18196     | `/ready`, `/metrics`                      |
 
-Coexists with `redis-multiregion-via-connect/` (15xxx) and `redis-redpanda-qos-resilience/` (16xxx).
+Coexists with `redis-multiregion-via-connect/` (15xxx), `redis-redpanda-qos-resilience/` (16xxx), and `redis-redpanda-connect-stress/` (17xxx).
 
 ## Resource caps
 
-Every container has a hard CPU+memory limit; total ceiling is ~12.5 CPU and ~4.4 GiB RAM. On a 32-core / 122 GiB host this is <40% CPU and <4% RAM. Lower the caps in `docker-compose.yml` if running on a weaker host — but doing so may invalidate the published SLOs.
+Per-container caps total ~29 CPU and ~9.25 GiB. On a 32-core / 122 GiB host that's <90% CPU and <8% RAM. See `docker-compose.yml` for per-service breakdown.
 
-## Verifying the lab
+## Calibration mode (default)
+
+Out of the box `scripts/lib/tier-defs.sh` ships with **`TIER_P99_MS=""` for every tier**. The verdict gates rate floor and `missing==0`; p99 sync-latency is reported but not gated.
+
+To commit per-tier p99 ceilings:
+
+1. Run the full matrix at least once on the target host.
+2. Inspect `reports/*.json` for `sync_latency_ms.p99` across both modes.
+3. Pick ceilings (suggested: `round_up_to_100ms(max(p99_batch, p99_single) * 1.25)`).
+4. Edit `TIER_P99_MS` in `scripts/lib/tier-defs.sh`.
+
+After calibration, the harness gates all three: rate, missing, p99.
+
+## Live `/rate` endpoint
+
+The writer's `POST /rate` accepts a JSON body `{ "rate": <int>, "mode": "batch"|"single" }`. Either field is optional — missing fields keep their current value.
 
 ```bash
-# 1. Boot smoke
-docker compose up -d --wait
-
-# 2. Sanity tier
-bash scripts/stress-run.sh --tiers=10 --modes=throughput
-
-# 3. Mid tier with latency check
-bash scripts/stress-run.sh --tiers=1000 --modes=throughput,latency
-
-# 4. Full matrix
-bash scripts/stress-run.sh
+curl -s -X POST -d '{"rate":35000,"mode":"single"}' \
+  -H 'content-type: application/json' http://localhost:18081/rate
+# -> {"rate":35000,"mode":"single"}
 ```
-
-During the 10 k chaos run, in another shell, `uptime` should show 1-min load average < 16 on a 32-core host — confirming CPU caps are honored.
-
-## Known limitations
-
-- **Chaos timing is anchored to harness wall-clock, not collector sustain start**. There is up to ~3 s of drift due to `docker compose run` container startup. For DURATION_S=30 this is acceptable. If you tighten DURATION_S below 15 s, chaos timing accuracy degrades.
-- **`region-events` stream is now capped at MAXLEN ~ 100000**: messages older than ~30 seconds at 10 k/s get trimmed. This matters only if a chaos outage exceeds ~30 s at 10 k/s — then the region tail can be lost. For DURATION_S=30 + CHAOS_DOWN_S=8 it's never a problem.
-- **`CHAOS_DOWN_S` is the scripted sleep, not the true outage**: actual `connect-sink` unavailability also includes `docker stop` shutdown time (~1 s) + `docker start` + healthcheck readiness (~3-5 s). The chaos script now waits for the healthy status before returning, so the harness's chaos-window measurement is consistent — but the *reported* `down_at_s` in the JSON report reflects the harness wall-clock decision point, not the precise outage span.
-- **JetStream stream config is sticky**: `nats-init` skips `stream add` if `APP_EVENTS` already exists. If you change `--max-bytes` in the compose file, run `docker compose down -v` to clear the named volume before restarting.
-- **Connect Prometheus metrics**: the collector sums across all label variants of a given metric. If Redpanda Connect adds new labeled dimensions in a future version, totals stay correct.
-
-## v2 measurement model
-
-As of 2026-05-25 the collector samples differently from v1. The pipeline under test is unchanged.
-
-- **`received` is now untainted by MAXLEN trimming.** The collector runs a streaming `XREAD BLOCK` consumer on `region-events` for the entire run. Every message that arrives is counted, even if it is later trimmed away when the stream exceeds 100 000 entries. At 10 k tier × 30 s, expect `received ≈ 300 000`.
-- **`trimmed` is a new diagnostic field.** It equals `received − XLEN(region-events)` clamped to ≥0 — the number of messages that were delivered but trimmed by `MAXLEN ~ 100000`. At 10 k tier, expect `trimmed ≈ 225 000` (the older entries). At 10 and 1000 tiers, `trimmed = 0` because production volume stays under the cap.
-- **`missing` now reflects real in-transit loss.** Computed as `sent − received`, both untainted by trim. For ALO/EOE under any tier or mode, expect `missing = 0`. For AMO chaos drills, expect `missing > 0` (the AMO loss mode under test, allowed by `slo.allow_missing=true`).
-- **`latency_ms.*` is now true per-message e2e latency.** v1's polling-window bias is gone. At 10 k throughput, expect sub-second P99 (real pipeline propagation), not the 4–35 s figures v1 reported.
-- **`received_errors`** counts transient XREAD failures from the streaming receiver. In a healthy run it is 0. A non-zero value tells operators that some samples may have been missed; it is not part of the verdict.
-- **`quiescence_timeout`** is `true` if the post-drain pipeline-quiescence wait (10 s deadline) did not see both source (`XLEN(app.events)==0`) and sink (`NATS num_pending==0` for ALO/EOE only) drain in time. A healthy run reports `false`.
-
-Between every tier run the harness now runs `nats stream purge APP_EVENTS` so accumulated bytes never trip the 200 MB pre-flight. The 256 MB stream cap is still a ceiling for in-flight bytes within one run.
 
 ## Useful checks (between runs)
 
 ```bash
 # Stream lengths
-redis-cli -p 17379 XLEN app.events
-redis-cli -p 17380 XLEN region-events
+redis-cli -p 18379 XLEN app.events
+redis-cli -p 18380 XLEN region-events
 
 # JetStream
-docker exec rrcs-nats nats stream info APP_EVENTS
+docker exec rrts-nats nats stream info APP_EVENTS
 
-# Writer live state
-curl -s http://localhost:17081/metrics
-curl -s -X POST -d '{"rate":0}' -H 'content-type: application/json' http://localhost:17081/rate
+# Writer state
+curl -s http://localhost:18081/metrics
+curl -s -X POST -d '{"rate":0}' -H 'content-type: application/json' http://localhost:18081/rate
 
-# v2 report fields — what to look for in reports/{tier}-{mode}-{profile}.json
-jq '.received, .trimmed, .missing, .latency_ms.p99, .quiescence_timeout' reports/10000-throughput-alo.json
+# Report fields
+jq '.sync_latency_ms, .missing, .received_by_pattern, .verdict' reports/50000-batch.json
 ```
 
 ## Tear down
@@ -131,7 +122,7 @@ docker compose down -v
 
 ## Further reading
 
-- [`RESEARCH.md`](RESEARCH.md) — design rationale, what stress proves, links to the design spec.
-- [`../redis-redpanda-qos-resilience/`](../redis-redpanda-qos-resilience/) — the parent lab (per-key visibility, no stress).
-- Design spec: `docs/superpowers/specs/2026-05-24-redis-redpanda-connect-stress-design.md`.
-- Implementation plan: `docs/superpowers/plans/2026-05-24-redis-redpanda-connect-stress.md`.
+- [`RESEARCH.md`](RESEARCH.md) — design rationale.
+- Parent: [`../redis-redpanda-connect-stress/`](../redis-redpanda-connect-stress/) — QoS-aware stress with 3 profiles and chaos drills.
+- Design spec: `docs/superpowers/specs/2026-05-26-redis-redpanda-throughput-stress-design.md`.
+- Implementation plan: `docs/superpowers/plans/2026-05-26-redis-redpanda-throughput-stress.md`.
