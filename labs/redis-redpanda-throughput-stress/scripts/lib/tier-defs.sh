@@ -1,40 +1,35 @@
 #!/usr/bin/env bash
-# Tier SLOs and run-window knobs. Sourced by stress-run.sh.
+# Tier knobs for the throughput-stress lab. Sourced by stress-run.sh.
 
-# Default tiers (override via --tiers=10,1000 on stress-run.sh)
-DEFAULT_TIERS=(10 1000 10000)
+# Default tiers (override via --tiers=5000,50000)
+DEFAULT_TIERS=(5000 10000 20000 30000 40000 50000)
 
-# Default modes (override via --modes=...)
-DEFAULT_MODES=(throughput latency chaos)
+# Default modes (override via --modes=batch,single)
+DEFAULT_MODES=(batch single)
 
-# Latency p99 SLO (ms) per tier
-declare -A TIER_P99_MS=(
-  [10]=200
-  [1000]=1000
-  [10000]=5000
+# Achieved-rate floor as fraction of target.
+declare -A TIER_RATE_MIN_PCT=(
+  [5000]=0.95
+  [10000]=0.95
+  [20000]=0.90
+  [30000]=0.90
+  [40000]=0.90
+  [50000]=0.90
 )
 
-# Achieved-rate floor as fraction of target
-declare -A TIER_RATE_MIN_PCT=(
-  [10]=0.95
-  [1000]=0.95
-  [10000]=0.90
+# Per-tier p99 sync-latency ceiling (ms).
+# Empty string = no ceiling (calibration mode); collector treats <=0 as "skip p99 gate".
+# After the first full-matrix run, edit these to commit real ceilings.
+declare -A TIER_P99_MS=(
+  [5000]=""
+  [10000]=""
+  [20000]=""
+  [30000]=""
+  [40000]=""
+  [50000]=""
 )
 
 # Run windows (env-overridable)
 DURATION_S="${DURATION_S:-30}"
 WARMUP_S="${WARMUP_S:-5}"
 DRAIN_S="${DRAIN_S:-10}"
-
-# Chaos parameters
-CHAOS_DOWN_S="${CHAOS_DOWN_S:-8}"
-# Chaos kicks in at sustain_mid by default
-chaos_at_s() { echo $(( DURATION_S / 2 )); }
-
-# Returns "true" if profile is amo (allows missing messages)
-allow_missing_for_profile() {
-  case "$1" in
-    amo) echo "true" ;;
-    *)   echo "false" ;;
-  esac
-}
