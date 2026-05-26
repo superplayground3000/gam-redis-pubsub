@@ -13,7 +13,7 @@ services:
       - "--save"
       - ""
     ports:
-      - "${REDIS_CENTRAL_PORT:-17379}:6379"
+      - "${REDIS_CENTRAL_PORT:-18379}:6379"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "512m" }
@@ -36,7 +36,7 @@ services:
       - "--save"
       - ""
     ports:
-      - "${REDIS_REGION_PORT:-17380}:6379"
+      - "${REDIS_REGION_PORT:-18380}:6379"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "512m" }
@@ -52,8 +52,8 @@ services:
     container_name: rrts-nats
     command: ["-js", "-sd", "/data", "-m", "8222"]
     ports:
-      - "${NATS_CLIENT_PORT:-17222}:4222"
-      - "${NATS_MON_PORT:-17322}:8222"
+      - "${NATS_CLIENT_PORT:-18222}:4222"
+      - "${NATS_MON_PORT:-18322}:8222"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "1g" }
@@ -105,7 +105,7 @@ services:
       - ./connect/${PROFILE_QOS:-alo}-forward.yaml:/connect.yaml:ro
     command: ["run", "/connect.yaml"]
     ports:
-      - "${CONNECT_SRC_PORT:-17195}:4195"
+      - "${CONNECT_SRC_PORT:-18195}:4195"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "1g" }
@@ -126,7 +126,7 @@ services:
       - ./connect/${PROFILE_QOS:-alo}-reverse.yaml:/connect.yaml:ro
     command: ["run", "/connect.yaml"]
     ports:
-      - "${CONNECT_SINK_PORT:-17196}:4195"
+      - "${CONNECT_SINK_PORT:-18196}:4195"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "1g" }
@@ -155,7 +155,7 @@ services:
       MAX_RATE: "${MAX_RATE:-20000}"
       HEALTH_ADDR: ":8081"
     ports:
-      - "${WRITER_PORT:-17081}:8081"
+      - "${WRITER_PORT:-18081}:8081"
     deploy:
       resources:
         limits: { cpus: "2.0", memory: "256m" }
