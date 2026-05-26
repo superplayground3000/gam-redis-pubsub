@@ -9,12 +9,19 @@ import (
 type Server struct {
 	Lim         *Limiter
 	Counters    *Counters
+	Mode        *ModeStore
 	MaxRate     int
 	HealthCheck func() bool
 }
 
 type rateReq struct {
-	Rate int `json:"rate"`
+	Rate *int    `json:"rate,omitempty"`
+	Mode *string `json:"mode,omitempty"`
+}
+
+type rateResp struct {
+	Rate int    `json:"rate"`
+	Mode string `json:"mode"`
 }
 
 func (s *Server) Register(mux *http.ServeMux) {
@@ -44,6 +51,12 @@ func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "stress_writer_rate_target %d\n", s.Lim.Current())
 	fmt.Fprintf(w, "# TYPE stress_writer_inflight_pipelines gauge\n")
 	fmt.Fprintf(w, "stress_writer_inflight_pipelines %d\n", s.Counters.Inflight.Load())
+	fmt.Fprintf(w, "# TYPE stress_writer_mode gauge\n")
+	fmt.Fprintf(w, "stress_writer_mode{name=%q} 1\n", s.Mode.Name())
+	for i, name := range [3]string{"employee", "role", "org"} {
+		fmt.Fprintf(w, "# TYPE stress_writer_sent_by_pattern_total counter\n")
+		fmt.Fprintf(w, "stress_writer_sent_by_pattern_total{pattern=%q} %d\n", name, s.Counters.SentByPattern[i].Load())
+	}
 }
 
 func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
@@ -56,12 +69,24 @@ func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
 		return
 	}
-	if rq.Rate < 0 || rq.Rate > s.MaxRate {
-		http.Error(w, fmt.Sprintf("rate %d out of range [0,%d]", rq.Rate, s.MaxRate), http.StatusBadRequest)
-		return
+	if rq.Rate != nil {
+		if *rq.Rate < 0 || *rq.Rate > s.MaxRate {
+			http.Error(w, fmt.Sprintf("rate %d out of range [0,%d]", *rq.Rate, s.MaxRate), http.StatusBadRequest)
+			return
+		}
+		s.Lim.Set(*rq.Rate)
 	}
-	s.Lim.Set(rq.Rate)
-	fmt.Fprintf(w, "rate set to %d\n", rq.Rate)
+	if rq.Mode != nil {
+		if err := s.Mode.SetByName(*rq.Mode); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(rateResp{
+		Rate: int(s.Lim.Current()),
+		Mode: s.Mode.Name(),
+	})
 }
 
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
