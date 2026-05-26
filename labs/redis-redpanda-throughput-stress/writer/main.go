@@ -17,43 +17,60 @@ import (
 func main() {
 	addr := envStr("REDIS_ADDR", "redis-central:6379")
 	streamKey := envStr("STREAM_KEY", "app.events")
-	streamMaxLen := envInt("STREAM_MAXLEN", 100_000)
-	workers := envInt("WORKERS", 8)
-	pipelineDepth := envInt("PIPELINE_DEPTH", 50)
+	streamMaxLen := envInt("STREAM_MAXLEN", 2_000_000)
+	workers := envInt("WORKERS", 16)
+	batchMax := envInt("BATCH_MAX", 500)
 	initialRate := envInt("INITIAL_RATE", 0)
-	keySpaceSize := envInt("KEY_SPACE_SIZE", 100_000)
-	payloadBytes := envInt("PAYLOAD_BYTES", 200)
-	maxRate := envInt("MAX_RATE", 20_000)
+	cardinality := envInt("PATTERN_CARDINALITY", 20_000)
+	payloadBytes := envInt("PAYLOAD_BYTES", 1024)
+	maxRate := envInt("MAX_RATE", 60_000)
 	healthAddr := envStr("HEALTH_ADDR", ":8081")
+	initialMode := envStr("INITIAL_MODE", "batch")
+	weightsStr := envStr("PATTERN_WEIGHTS", "33,33,34")
+	keySeed := int64(envInt("KEY_SEED", 42))
+
+	weights, err := ParsePatternWeights(weightsStr)
+	if err != nil {
+		log.Fatalf("PATTERN_WEIGHTS: %v", err)
+	}
+	picker, err := NewPicker(weights)
+	if err != nil {
+		log.Fatalf("NewPicker: %v", err)
+	}
+	keyGen := NewKeyGen(KeyGenConfig{Cardinality: cardinality, Seed: keySeed})
 
 	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: workers * 2})
 	defer rdb.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel() // safety net; explicit cancel() in shutdown handler is the live path
+	defer cancel()
 
 	lim := NewLimiter()
 	lim.Set(initialRate)
+	mode := NewModeStore(initialMode)
 	counters := &Counters{}
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		w := &Worker{
 			ID: i, RDB: rdb,
-			StreamKey:     streamKey,
-			StreamMaxLen:  int64(streamMaxLen),
-			PipelineDepth: pipelineDepth,
-			PayloadBytes:  payloadBytes,
-			KeySpaceSize:  int64(keySpaceSize),
-			Lim:           lim,
-			Counters:      counters,
+			StreamKey:    streamKey,
+			StreamMaxLen: int64(streamMaxLen),
+			BatchMax:     batchMax,
+			PayloadBytes: payloadBytes,
+			Cardinality:  cardinality,
+			Lim:          lim,
+			Counters:     counters,
+			Mode:         mode,
+			KeyGen:       keyGen,
+			Picker:       picker,
 		}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.Run(ctx) }()
 	}
 
 	srv := &Server{
-		Lim: lim, Counters: counters, MaxRate: maxRate,
+		Lim: lim, Counters: counters, Mode: mode, MaxRate: maxRate,
 		HealthCheck: func() bool {
 			c, cf := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cf()
@@ -65,7 +82,7 @@ func main() {
 
 	httpSrv := &http.Server{Addr: healthAddr, Handler: mux}
 	go func() {
-		log.Printf("writer listening on %s", healthAddr)
+		log.Printf("writer listening on %s (initial mode=%s)", healthAddr, mode.Name())
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server: %v", err)
 		}
