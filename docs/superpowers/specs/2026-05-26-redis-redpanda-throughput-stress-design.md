@@ -234,6 +234,7 @@ Covers: writer → central XADD ack → Connect-source pull → JetStream publis
 - Streaming `XREAD BLOCK 100 STREAMS region-events $` for full run duration.
 - Per entry: parse fields → compute `sync_latency_ms` → feed into HDR histogram (existing dep `hdrhistogram-go`).
 - Accumulate `received` count and per-pattern breakdown.
+- Quiescence wait uses `GroupLag("app.events", "propagator")` (source) AND `ScrapeJSZ(natsURL, "APP_EVENTS").MaxPending` (sink) — see Section 5 step 9 for the rationale (XLEN is the wrong signal; we inherit parent's `bdf31a9` fix and `1e9e7b2` tail-flush).
 - End-of-run: write JSON report with sync-latency distribution, counts, verdict (Section 5).
 
 ### Stream / JetStream sizing
@@ -271,10 +272,15 @@ bash scripts/stress-run.sh --tiers=10000,20000 --modes=batch,single
 6. **Collector**: `POST /rate {"rate": <tier>}` (sustain).
 7. **Collector**: streaming `XREAD BLOCK` on `region-events`, counters running, for `DURATION_S` (30 s).
 8. **Collector**: `POST /rate {"rate": 0}` (stop sending).
-9. **Collector**: pipeline-quiescence wait — `XLEN(app.events)==0` AND JetStream `num_pending==0`, 10 s deadline.
-10. Sleep `DRAIN_S` (10 s) for any in-flight to land.
-11. **Collector**: write JSON report; exit.
-12. **Harness**: loop to next `(tier, mode)`.
+9. **Collector**: pipeline-quiescence wait, 10 s deadline. Polls every 250 ms; quiesced when **both** conditions hold for one poll:
+   - **Source-side:** `GroupLag("app.events", "propagator") == 0` (consumer group has read every entry).
+     - **NOT** `XLEN("app.events") == 0` — Redis streams don't shrink on ack, so XLEN never drops back to zero during a run. The parent lab regressed on this exact mistake (commit `bdf31a9`); we inherit the fixed signal.
+     - `GroupLag` returns 0 trivially if the consumer group doesn't exist yet (first-ever run before Connect registers `propagator`); any other error propagates so the poll retries.
+   - **Sink-side:** `ScrapeJSZ(natsURL, "APP_EVENTS").MaxPending == 0` (no JetStream deliveries pending ack from `connect-sink`'s durable consumer `region-writer`). Since this lab is ALO-only, sink-side check is always required (parent's AMO branch is dropped here).
+10. **Collector**: tail-flush sleep of **1500 ms** after quiescence is observed, before cancelling the streaming receiver. The receiver's `XREAD BLOCK 100` can miss the final entry or two if cancelled too aggressively at the moment `MaxPending` flips to 0; parent lab calibrated this at 1500 ms (commit `1e9e7b2`).
+11. Sleep `DRAIN_S` (10 s) for any in-flight to land. (Belt-and-braces; with healthy quiescence this is mostly idle.)
+12. **Collector**: write JSON report; exit.
+13. **Harness**: loop to next `(tier, mode)`.
 
 ### Per-tier SLO matrix — calibration mode
 
