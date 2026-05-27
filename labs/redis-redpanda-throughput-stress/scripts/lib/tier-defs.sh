@@ -60,4 +60,4 @@ declare -A TIER_P99_MS=(
 # Run windows (env-overridable)
 DURATION_S="${DURATION_S:-30}"
 WARMUP_S="${WARMUP_S:-5}"
-DRAIN_S="${DRAIN_S:-10}"
+DRAIN_S="${DRAIN_S:-30}"
