@@ -65,10 +65,11 @@ The `nats.bytes ≈ delivered × 1.7 KB` match cited above was misread — it wa
 The actual fix at 50k required three additional knobs:
 
 - `connect-sink` CPU cap raised from 6 to 12 (it was saturating the 6 CPU at 50k).
+- `connect-sink` `pipeline.threads` raised from 2 to 4 so the extra CPU is actually used (each sink message does SET + XADD, so 2 threads × 2 writes ≈ 4 concurrent client ops — bumping to 4 threads gives ~8 ops against the new 12-CPU budget).
 - `max_in_flight` raised from 256 to 1024 on both `reverse.yaml` fan-out outputs.
 - `DRAIN_S` default raised from 10 s to 30 s so the sink can finish draining the backlog before quiescence checks.
 
-The 5GB cap is still load-bearing — it stops eviction-driven loss — but the sink-side knobs are what turn 50k into a loss-free tier on this host.
+The 5GB cap is still load-bearing — it stops eviction-driven loss — but the sink-side knobs are what turn 50k into a loss-free tier on this host. Per-container CPU caps total 34 after the bump on a 32-core host — a modest CFS overcommit, not "under budget"; this is fine in practice because not all containers peg their cap simultaneously, but worth recording.
 
 ## Why calibration-mode verdict
 
