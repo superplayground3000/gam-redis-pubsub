@@ -52,6 +52,7 @@ No-arg runs auto-teardown (`docker compose down -v`). Any explicit arg suppresse
 | `PATTERN_CARDINALITY` | `20000`    | unique IDs per pattern                  |
 | `PAYLOAD_BYTES` | `1024`| JSON pad bytes per event                      |
 | `STREAM_MAXLEN` | `2000000` | central + region stream MAXLEN ~ cap      |
+| `NATS_MAX_BYTES` | `5GB` | JetStream APP_EVENTS byte cap (raise for higher tiers) |
 | `MAX_RATE`    | `60000` | hard ceiling on `POST /rate`                   |
 | `INITIAL_MODE`| `batch` | starting write mode                            |
 
@@ -75,9 +76,9 @@ Per-container caps total ~29 CPU and ~9.25 GiB. On a 32-core / 122 GiB host that
 
 ## Calibration mode (default)
 
-Out of the box `scripts/lib/tier-defs.sh` ships with **`TIER_P99_MS=""` for every tier**. The verdict gates rate floor and `missing==0`; p99 sync-latency is reported but not gated.
+Out of the box `scripts/lib/tier-defs.sh` ships with `TIER_P99_MS` calibrated from a full-matrix run on a 32-core / 122 GiB host. All six tiers gate rate floor, `missing==0`, and a p99 sync-latency ceiling. The 50k tier passes loss-free under the default `NATS_MAX_BYTES=5GB`; on smaller hosts you may need to lower the matrix's top tier or raise `NATS_MAX_BYTES` further.
 
-To commit per-tier p99 ceilings:
+To recalibrate on a different host:
 
 1. Run the full matrix at least once on the target host.
 2. Inspect `reports/*.json` for `sync_latency_ms.p99` across both modes.
