@@ -114,6 +114,18 @@ curl -s -X POST -d '{"rate":0}' -H 'content-type: application/json' http://local
 jq '.sync_latency_ms, .missing, .received_by_pattern, .verdict' reports/50000-batch.json
 ```
 
+## Visual dashboard
+
+After a matrix run, generate a self-contained HTML dashboard that compares batch vs single across all tiers — rate, packet loss, latency percentiles, and a full per-run table:
+
+```bash
+python3 scripts/dashboard.py
+# Dashboard: 12 reports -> reports/dashboard.html
+# Open:      file:///.../reports/dashboard.html
+```
+
+Open the printed `file://` URL in any browser. The HTML inlines all data (no server needed) and uses Chart.js from CDN. Regenerate after each matrix run; `reports/dashboard.html` is gitignored.
+
 ## Tear down
 
 ```bash
