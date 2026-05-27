@@ -461,6 +461,190 @@ both modes. Dashboard regenerated."
 
 ---
 
+---
+
+## Addendum 2026-05-27: tasks added after the first matrix failed
+
+The first matrix run (Task 6 above) showed the 5GB cap alone did not produce loss-free 50k — the connect-sink, not the JetStream buffer, was the real bottleneck. See spec amendment for full analysis. The following tasks were added after the failure was diagnosed and the user authorized the corrected scope (sink CPU + max_in_flight + DRAIN_S).
+
+### Task 9: Bump connect-sink CPU 6→12 in docker-compose.yml
+
+**Files:**
+- Modify: `labs/redis-redpanda-throughput-stress/docker-compose.yml` (the `connect-sink` service block, around line 132)
+
+- [ ] **Step 1: Edit the connect-sink resource limit**
+
+Locate the `connect-sink:` service block. Its `deploy.resources.limits` line currently reads:
+
+```yaml
+        limits: { cpus: "6.0", memory: "2g" }
+```
+
+Change to:
+
+```yaml
+        limits: { cpus: "12.0", memory: "2g" }
+```
+
+Do NOT touch the `connect-source` block (it stays at 6.0 CPU).
+
+- [ ] **Step 2: Verify**
+
+```bash
+cd labs/redis-redpanda-throughput-stress
+docker compose config | grep -B5 -A1 'rrts-connect-sink' | grep cpus
+```
+
+Expected output contains `cpus: '12.0'` (compose YAML normalization may quote the value).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add labs/redis-redpanda-throughput-stress/docker-compose.yml
+git commit -m "redis-redpanda-throughput-stress: bump connect-sink CPU 6->12
+
+First matrix showed the sink (not the 5GB JetStream buffer) is the
+50k bottleneck. Doubling CPU is the first knob the sink needs."
+```
+
+### Task 10: Raise max_in_flight 256→1024 on both fan-out outputs in reverse.yaml
+
+**Files:**
+- Modify: `labs/redis-redpanda-throughput-stress/connect/reverse.yaml:40,46`
+
+- [ ] **Step 1: Edit both `max_in_flight` lines**
+
+Locate the two `max_in_flight: 256` lines (one under the `redis` output for cache SET, one under `redis_streams` for region-events XADD). Change both to:
+
+```yaml
+          max_in_flight: 1024
+```
+
+- [ ] **Step 2: Verify**
+
+```bash
+grep -c 'max_in_flight: 1024' labs/redis-redpanda-throughput-stress/connect/reverse.yaml
+```
+
+Expected output: `2`.
+
+```bash
+grep -c 'max_in_flight: 256' labs/redis-redpanda-throughput-stress/connect/reverse.yaml
+```
+
+Expected output: `0`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add labs/redis-redpanda-throughput-stress/connect/reverse.yaml
+git commit -m "redis-redpanda-throughput-stress: raise sink max_in_flight 256->1024
+
+Symmetric with the JetStream input's max_in_flight on the source side.
+At 50k * ~1.7KB the fan-out per-output depth needs >256 to keep up."
+```
+
+### Task 11: Raise DRAIN_S default 10→30 in tier-defs.sh
+
+**Files:**
+- Modify: `labs/redis-redpanda-throughput-stress/scripts/lib/tier-defs.sh:63`
+
+- [ ] **Step 1: Edit the DRAIN_S default**
+
+Locate the line:
+
+```bash
+DRAIN_S="${DRAIN_S:-10}"
+```
+
+Change to:
+
+```bash
+DRAIN_S="${DRAIN_S:-30}"
+```
+
+- [ ] **Step 2: Verify**
+
+```bash
+grep 'DRAIN_S=' labs/redis-redpanda-throughput-stress/scripts/lib/tier-defs.sh
+```
+
+Expected output contains `DRAIN_S="${DRAIN_S:-30}"`.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add labs/redis-redpanda-throughput-stress/scripts/lib/tier-defs.sh
+git commit -m "redis-redpanda-throughput-stress: raise DRAIN_S default 10->30
+
+Per first-matrix data: 50k batch had ~755k in-flight at writer-stop;
+sink steady-state delivery ~30k/s -> ~25s to drain. 30s gives margin."
+```
+
+### Task 12: Amend `## Why NATS_MAX_BYTES = 5GB (was 2GB)` in RESEARCH.md
+
+**Files:**
+- Modify: `labs/redis-redpanda-throughput-stress/RESEARCH.md` (the section added in Task 4)
+
+- [ ] **Step 1: Append a corrected-analysis subsection inside the existing section**
+
+After the final paragraph of `## Why NATS_MAX_BYTES = 5GB (was 2GB)` (the one ending "...if RSS approaches the cap"), insert a blank line then this subsection:
+
+```markdown
+### Corrected after first matrix: buffer alone wasn't enough
+
+The first verification matrix (2026-05-27) showed the 5GB cap did NOT produce loss-free 50k by itself. Missing count stayed at ~750k, but the failure mode flipped: instead of JetStream evicting overflow mid-sustain, the stream filled with messages the connect-sink could not deliver in time, and `DRAIN_S=10s` expired with ~750k messages still in flight (`quiescence_timeout=true` in the report).
+
+The `nats.bytes ≈ delivered × 1.7 KB` match cited above was misread — it was the steady-state product of continuous eviction holding the buffer bounded, not evidence the sink could keep pace at line rate.
+
+The actual fix at 50k required three additional knobs:
+
+- `connect-sink` CPU cap raised from 6 to 12 (it was saturating the 6 CPU at 50k).
+- `max_in_flight` raised from 256 to 1024 on both `reverse.yaml` fan-out outputs.
+- `DRAIN_S` default raised from 10 s to 30 s so the sink can finish draining the backlog before quiescence checks.
+
+The 5GB cap is still load-bearing — it stops eviction-driven loss — but the sink-side knobs are what turn 50k into a loss-free tier on this host.
+```
+
+- [ ] **Step 2: Verify section count still 9**
+
+```bash
+grep -c "^## " labs/redis-redpanda-throughput-stress/RESEARCH.md
+```
+
+Expected output: `9` (no new `##` heading; the corrected analysis is a `###` subsection inside the existing one).
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add labs/redis-redpanda-throughput-stress/RESEARCH.md
+git commit -m "redis-redpanda-throughput-stress: RESEARCH.md notes corrected sink-bottleneck finding"
+```
+
+### Task 13: Re-run matrix with new knobs (inline)
+
+- [ ] Boot stack with new config: `cd labs/redis-redpanda-throughput-stress && docker compose down -v && docker compose up --wait`
+- [ ] Verify sink CPU shows 12 in `docker compose config`
+- [ ] Run full matrix: `bash scripts/stress-run.sh`
+- [ ] Verify: 50k both modes show `missing == 0`, `trimmed == 0`, `quiescence_timeout == false`. 40k batch no longer trims.
+- [ ] Capture all p99 values for ALL tiers (recalibration needed across the board, not just 50k)
+- [ ] Commit reports
+
+### Task 14: Recalibrate ALL tier p99 ceilings (inline)
+
+- [ ] Compute new ceilings via `ceil_100ms(max(p99_batch, p99_single) * 1.25)`, floor 100 ms
+- [ ] Edit `scripts/lib/tier-defs.sh` `TIER_P99_MS` for any tier whose ceiling drifted
+- [ ] Update the per-tier-breakdown comment in tier-defs.sh
+- [ ] Commit
+
+### Task 15: Verification matrix + dashboard regen (inline, replaces original Task 8)
+
+- [ ] Re-run matrix once more to verify all 12 reports show `verdict.pass == true`
+- [ ] Regenerate dashboard via `python3 scripts/dashboard.py`
+- [ ] Commit reports + dashboard
+
+---
+
 ## Self-review check
 
 **Spec coverage:**

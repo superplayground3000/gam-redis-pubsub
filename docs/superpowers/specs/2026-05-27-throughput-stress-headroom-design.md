@@ -2,7 +2,7 @@
 
 **Lab:** `labs/redis-redpanda-throughput-stress/`
 **Date:** 2026-05-27
-**Status:** approved (brainstorm phase complete)
+**Status:** amended 2026-05-27 after first verification run — see [Amendment](#amendment-2026-05-27-corrected-scope-after-first-matrix)
 
 ---
 
@@ -102,3 +102,45 @@ The lab still satisfies the `/research-lab` skill output contract:
 - Verdict gating — unchanged structure; 50k now passes all three gates after calibration
 
 No additions or removals to lab deliverables. The change is a single configuration value plus the calibration and documentation work that follows from it.
+
+---
+
+## Amendment 2026-05-27: corrected scope after first matrix
+
+The original spec (sections 1–9 above) was wrong on its central premise.
+
+**What the first verification matrix showed:** raising JetStream `--max-bytes` from 2GB to 5GB did **not** make the 50k tier loss-free. The missing count at 50k stayed at ~750k (nearly identical to the 2GB-cap matrix), but the failure mechanism flipped:
+
+- With 2GB cap: JetStream evicted overflow mid-sustain (`nats.bytes` held steady at ~1.26 GB by continuous discard-old eviction).
+- With 5GB cap: stream filled with messages the connect-sink could not deliver in time; `DRAIN_S=10s` expired with ~750k messages still in flight; the harness counted them as missing via `quiescence_timeout=true`.
+
+The `nats.bytes ≈ delivered × 1.7 KB` match cited in section 2 as "evidence the sink keeps pace" was misread. It was actually the steady-state product of continuous eviction holding the buffer bounded — not evidence of sink throughput at line rate.
+
+**The actual bottleneck at 50k on this host is the connect-sink, not the JetStream buffer.** Confirmed by inspecting `connect/reverse.yaml`: fan-out outputs use `max_in_flight: 256` and the sink pipeline runs `threads: 2` against a 6-CPU cap. At 50k × 1.7 KB ≈ 60 MB/s incoming, this is materially undersized.
+
+### Corrected scope (added on top of the original 5GB cap change)
+
+| File | Change |
+|---|---|
+| `docker-compose.yml` | `connect-sink` resource cap: CPU `6.0` → `12.0` (memory stays at `2g`) |
+| `connect/reverse.yaml` | Both `redis` (cache SET) and `redis_streams` (region-events XADD) fan-out outputs: `max_in_flight: 256` → `max_in_flight: 1024` |
+| `scripts/lib/tier-defs.sh` | `DRAIN_S` default `10` → `30` so the sink can finish draining the 50k backlog before quiescence checks |
+| `RESEARCH.md` | Rewrite the `## Why NATS_MAX_BYTES = 5GB (was 2GB)` section to acknowledge the corrected analysis (sink, not buffer, was the bottleneck) and document the multi-knob fix |
+| `scripts/lib/tier-defs.sh` | Recalibrate ALL `TIER_P99_MS` entries (not just 50k) from the second matrix — the first matrix showed several mid-tier p99 ceilings drift outside their original windows under the new pipeline behavior |
+
+### Why these specific knobs and values
+
+- **Sink CPU 6→12:** Sink at 50k is consuming the full 6 CPU during sustain (observable via `docker stats rrts-connect-sink`). Doubling matches the writer's 4-CPU + 16-worker fan-in pattern. Total host CPU cap stays under the 32-core budget.
+- **`max_in_flight` 256→1024:** Matches the `nats_jetstream` input setting already on the sink side and the source's `max_in_flight` for symmetry. At 50k × ~1.7 KB the fan-out per-output queue depth needs to handle ~85 messages per millisecond; 256 is hard-capped well below that.
+- **`DRAIN_S` 10→30:** Data-driven. The 50k batch run had ~755k in-flight at writer-stop; sink steady-state delivery is ~30k/s → ~25s to drain. 30s gives margin; 60s would be excessive.
+
+### Non-goals (still excluded)
+
+- Not switching to memory storage. File storage is still load-bearing for lab durability.
+- Not raising `STREAM_MAXLEN` for `region-events`. The 40k batch trimming observed in the first matrix should resolve once the sink is no longer falling 25s behind. Re-evaluate after the second matrix.
+- Not adding sink replicas. The single-replica + larger-CPU path is the simpler first step.
+- Not adding new tiers above 50k. Still out of scope.
+
+### Honest record
+
+The original section 2's math was numerically right (peak buffer ≈ 2.55 GB at 50k) but causally wrong (a bigger buffer just defers the sink-throughput question, doesn't answer it). This kind of mistake is exactly what the cross-model code-quality review catches downstream of the spec; in this case the matrix run was the first place the wrong premise surfaced. Leaving the original section 2 intact above (rather than rewriting it in place) preserves the record of the wrong hypothesis.
