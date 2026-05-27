@@ -129,7 +129,7 @@ services:
       - "${CONNECT_SINK_PORT:-18196}:4195"
     deploy:
       resources:
-        limits: { cpus: "6.0", memory: "2g" }
+        limits: { cpus: "12.0", memory: "2g" }
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
       interval: 2s
