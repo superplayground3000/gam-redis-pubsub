@@ -86,7 +86,7 @@ services:
             --retention limits \
             --discard old \
             --max-age 1h \
-            --max-bytes 2GB \
+            --max-bytes ${NATS_MAX_BYTES:-5GB} \
             --max-msgs=-1 \
             --max-msg-size=4KB \
             --dupe-window 5m \
