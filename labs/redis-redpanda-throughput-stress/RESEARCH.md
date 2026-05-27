@@ -56,6 +56,20 @@ The match between `nats.bytes` end-state and the delivered count (1.26 GB ≈ 74
 
 The knob is env-tunable (`NATS_MAX_BYTES`) so future tiers (60k, 80k) can raise it without docker-compose edits. nats container memory cap is 2 GiB; this was uncontended at the 2 GB stream size in prior matrix runs and should be re-checked during the 5 GB calibration via `docker stats rrts-nats` (raise the `mem_limit` in docker-compose.yml to 4 GiB if RSS approaches the cap).
 
+### Corrected after first matrix: buffer alone wasn't enough
+
+The first verification matrix (2026-05-27) showed the 5GB cap did NOT produce loss-free 50k by itself. Missing count stayed at ~750k, but the failure mode flipped: instead of JetStream evicting overflow mid-sustain, the stream filled with messages the connect-sink could not deliver in time, and `DRAIN_S=10s` expired with ~750k messages still in flight (`quiescence_timeout=true` in the report).
+
+The `nats.bytes ≈ delivered × 1.7 KB` match cited above was misread — it was the steady-state product of continuous eviction holding the buffer bounded, not evidence the sink could keep pace at line rate.
+
+The actual fix at 50k required three additional knobs:
+
+- `connect-sink` CPU cap raised from 6 to 12 (it was saturating the 6 CPU at 50k).
+- `max_in_flight` raised from 256 to 1024 on both `reverse.yaml` fan-out outputs.
+- `DRAIN_S` default raised from 10 s to 30 s so the sink can finish draining the backlog before quiescence checks.
+
+The 5GB cap is still load-bearing — it stops eviction-driven loss — but the sink-side knobs are what turn 50k into a loss-free tier on this host.
+
 ## Why calibration-mode verdict
 
 There's no reference number for what p99 sync-latency *should* be at, say, 30k batch mode on a given host. Hard-coding a guess turns the verdict into noise. Ship with `TIER_P99_MS=""` for every tier; collector's `--slo-p99-ms <= 0` flag skips the p99 gate; run the full matrix once on real hardware; pick ceilings; commit them. Future runs gate on real numbers.
