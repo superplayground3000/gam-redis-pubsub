@@ -12,6 +12,7 @@ Usage:
 """
 import json
 import sys
+import time
 from pathlib import Path
 
 LAB_DIR = Path(__file__).resolve().parent.parent
@@ -104,6 +105,22 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     display: inline-block; width: 12px; height: 12px;
     border-radius: 2px; margin-right: 0.3rem; vertical-align: middle;
   }
+  .legend-line {
+    display: inline-block; width: 18px; height: 0;
+    border-top: 2px dashed #666; margin-right: 0.3rem; vertical-align: middle;
+  }
+  .banner {
+    background: #fff3e0;
+    border: 1px solid #ffb74d;
+    border-left: 4px solid #f57c00;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+    color: #5d4037;
+  }
+  .banner strong { color: #bf360c; }
+  .ago-stale { color: var(--fail); }
   footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: center; }
 </style>
 </head>
@@ -113,9 +130,12 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <span class="legend-swatch" style="background:var(--batch)"></span>batch
   &nbsp;&nbsp;
   <span class="legend-swatch" style="background:var(--single)"></span>single
+  &nbsp;&nbsp;
+  <span class="legend-line"></span>SLO threshold
   &nbsp;&middot;&nbsp; comparison across all tiers in reports/
 </p>
 
+<div id="vintageBanner"></div>
 <div class="summary" id="summary"></div>
 
 <section>
@@ -164,6 +184,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <th class="num">max</th>
           <th class="num">Ceiling</th>
           <th>Verdict</th>
+          <th class="num">Age</th>
         </tr>
       </thead>
       <tbody></tbody>
@@ -177,19 +198,28 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <script>
 const REPORTS = __DATA__;
+const GENERATED_AT_MS = __GENERATED_AT_MS__;
 
 // Sort by tier then mode (batch first per tier).
 REPORTS.sort((a, b) => a.tier - b.tier || a.mode.localeCompare(b.mode));
 
 const tiers = [...new Set(REPORTS.map(r => r.tier))].sort((a, b) => a - b);
 const COLORS = { batch: '#1976d2', single: '#f57c00' };
+const THRESHOLD_COLOR = '#555';
 
 function get(tier, mode) {
   return REPORTS.find(r => r.tier === tier && r.mode === mode);
 }
 
+// Return the SLO values for a tier (same across both modes of one tier).
+function sloFor(tier) {
+  const r = get(tier, 'batch') || get(tier, 'single');
+  return r ? r.slo : null;
+}
+
 function bymode(field) {
   return ['batch', 'single'].map(mode => ({
+    type: 'bar',
     label: mode,
     data: tiers.map(t => {
       const r = get(t, mode);
@@ -197,7 +227,67 @@ function bymode(field) {
     }),
     backgroundColor: COLORS[mode],
     borderColor: COLORS[mode],
+    order: 2,
   }));
+}
+
+// Build a horizontal threshold-line dataset (one Y value per tier; null breaks the line).
+function thresholdDataset(label, perTierValue, opts) {
+  opts = opts || {};
+  return {
+    type: 'line',
+    label: label,
+    data: tiers.map(perTierValue),
+    borderColor: THRESHOLD_COLOR,
+    borderDash: [6, 4],
+    borderWidth: 1.5,
+    pointRadius: 0,
+    pointHoverRadius: 4,
+    fill: false,
+    tension: 0,
+    spanGaps: false,   // null in data breaks the line (e.g. 50k p99 ceiling)
+    order: 1,          // draw above bars
+    stepped: opts.stepped || false,
+  };
+}
+
+// --- Vintage detection ---
+const reportTimes = REPORTS
+  .map(r => Date.parse(r.started_at))
+  .filter(t => !Number.isNaN(t));
+const minTime = reportTimes.length ? Math.min(...reportTimes) : 0;
+const maxTime = reportTimes.length ? Math.max(...reportTimes) : 0;
+const spanMs = maxTime - minTime;
+const STALE_THRESHOLD_MS = 5 * 60 * 1000;  // 5 minutes
+
+function fmtSpan(ms) {
+  if (ms < 60_000) return Math.round(ms / 1000) + 's';
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+function fmtAgo(reportMs, refMs) {
+  const delta = refMs - reportMs;
+  if (delta < 60_000) return Math.round(delta / 1000) + 's ago';
+  const m = Math.round(delta / 60_000);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm ago';
+}
+
+// Banner if reports span > 5 minutes — likely a mix of runs.
+if (spanMs > STALE_THRESHOLD_MS) {
+  const minDate = new Date(minTime).toLocaleString();
+  const maxDate = new Date(maxTime).toLocaleString();
+  document.getElementById('vintageBanner').innerHTML = `
+    <div class="banner">
+      <strong>Mixed-vintage reports.</strong> The 12 reports below span <strong>${fmtSpan(spanMs)}</strong>
+      (oldest: ${minDate}, newest: ${maxDate}). Some are from earlier runs and may not reflect the
+      current build. For a consistent comparison, delete <code>reports/*.json</code> and re-run the full
+      matrix: <code>rm reports/*.json && bash scripts/stress-run.sh</code>.
+    </div>
+  `;
 }
 
 // --- Summary tiles ---
@@ -206,20 +296,28 @@ const failed = REPORTS.length - passed;
 const totalEvents = REPORTS.reduce((s, r) => s + (r.sent || 0), 0);
 const totalLoss = REPORTS.reduce((s, r) => s + (r.missing || 0), 0);
 const totalLossPct = totalEvents > 0 ? (totalLoss / totalEvents * 100) : 0;
+const vintageClass = spanMs > STALE_THRESHOLD_MS ? 'fail' : '';
 document.getElementById('summary').innerHTML = `
   <div class="stat"><div class="stat-value">${REPORTS.length}</div><div class="stat-label">runs</div></div>
   <div class="stat"><div class="stat-value pass">${passed}</div><div class="stat-label">passed</div></div>
   <div class="stat"><div class="stat-value ${failed > 0 ? 'fail' : ''}">${failed}</div><div class="stat-label">failed</div></div>
   <div class="stat"><div class="stat-value">${(totalEvents / 1e6).toFixed(2)}M</div><div class="stat-label">events sent</div></div>
   <div class="stat"><div class="stat-value ${totalLoss > 0 ? 'fail' : ''}">${totalLoss.toLocaleString()}</div><div class="stat-label">missing (${totalLossPct.toFixed(2)}%)</div></div>
+  <div class="stat"><div class="stat-value ${vintageClass}">${reportTimes.length ? fmtSpan(spanMs) : '—'}</div><div class="stat-label">vintage span</div></div>
 `;
 
-// --- Rate chart ---
+// --- Rate chart (with per-tier rate-floor SLO line) ---
 new Chart(document.getElementById('rateChart'), {
   type: 'bar',
   data: {
     labels: tiers.map(t => t.toLocaleString()),
-    datasets: bymode(r => +((r.rate_achieved / r.rate_target) * 100).toFixed(1)),
+    datasets: [
+      ...bymode(r => +((r.rate_achieved / r.rate_target) * 100).toFixed(1)),
+      thresholdDataset('rate floor SLO', t => {
+        const slo = sloFor(t);
+        return slo ? +(slo.rate_min_pct * 100).toFixed(1) : null;
+      }, { stepped: true }),
+    ],
   },
   options: {
     responsive: true,
@@ -228,6 +326,10 @@ new Chart(document.getElementById('rateChart'), {
       tooltip: {
         callbacks: {
           label: ctx => {
+            // Threshold line tooltip
+            if (ctx.dataset.type === 'line') {
+              return `rate floor SLO: ${ctx.parsed.y}%`;
+            }
             const r = get(tiers[ctx.dataIndex], ctx.dataset.label);
             return `${ctx.dataset.label}: ${ctx.parsed.y}% (${r.rate_achieved.toFixed(0)}/${r.rate_target})`;
           },
@@ -268,12 +370,19 @@ new Chart(document.getElementById('lossChart'), {
   },
 });
 
-// --- p99 chart (log scale) ---
+// --- p99 chart (log scale, with per-tier ceiling line) ---
 new Chart(document.getElementById('p99Chart'), {
   type: 'bar',
   data: {
     labels: tiers.map(t => t.toLocaleString()),
-    datasets: bymode(r => r.sync_latency_ms.p99),
+    datasets: [
+      ...bymode(r => r.sync_latency_ms.p99),
+      thresholdDataset('p99 ceiling SLO', t => {
+        const slo = sloFor(t);
+        // null ceiling (calibration mode, e.g. 50k) breaks the line at that point.
+        return slo && slo.latency_p99_ms_max != null ? slo.latency_p99_ms_max : null;
+      }, { stepped: true }),
+    ],
   },
   options: {
     responsive: true,
@@ -282,6 +391,9 @@ new Chart(document.getElementById('p99Chart'), {
       tooltip: {
         callbacks: {
           label: ctx => {
+            if (ctx.dataset.type === 'line') {
+              return `p99 ceiling SLO: ${ctx.parsed.y}ms`;
+            }
             const r = get(tiers[ctx.dataIndex], ctx.dataset.label);
             const ceiling = r.slo.latency_p99_ms_max;
             const v = ctx.parsed.y;
@@ -357,6 +469,14 @@ REPORTS.forEach(r => {
     : `<span class="fail">FAIL</span><br><span class="muted">(${reasons.join(', ')})</span>`;
   const ratePct = (r.rate_achieved / r.rate_target * 100);
   const missingClass = r.missing > 0 ? 'fail' : '';
+  const tMs = Date.parse(r.started_at);
+  let ageHTML = '<span class="muted">—</span>';
+  if (!Number.isNaN(tMs)) {
+    const age = fmtAgo(tMs, GENERATED_AT_MS);
+    // Mark stale if this report is more than 5 minutes older than the newest report.
+    const isStale = (maxTime - tMs) > STALE_THRESHOLD_MS;
+    ageHTML = `<span class="${isStale ? 'ago-stale' : 'muted'}" title="${new Date(tMs).toLocaleString()}">${age}</span>`;
+  }
   tr.innerHTML = `
     <td>${r.tier.toLocaleString()}</td>
     <td class="mode-${r.mode}">${r.mode}</td>
@@ -373,6 +493,7 @@ REPORTS.forEach(r => {
     <td class="num">${r.sync_latency_ms.max}</td>
     <td class="num ${ceiling == null ? 'muted' : ''}">${ceiling == null ? 'null' : ceiling}</td>
     <td>${verdictHTML}</td>
+    <td class="num">${ageHTML}</td>
   `;
   tbody.appendChild(tr);
 });
@@ -383,9 +504,11 @@ REPORTS.forEach(r => {
 
 
 def build_dashboard(reports):
+    generated_at_ms = int(time.time() * 1000)
     return (
         HTML_TEMPLATE
         .replace("__DATA__", json.dumps(reports, separators=(",", ":")))
+        .replace("__GENERATED_AT_MS__", str(generated_at_ms))
         .replace("__COUNT__", str(len(reports)))
     )
 
