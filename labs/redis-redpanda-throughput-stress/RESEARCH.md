@@ -41,6 +41,20 @@ Real workloads pin related keys to the same Cluster slot via `{...}` hashtags. E
 
 50k/s × 30s = 1.5 M peak. Parent's 100 k cap trimmed aggressively at 10k; at 50k it would discard 93% of entries before the receiver could read them. 2 M caps the stream at ~33% headroom over peak. Receiver is still untainted by MAXLEN trimming (streaming `XREAD BLOCK` reads every entry as it arrives; trim only matters for end-of-run XLEN), but the larger cap lets operators eyeball stream contents post-run.
 
+## Why NATS_MAX_BYTES = 5GB (was 2GB)
+
+JetStream's `APP_EVENTS` stream is configured `--storage file --discard old --max-bytes ...`. When the stream hits the byte cap, every new publish discards the oldest unacked message — silent loss before the sink can pull. This is the dominant loss path at high throughput.
+
+Sizing math at 50k:
+
+- Writer commits 50 000 msg/s × 30 s sustain × ~1.7 KB JetStream envelope (1024 B payload + JSON wrapper + NATS headers) ≈ **2.55 GB peak buffer**.
+- A 2 GB cap evicts ~0.55 GB before the sink can drain — observed as 40–50% loss on the original matrix run at 50k.
+- A 5 GB cap gives ~2× headroom over the 50k peak buffer. Even if the sink briefly lags 3–5 s behind the writer, the buffer absorbs it without eviction.
+
+The end-of-run `nats.bytes` from the failed 50k runs (1.26 GB) is itself evidence the sink can keep pace once the cap stops the eviction race — it's the steady-state retained-message footprint, not a backlog.
+
+The knob is env-tunable (`NATS_MAX_BYTES`) so future tiers (60k, 80k) can raise it without docker-compose edits. nats container memory cap (2 GiB) still bounds index footprint comfortably at 5 GB stream size (~500 MB index for ~3 M messages tracked).
+
 ## Why calibration-mode verdict
 
 There's no reference number for what p99 sync-latency *should* be at, say, 30k batch mode on a given host. Hard-coding a guess turns the verdict into noise. Ship with `TIER_P99_MS=""` for every tier; collector's `--slo-p99-ms <= 0` flag skips the p99 gate; run the full matrix once on real hardware; pick ceilings; commit them. Future runs gate on real numbers.
