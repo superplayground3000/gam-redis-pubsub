@@ -43,17 +43,18 @@ Real workloads pin related keys to the same Cluster slot via `{...}` hashtags. E
 
 ## Why NATS_MAX_BYTES = 5GB (was 2GB)
 
-JetStream's `APP_EVENTS` stream is configured `--storage file --discard old --max-bytes ...`. When the stream hits the byte cap, every new publish discards the oldest unacked message — silent loss before the sink can pull. This is the dominant loss path at high throughput.
+JetStream's `APP_EVENTS` stream is configured `--storage file --retention limits --discard old --max-bytes ...`. When the stream exceeds the byte cap, the oldest retained messages are evicted regardless of ack status. If a message is evicted before the durable consumer (`region-writer`) reads it, the sink never sees it — silent loss.
 
-Sizing math at 50k:
+Sizing math at 50k, grounded in observed data from the failed 2GB-cap matrix:
 
-- Writer commits 50 000 msg/s × 30 s sustain × ~1.7 KB JetStream envelope (1024 B payload + JSON wrapper + NATS headers) ≈ **2.55 GB peak buffer**.
-- A 2 GB cap evicts ~0.55 GB before the sink can drain — observed as 40–50% loss on the original matrix run at 50k.
+- The failed 50k batch run reported `nats.bytes` = 1.26 GB containing ~740k delivered messages, giving an observed **~1.7 KB per message in JetStream file storage** (JSON envelope + NATS headers + file-block overhead).
+- At 50k msg/s × 30s sustain = 1.5M messages × 1.7 KB ≈ **2.55 GB peak buffer required**.
+- A 2 GB cap evicts the overflow before the sink reads it: 1.5M sent − 740k delivered = 760k missing ≈ 1.3 GB worth, matching the order of magnitude predicted by the byte math (the 2 GB cap is exceeded for the entire second half of the sustain window). This was the main loss path on the original matrix; addressing it is the goal of this change.
 - A 5 GB cap gives ~2× headroom over the 50k peak buffer. Even if the sink briefly lags 3–5 s behind the writer, the buffer absorbs it without eviction.
 
-The end-of-run `nats.bytes` from the failed 50k runs (1.26 GB) is itself evidence the sink can keep pace once the cap stops the eviction race — it's the steady-state retained-message footprint, not a backlog.
+The match between `nats.bytes` end-state and the delivered count (1.26 GB ≈ 740k × 1.7 KB), combined with the harness's quiescence gate reporting `MaxPending == 0` at run end, suggests the sink kept pace with everything that survived eviction — the failing tier wasn't a sink-throughput limit, it was a buffer limit.
 
-The knob is env-tunable (`NATS_MAX_BYTES`) so future tiers (60k, 80k) can raise it without docker-compose edits. nats container memory cap (2 GiB) still bounds index footprint comfortably at 5 GB stream size (~500 MB index for ~3 M messages tracked).
+The knob is env-tunable (`NATS_MAX_BYTES`) so future tiers (60k, 80k) can raise it without docker-compose edits. nats container memory cap is 2 GiB; this was uncontended at the 2 GB stream size in prior matrix runs and should be re-checked during the 5 GB calibration via `docker stats rrts-nats` (raise the `mem_limit` in docker-compose.yml to 4 GiB if RSS approaches the cap).
 
 ## Why calibration-mode verdict
 
