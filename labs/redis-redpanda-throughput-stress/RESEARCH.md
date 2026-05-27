@@ -62,7 +62,7 @@ The first verification matrix (2026-05-27) showed the 5GB cap did NOT produce lo
 
 The `nats.bytes ≈ delivered × 1.7 KB` match cited above was misread — it was the steady-state product of continuous eviction holding the buffer bounded, not evidence the sink could keep pace at line rate.
 
-The actual fix at 50k required three additional knobs:
+The actual fix at 50k required four additional knobs:
 
 - `connect-sink` CPU cap raised from 6 to 12 (it was saturating the 6 CPU at 50k).
 - `connect-sink` `pipeline.threads` raised from 2 to 4 so the extra CPU is actually used (each sink message does SET + XADD, so 2 threads × 2 writes ≈ 4 concurrent client ops — bumping to 4 threads gives ~8 ops against the new 12-CPU budget).
