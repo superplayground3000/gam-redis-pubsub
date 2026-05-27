@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>redis-redpanda-throughput-stress dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --batch: #1976d2;
+    --single: #f57c00;
+    --pass: #2e7d32;
+    --fail: #c62828;
+    --bg: #fafafa;
+    --card: #ffffff;
+    --border: #e0e0e0;
+    --text: #212121;
+    --muted: #757575;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+    max-width: 1200px;
+    margin: 0 auto;
+    padding: 2rem 1rem;
+    background: var(--bg);
+    color: var(--text);
+  }
+  h1 { margin: 0 0 0.25rem 0; font-size: 1.6rem; }
+  .subtitle { color: var(--muted); margin: 0 0 1.5rem 0; font-size: 0.95rem; }
+  .summary { display: flex; flex-wrap: wrap; gap: 1rem; margin: 1.5rem 0; }
+  .stat {
+    background: var(--card);
+    padding: 0.9rem 1.2rem;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    min-width: 120px;
+    flex: 0 0 auto;
+  }
+  .stat-value { font-size: 1.6rem; font-weight: 600; line-height: 1.1; }
+  .stat-label { color: var(--muted); font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  section {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem;
+    margin: 1.25rem 0;
+  }
+  h2 { margin: 0 0 0.5rem 0; font-size: 1.1rem; }
+  .note { color: var(--muted); font-size: 0.85rem; margin: 0 0 1rem 0; }
+  .chart-container { position: relative; height: 340px; margin-top: 0.5rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-size: 0.88rem; }
+  th {
+    background: #f5f5f5;
+    padding: 0.6rem 0.5rem;
+    text-align: left;
+    border-bottom: 2px solid var(--border);
+    font-weight: 600;
+  }
+  td {
+    padding: 0.55rem 0.5rem;
+    border-bottom: 1px solid #f0f0f0;
+    font-variant-numeric: tabular-nums;
+  }
+  tr:hover td { background: #fafafa; }
+  .pass { color: var(--pass); font-weight: 600; }
+  .fail { color: var(--fail); font-weight: 600; }
+  .num { text-align: right; }
+  .muted { color: var(--muted); }
+  .mode-batch { color: var(--batch); font-weight: 600; }
+  .mode-single { color: var(--single); font-weight: 600; }
+  .legend-swatch {
+    display: inline-block; width: 12px; height: 12px;
+    border-radius: 2px; margin-right: 0.3rem; vertical-align: middle;
+  }
+  .legend-line {
+    display: inline-block; width: 18px; height: 0;
+    border-top: 2px dashed #666; margin-right: 0.3rem; vertical-align: middle;
+  }
+  .banner {
+    background: #fff3e0;
+    border: 1px solid #ffb74d;
+    border-left: 4px solid #f57c00;
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin: 1rem 0;
+    font-size: 0.9rem;
+    color: #5d4037;
+  }
+  .banner strong { color: #bf360c; }
+  .ago-stale { color: var(--fail); }
+  footer { margin-top: 2rem; color: var(--muted); font-size: 0.8rem; text-align: center; }
+</style>
+</head>
+<body>
+<h1>redis-redpanda-throughput-stress &mdash; matrix dashboard</h1>
+<p class="subtitle">
+  <span class="legend-swatch" style="background:var(--batch)"></span>batch
+  &nbsp;&nbsp;
+  <span class="legend-swatch" style="background:var(--single)"></span>single
+  &nbsp;&nbsp;
+  <span class="legend-line"></span>SLO threshold
+  &nbsp;&middot;&nbsp; comparison across all tiers in reports/
+</p>
+
+<div id="vintageBanner"></div>
+<div class="summary" id="summary"></div>
+
+<section>
+  <h2>Rate achieved (% of target)</h2>
+  <p class="note">Higher is better. 100% = writer fully sustained target rate during the sustain window. Dashed line marks each tier's `rate_min_pct` floor.</p>
+  <div class="chart-container"><canvas id="rateChart"></canvas></div>
+</section>
+
+<section>
+  <h2>Packet loss (missing_pct)</h2>
+  <p class="note">Lower is better. ALO mode expects 0% loss; any non-zero value is real in-transit loss between writer and regional Redis. Trimmed entries (capped by MAXLEN) are NOT counted as loss.</p>
+  <div class="chart-container"><canvas id="lossChart"></canvas></div>
+</section>
+
+<section>
+  <h2>Sync latency p99 (ms, log scale)</h2>
+  <p class="note">applied_ms &minus; t_send_ms per event, 99th percentile. Lower is better. Dashed line per tier shows the calibrated p99 ceiling from `tier-defs.sh`.</p>
+  <div class="chart-container"><canvas id="p99Chart"></canvas></div>
+</section>
+
+<section>
+  <h2>Latency percentile distribution</h2>
+  <p class="note">Each line is one tier&times;mode combination. Click legend entries to hide/show. Solid = batch, dashed = single. Log scale on Y to show p50 and max together.</p>
+  <div class="chart-container" style="height:400px"><canvas id="percentileChart"></canvas></div>
+</section>
+
+<section>
+  <h2>Full table</h2>
+  <p class="note">All fields from every report. Verdict reason in parens when failed.</p>
+  <div style="overflow-x:auto">
+    <table id="reportTable">
+      <thead>
+        <tr>
+          <th>Tier</th>
+          <th>Mode</th>
+          <th class="num">Rate ach./target</th>
+          <th class="num">Rate %</th>
+          <th class="num">Sent</th>
+          <th class="num">Received</th>
+          <th class="num">Missing</th>
+          <th class="num">Loss %</th>
+          <th class="num">Trimmed</th>
+          <th class="num">p50</th>
+          <th class="num">p99</th>
+          <th class="num">p999</th>
+          <th class="num">max</th>
+          <th class="num">Ceiling</th>
+          <th>Verdict</th>
+          <th class="num">Age</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</section>
+
+<footer>
+  Generated from <code>12</code> reports. Re-run <code>python3 scripts/dashboard.py</code> after each matrix run.
+</footer>
+
+<script>
+const REPORTS = [{"tier":10000,"mode":"batch","started_at":"2026-05-26T09:05:46.584400527Z","duration_s":30,"rate_target":10000,"rate_achieved":9413.465890786669,"rate_achieved_min":8499.225814019826,"sent":310508,"errors":0,"received":310508,"received_by_pattern":{"employee":102478,"org":105706,"role":102324},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":3,"sync_latency_ms":{"p50":8,"p95":13,"p99":15,"p999":29,"max":34,"count":310508},"redis":{"central_xlen_max":310508,"region_xlen_final":310508},"nats":{"pending_max":0,"bytes":449411057},"connect":{"source_in":768431,"source_out":768431,"sink_in":768431,"sink_out":1536862},"slo":{"rate_min_pct":0.95,"latency_p99_ms_max":null},"verdict":{"pass":false,"detail":{"rate_floor_ok":false,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"10000-batch.json"},{"tier":10000,"mode":"single","started_at":"2026-05-26T09:06:35.905528278Z","duration_s":30,"rate_target":10000,"rate_achieved":10000.855891404244,"rate_achieved_min":9995.185153942102,"sent":320107,"errors":0,"received":320107,"received_by_pattern":{"employee":105228,"org":108708,"role":106171},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":164257,"sync_latency_ms":{"p50":1,"p95":1,"p99":1,"p999":4,"max":17,"count":320107},"redis":{"central_xlen_max":320107,"region_xlen_final":320107},"nats":{"pending_max":0,"bytes":463316334},"connect":{"source_in":1088538,"source_out":1088538,"sink_in":1088538,"sink_out":2177076},"slo":{"rate_min_pct":0.95,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"10000-single.json"},{"tier":20000,"mode":"batch","started_at":"2026-05-26T09:07:26.296473697Z","duration_s":30,"rate_target":20000,"rate_achieved":20000.061180954144,"rate_achieved_min":19985.209366237443,"sent":656507,"errors":0,"received":656507,"received_by_pattern":{"employee":215379,"org":223298,"role":217830},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":0,"sync_latency_ms":{"p50":7,"p95":13,"p99":17,"p999":368,"max":411,"count":656507},"redis":{"central_xlen_max":656507,"region_xlen_final":656507},"nats":{"pending_max":0,"bytes":950227991},"connect":{"source_in":1745045,"source_out":1745045,"sink_in":1745045,"sink_out":3490090},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"20000-batch.json"},{"tier":20000,"mode":"single","started_at":"2026-05-26T09:08:19.409932475Z","duration_s":30,"rate_target":20000,"rate_achieved":20006.874370603287,"rate_achieved_min":19992.0545737356,"sent":642370,"errors":0,"received":642370,"received_by_pattern":{"employee":212458,"org":218397,"role":211515},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":225696,"sync_latency_ms":{"p50":1,"p95":1,"p99":94,"p999":547,"max":597,"count":642370},"redis":{"central_xlen_max":642370,"region_xlen_final":642370},"nats":{"pending_max":1,"bytes":929751730},"connect":{"source_in":2387415,"source_out":2387415,"sink_in":2387415,"sink_out":4774830},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"20000-single.json"},{"tier":30000,"mode":"batch","started_at":"2026-05-26T09:17:39.455778633Z","duration_s":30,"rate_target":30000,"rate_achieved":29999.143146629274,"rate_achieved_min":29971.487225058187,"sent":983005,"errors":0,"received":983005,"received_by_pattern":{"employee":324544,"org":334324,"role":324137},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":0,"sync_latency_ms":{"p50":13,"p95":1363,"p99":1921,"p999":2046,"max":2067,"count":983005},"redis":{"central_xlen_max":983005,"region_xlen_final":983005},"nats":{"pending_max":556,"bytes":1422783825},"connect":{"source_in":9710947,"source_out":9710947,"sink_in":9674063,"sink_out":19348126},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":300},"verdict":{"pass":false,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":false}},"quiescence_timeout":false,"_filename":"30000-batch.json"},{"tier":30000,"mode":"single","started_at":"2026-05-26T09:10:09.017162802Z","duration_s":30,"rate_target":30000,"rate_achieved":30019.500647333443,"rate_achieved_min":29985.284675555773,"sent":968559,"errors":0,"received":968559,"received_by_pattern":{"employee":319712,"org":329164,"role":319683},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":212052,"sync_latency_ms":{"p50":1,"p95":67,"p99":203,"p999":255,"max":269,"count":968559},"redis":{"central_xlen_max":968559,"region_xlen_final":968559},"nats":{"pending_max":533,"bytes":1401891759},"connect":{"source_in":4337984,"source_out":4337984,"sink_in":4337984,"sink_out":8675968},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"30000-single.json"},{"tier":40000,"mode":"batch","started_at":"2026-05-26T09:11:06.704861184Z","duration_s":30,"rate_target":40000,"rate_achieved":39999.74148704905,"rate_achieved_min":39973.42518725441,"sent":1308511,"errors":0,"received":1270459,"received_by_pattern":{"employee":419325,"org":431371,"role":419763},"missing":38052,"missing_pct":2.908038220542281,"trimmed":1270459,"received_errors":10,"latency_parse_errors":0,"negative_latency_deltas":0,"sync_latency_ms":{"p50":1568,"p95":5767,"p99":5875,"p999":5919,"max":5927,"count":1270459},"redis":{"central_xlen_max":1308511,"region_xlen_final":0},"nats":{"pending_max":6707,"bytes":1837786135},"connect":{"source_in":5646495,"source_out":5646495,"sink_in":5608854,"sink_out":11217181},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":false,"detail":{"rate_floor_ok":true,"missing_ok":false,"p99_latency_ok":null}},"quiescence_timeout":true,"_filename":"40000-batch.json"},{"tier":40000,"mode":"single","started_at":"2026-05-26T09:12:19.455455774Z","duration_s":30,"rate_target":40000,"rate_achieved":40034.70994668814,"rate_achieved_min":39988.48080442973,"sent":1294009,"errors":0,"received":1294009,"received_by_pattern":{"employee":426896,"org":440078,"role":427035},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":17975,"sync_latency_ms":{"p50":842,"p95":6051,"p99":6363,"p999":6399,"max":6407,"count":1294009},"redis":{"central_xlen_max":1294009,"region_xlen_final":1294009},"nats":{"pending_max":10708,"bytes":1872942360},"connect":{"source_in":6940504,"source_out":6940504,"sink_in":6903620,"sink_out":13807240},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"40000-single.json"},{"tier":5000,"mode":"batch","started_at":"2026-05-26T09:04:05.861486978Z","duration_s":30,"rate_target":5000,"rate_achieved":4448.214771496805,"rate_achieved_min":3502.025350835326,"sent":145750,"errors":0,"received":145750,"received_by_pattern":{"employee":47921,"org":49710,"role":48119},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":0,"sync_latency_ms":{"p50":8,"p95":14,"p99":401,"p999":876,"max":879,"count":145750},"redis":{"central_xlen_max":145750,"region_xlen_final":145750},"nats":{"pending_max":0,"bytes":210935844},"connect":{"source_in":297750,"source_out":297750,"sink_in":297750,"sink_out":595500},"slo":{"rate_min_pct":0.85,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"5000-batch.json"},{"tier":5000,"mode":"single","started_at":"2026-05-26T09:04:56.15492926Z","duration_s":30,"rate_target":5000,"rate_achieved":4999.89060859012,"rate_achieved_min":4996.339903668228,"sent":160173,"errors":0,"received":160173,"received_by_pattern":{"employee":52950,"org":54351,"role":52872},"missing":0,"missing_pct":0,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":109066,"sync_latency_ms":{"p50":1,"p95":1,"p99":311,"p999":857,"max":918,"count":160173},"redis":{"central_xlen_max":160173,"region_xlen_final":160173},"nats":{"pending_max":0,"bytes":231825335},"connect":{"source_in":457923,"source_out":457923,"sink_in":457923,"sink_out":915846},"slo":{"rate_min_pct":0.85,"latency_p99_ms_max":null},"verdict":{"pass":true,"detail":{"rate_floor_ok":true,"missing_ok":true,"p99_latency_ok":null}},"quiescence_timeout":false,"_filename":"5000-single.json"},{"tier":50000,"mode":"batch","started_at":"2026-05-26T09:13:20.624636509Z","duration_s":30,"rate_target":50000,"rate_achieved":48661.06180962136,"rate_achieved_min":28496.985189948813,"sent":1638556,"errors":4454,"received":883652,"received_by_pattern":{"employee":291417,"org":299692,"role":292543},"missing":754904,"missing_pct":46.071296922412174,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":0,"sync_latency_ms":{"p50":3627,"p95":11439,"p99":12247,"p999":12423,"max":12431,"count":883652},"redis":{"central_xlen_max":1474812,"region_xlen_final":883652},"nats":{"pending_max":245,"bytes":1257062508},"connect":{"source_in":7824156,"source_out":7824156,"sink_in":7787272,"sink_out":15574544},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":false,"detail":{"rate_floor_ok":true,"missing_ok":false,"p99_latency_ok":null}},"quiescence_timeout":true,"_filename":"50000-batch.json"},{"tier":50000,"mode":"single","started_at":"2026-05-26T09:14:30.171244055Z","duration_s":30,"rate_target":50000,"rate_achieved":47569.76952497983,"rate_achieved_min":105.26065358880724,"sent":1503709,"errors":16,"received":903786,"received_by_pattern":{"employee":297339,"org":308185,"role":298262},"missing":599923,"missing_pct":39.89621662170008,"trimmed":0,"received_errors":0,"latency_parse_errors":0,"negative_latency_deltas":3668,"sync_latency_ms":{"p50":2887,"p95":11007,"p99":11743,"p999":11999,"max":12055,"count":903786},"redis":{"central_xlen_max":1472556,"region_xlen_final":903786},"nats":{"pending_max":47,"bytes":1290096749},"connect":{"source_in":8727942,"source_out":8727942,"sink_in":8691058,"sink_out":17382116},"slo":{"rate_min_pct":0.9,"latency_p99_ms_max":null},"verdict":{"pass":false,"detail":{"rate_floor_ok":true,"missing_ok":false,"p99_latency_ok":null}},"quiescence_timeout":true,"_filename":"50000-single.json"}];
+const GENERATED_AT_MS = 1779862745679;
+
+// Sort by tier then mode (batch first per tier).
+REPORTS.sort((a, b) => a.tier - b.tier || a.mode.localeCompare(b.mode));
+
+const tiers = [...new Set(REPORTS.map(r => r.tier))].sort((a, b) => a - b);
+const COLORS = { batch: '#1976d2', single: '#f57c00' };
+const THRESHOLD_COLOR = '#555';
+
+function get(tier, mode) {
+  return REPORTS.find(r => r.tier === tier && r.mode === mode);
+}
+
+// Return the SLO values for a tier (same across both modes of one tier).
+function sloFor(tier) {
+  const r = get(tier, 'batch') || get(tier, 'single');
+  return r ? r.slo : null;
+}
+
+function bymode(field) {
+  return ['batch', 'single'].map(mode => ({
+    type: 'bar',
+    label: mode,
+    data: tiers.map(t => {
+      const r = get(t, mode);
+      return r ? field(r) : null;
+    }),
+    backgroundColor: COLORS[mode],
+    borderColor: COLORS[mode],
+    order: 2,
+  }));
+}
+
+// Build a horizontal threshold-line dataset (one Y value per tier; null breaks the line).
+function thresholdDataset(label, perTierValue, opts) {
+  opts = opts || {};
+  return {
+    type: 'line',
+    label: label,
+    data: tiers.map(perTierValue),
+    borderColor: THRESHOLD_COLOR,
+    borderDash: [6, 4],
+    borderWidth: 1.5,
+    pointRadius: 0,
+    pointHoverRadius: 4,
+    fill: false,
+    tension: 0,
+    spanGaps: false,   // null in data breaks the line (e.g. 50k p99 ceiling)
+    order: 1,          // draw above bars
+    stepped: opts.stepped || false,
+  };
+}
+
+// --- Vintage detection ---
+const reportTimes = REPORTS
+  .map(r => Date.parse(r.started_at))
+  .filter(t => !Number.isNaN(t));
+const minTime = reportTimes.length ? Math.min(...reportTimes) : 0;
+const maxTime = reportTimes.length ? Math.max(...reportTimes) : 0;
+const spanMs = maxTime - minTime;
+const STALE_THRESHOLD_MS = 5 * 60 * 1000;  // 5 minutes
+
+function fmtSpan(ms) {
+  if (ms < 60_000) return Math.round(ms / 1000) + 's';
+  const m = Math.round(ms / 60_000);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm';
+}
+function fmtAgo(reportMs, refMs) {
+  const delta = refMs - reportMs;
+  if (delta < 60_000) return Math.round(delta / 1000) + 's ago';
+  const m = Math.round(delta / 60_000);
+  if (m < 60) return m + 'm ago';
+  const h = Math.floor(m / 60);
+  return h + 'h ' + (m % 60) + 'm ago';
+}
+
+// Banner if reports span > 5 minutes — likely a mix of runs.
+if (spanMs > STALE_THRESHOLD_MS) {
+  const minDate = new Date(minTime).toLocaleString();
+  const maxDate = new Date(maxTime).toLocaleString();
+  document.getElementById('vintageBanner').innerHTML = `
+    <div class="banner">
+      <strong>Mixed-vintage reports.</strong> The ${REPORTS.length} reports below span <strong>${fmtSpan(spanMs)}</strong>
+      (oldest: ${minDate}, newest: ${maxDate}). Some are from earlier runs and may not reflect the
+      current build. For a consistent comparison, delete <code>reports/*.json</code> and re-run the full
+      matrix: <code>rm reports/*.json && bash scripts/stress-run.sh</code>.
+    </div>
+  `;
+}
+
+// --- Summary tiles ---
+const passed = REPORTS.filter(r => r.verdict.pass).length;
+const failed = REPORTS.length - passed;
+const totalEvents = REPORTS.reduce((s, r) => s + (r.sent || 0), 0);
+const totalLoss = REPORTS.reduce((s, r) => s + (r.missing || 0), 0);
+const totalLossPct = totalEvents > 0 ? (totalLoss / totalEvents * 100) : 0;
+const vintageClass = spanMs > STALE_THRESHOLD_MS ? 'fail' : '';
+document.getElementById('summary').innerHTML = `
+  <div class="stat"><div class="stat-value">${REPORTS.length}</div><div class="stat-label">runs</div></div>
+  <div class="stat"><div class="stat-value pass">${passed}</div><div class="stat-label">passed</div></div>
+  <div class="stat"><div class="stat-value ${failed > 0 ? 'fail' : ''}">${failed}</div><div class="stat-label">failed</div></div>
+  <div class="stat"><div class="stat-value">${(totalEvents / 1e6).toFixed(2)}M</div><div class="stat-label">events sent</div></div>
+  <div class="stat"><div class="stat-value ${totalLoss > 0 ? 'fail' : ''}">${totalLoss.toLocaleString()}</div><div class="stat-label">missing (${totalLossPct.toFixed(2)}%)</div></div>
+  <div class="stat"><div class="stat-value ${vintageClass}">${reportTimes.length ? fmtSpan(spanMs) : '—'}</div><div class="stat-label">vintage span</div></div>
+`;
+
+// --- Rate chart (with per-tier rate-floor SLO line) ---
+new Chart(document.getElementById('rateChart'), {
+  type: 'bar',
+  data: {
+    labels: tiers.map(t => t.toLocaleString()),
+    datasets: [
+      ...bymode(r => +((r.rate_achieved / r.rate_target) * 100).toFixed(1)),
+      thresholdDataset('rate floor SLO', t => {
+        const slo = sloFor(t);
+        return slo ? +(slo.rate_min_pct * 100).toFixed(1) : null;
+      }, { stepped: true }),
+    ],
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      tooltip: {
+        callbacks: {
+          label: ctx => {
+            // Threshold line tooltip
+            if (ctx.dataset.type === 'line') {
+              return `rate floor SLO: ${ctx.parsed.y}%`;
+            }
+            const r = get(tiers[ctx.dataIndex], ctx.dataset.label);
+            return `${ctx.dataset.label}: ${ctx.parsed.y}% (${r.rate_achieved.toFixed(0)}/${r.rate_target})`;
+          },
+        },
+      },
+    },
+    scales: {
+      y: { beginAtZero: true, max: 110, title: { display: true, text: '% of target rate' } },
+      x: { title: { display: true, text: 'tier (msg/s)' } },
+    },
+  },
+});
+
+// --- Loss chart ---
+new Chart(document.getElementById('lossChart'), {
+  type: 'bar',
+  data: {
+    labels: tiers.map(t => t.toLocaleString()),
+    datasets: bymode(r => +(r.missing_pct || 0).toFixed(2)),
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      tooltip: {
+        callbacks: {
+          label: ctx => {
+            const r = get(tiers[ctx.dataIndex], ctx.dataset.label);
+            return `${ctx.dataset.label}: ${ctx.parsed.y}% (${r.missing.toLocaleString()} of ${r.sent.toLocaleString()})`;
+          },
+        },
+      },
+    },
+    scales: {
+      y: { beginAtZero: true, title: { display: true, text: 'missing_pct (%)' } },
+      x: { title: { display: true, text: 'tier (msg/s)' } },
+    },
+  },
+});
+
+// --- p99 chart (log scale, with per-tier ceiling line) ---
+new Chart(document.getElementById('p99Chart'), {
+  type: 'bar',
+  data: {
+    labels: tiers.map(t => t.toLocaleString()),
+    datasets: [
+      ...bymode(r => r.sync_latency_ms.p99),
+      thresholdDataset('p99 ceiling SLO', t => {
+        const slo = sloFor(t);
+        // null ceiling (calibration mode, e.g. 50k) breaks the line at that point.
+        return slo && slo.latency_p99_ms_max != null ? slo.latency_p99_ms_max : null;
+      }, { stepped: true }),
+    ],
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    plugins: {
+      tooltip: {
+        callbacks: {
+          label: ctx => {
+            if (ctx.dataset.type === 'line') {
+              return `p99 ceiling SLO: ${ctx.parsed.y}ms`;
+            }
+            const r = get(tiers[ctx.dataIndex], ctx.dataset.label);
+            const ceiling = r.slo.latency_p99_ms_max;
+            const v = ctx.parsed.y;
+            const status = ceiling == null ? '(no ceiling)' : v <= ceiling ? `<= ${ceiling} OK` : `> ${ceiling} FAIL`;
+            return `${ctx.dataset.label}: p99=${v}ms ${status}`;
+          },
+        },
+      },
+    },
+    scales: {
+      y: {
+        type: 'logarithmic',
+        title: { display: true, text: 'p99 sync-latency (ms, log scale)' },
+        min: 1,
+      },
+      x: { title: { display: true, text: 'tier (msg/s)' } },
+    },
+  },
+});
+
+// --- Percentile distribution per tier+mode ---
+const PERCENTILES = ['p50', 'p95', 'p99', 'p999', 'max'];
+const PERCENTILE_LABELS = ['p50', 'p95', 'p99', 'p99.9', 'max'];
+new Chart(document.getElementById('percentileChart'), {
+  type: 'line',
+  data: {
+    labels: PERCENTILE_LABELS,
+    datasets: REPORTS.map(r => ({
+      label: `${r.tier.toLocaleString()} ${r.mode}`,
+      data: PERCENTILES.map(p => r.sync_latency_ms[p]),
+      borderColor: COLORS[r.mode],
+      backgroundColor: COLORS[r.mode],
+      borderDash: r.mode === 'single' ? [6, 4] : [],
+      tension: 0.15,
+      fill: false,
+      borderWidth: 1.5,
+      pointRadius: 3,
+    })),
+  },
+  options: {
+    responsive: true,
+    maintainAspectRatio: false,
+    interaction: { mode: 'index', intersect: false },
+    plugins: {
+      tooltip: {
+        callbacks: {
+          label: ctx => `${ctx.dataset.label}: ${ctx.parsed.y}ms`,
+        },
+      },
+      legend: { position: 'right', labels: { boxWidth: 16 } },
+    },
+    scales: {
+      y: {
+        type: 'logarithmic',
+        title: { display: true, text: 'latency (ms, log scale)' },
+        min: 1,
+      },
+    },
+  },
+});
+
+// --- Full table ---
+const tbody = document.querySelector('#reportTable tbody');
+REPORTS.forEach(r => {
+  const tr = document.createElement('tr');
+  const ceiling = r.slo.latency_p99_ms_max;
+  const reasons = [];
+  if (!r.verdict.detail.rate_floor_ok) reasons.push('rate');
+  if (!r.verdict.detail.missing_ok) reasons.push('missing');
+  if (r.verdict.detail.p99_latency_ok === false) reasons.push('p99');
+  const verdictHTML = r.verdict.pass
+    ? '<span class="pass">PASS</span>'
+    : `<span class="fail">FAIL</span><br><span class="muted">(${reasons.join(', ')})</span>`;
+  const ratePct = (r.rate_achieved / r.rate_target * 100);
+  const missingClass = r.missing > 0 ? 'fail' : '';
+  const tMs = Date.parse(r.started_at);
+  let ageHTML = '<span class="muted">—</span>';
+  if (!Number.isNaN(tMs)) {
+    const age = fmtAgo(tMs, GENERATED_AT_MS);
+    // Mark stale if this report is more than 5 minutes older than the newest report.
+    const isStale = (maxTime - tMs) > STALE_THRESHOLD_MS;
+    ageHTML = `<span class="${isStale ? 'ago-stale' : 'muted'}" title="${new Date(tMs).toLocaleString()}">${age}</span>`;
+  }
+  tr.innerHTML = `
+    <td>${r.tier.toLocaleString()}</td>
+    <td class="mode-${r.mode}">${r.mode}</td>
+    <td class="num">${r.rate_achieved.toFixed(0)} / ${r.rate_target.toLocaleString()}</td>
+    <td class="num">${ratePct.toFixed(1)}%</td>
+    <td class="num">${r.sent.toLocaleString()}</td>
+    <td class="num">${r.received.toLocaleString()}</td>
+    <td class="num ${missingClass}">${r.missing.toLocaleString()}</td>
+    <td class="num ${missingClass}">${(r.missing_pct || 0).toFixed(2)}%</td>
+    <td class="num">${r.trimmed.toLocaleString()}</td>
+    <td class="num">${r.sync_latency_ms.p50}</td>
+    <td class="num">${r.sync_latency_ms.p99}</td>
+    <td class="num">${r.sync_latency_ms.p999}</td>
+    <td class="num">${r.sync_latency_ms.max}</td>
+    <td class="num ${ceiling == null ? 'muted' : ''}">${ceiling == null ? 'null' : ceiling}</td>
+    <td>${verdictHTML}</td>
+    <td class="num">${ageHTML}</td>
+  `;
+  tbody.appendChild(tr);
+});
+</script>
+</body>
+</html>
