@@ -123,16 +123,17 @@ The `nats.bytes ≈ delivered × 1.7 KB` match cited in section 2 as "evidence t
 | File | Change |
 |---|---|
 | `docker-compose.yml` | `connect-sink` resource cap: CPU `6.0` → `12.0` (memory stays at `2g`) |
-| `connect/reverse.yaml` | Both `redis` (cache SET) and `redis_streams` (region-events XADD) fan-out outputs: `max_in_flight: 256` → `max_in_flight: 1024` |
+| `connect/reverse.yaml` | Pipeline `threads: 2` → `threads: 4`; both `redis` (cache SET) and `redis_streams` (region-events XADD) fan-out outputs: `max_in_flight: 256` → `max_in_flight: 1024` |
 | `scripts/lib/tier-defs.sh` | `DRAIN_S` default `10` → `30` so the sink can finish draining the 50k backlog before quiescence checks |
 | `RESEARCH.md` | Rewrite the `## Why NATS_MAX_BYTES = 5GB (was 2GB)` section to acknowledge the corrected analysis (sink, not buffer, was the bottleneck) and document the multi-knob fix |
 | `scripts/lib/tier-defs.sh` | Recalibrate ALL `TIER_P99_MS` entries (not just 50k) from the second matrix — the first matrix showed several mid-tier p99 ceilings drift outside their original windows under the new pipeline behavior |
 
 ### Why these specific knobs and values
 
-- **Sink CPU 6→12:** Sink at 50k is consuming the full 6 CPU during sustain (observable via `docker stats rrts-connect-sink`). Doubling matches the writer's 4-CPU + 16-worker fan-in pattern. Total host CPU cap stays under the 32-core budget.
+- **Sink CPU 6→12:** Sink at 50k is consuming the full 6 CPU during sustain (observable via `docker stats rrts-connect-sink`). Doubling matches the writer's 4-CPU + 16-worker fan-in pattern. Total per-container cap after this change is 34 CPU (`4+4+4+6+12+4` for redis-central/redis-region/nats/connect-source/connect-sink/writer) against a 32-core host — a modest CFS overcommit that's fine in practice because not all containers peg their cap simultaneously, but worth flagging here rather than claiming the budget is unchanged.
+- **`pipeline.threads: 2→4` (sink):** Required alongside the CPU bump or the extra cores sit idle. Each sink message does two Redis writes (SET + XADD), so 2 pipeline threads × 2 writes ≈ 4 concurrent client ops; bumping to 4 threads gives ~8 concurrent ops, exploiting the new 12-CPU budget without overcommitting it.
 - **`max_in_flight` 256→1024:** Matches the `nats_jetstream` input setting already on the sink side and the source's `max_in_flight` for symmetry. At 50k × ~1.7 KB the fan-out per-output queue depth needs to handle ~85 messages per millisecond; 256 is hard-capped well below that.
-- **`DRAIN_S` 10→30:** Data-driven. The 50k batch run had ~755k in-flight at writer-stop; sink steady-state delivery is ~30k/s → ~25s to drain. 30s gives margin; 60s would be excessive.
+- **`DRAIN_S` 10→30:** Data-driven. The 50k batch run had ~755k in-flight at writer-stop; sink steady-state delivery is ~30k/s → ~25s to drain. 30s gives ~5s margin; if the post-change sink runs faster, that margin grows. Override via env if a higher tier needs more.
 
 ### Non-goals (still excluded)
 
