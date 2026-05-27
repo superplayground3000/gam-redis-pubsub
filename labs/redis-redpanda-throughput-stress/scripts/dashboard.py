@@ -282,7 +282,7 @@ if (spanMs > STALE_THRESHOLD_MS) {
   const maxDate = new Date(maxTime).toLocaleString();
   document.getElementById('vintageBanner').innerHTML = `
     <div class="banner">
-      <strong>Mixed-vintage reports.</strong> The 12 reports below span <strong>${fmtSpan(spanMs)}</strong>
+      <strong>Mixed-vintage reports.</strong> The ${REPORTS.length} reports below span <strong>${fmtSpan(spanMs)}</strong>
       (oldest: ${minDate}, newest: ${maxDate}). Some are from earlier runs and may not reflect the
       current build. For a consistent comparison, delete <code>reports/*.json</code> and re-run the full
       matrix: <code>rm reports/*.json && bash scripts/stress-run.sh</code>.
