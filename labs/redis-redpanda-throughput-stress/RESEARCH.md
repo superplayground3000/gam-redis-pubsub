@@ -49,7 +49,7 @@ Sizing math at 50k, grounded in observed data from the failed 2GB-cap matrix:
 
 - The failed 50k batch run reported `nats.bytes` = 1.26 GB containing ~740k delivered messages, giving an observed **~1.7 KB per message in JetStream file storage** (JSON envelope + NATS headers + file-block overhead).
 - At 50k msg/s × 30s sustain = 1.5M messages × 1.7 KB ≈ **2.55 GB peak buffer required**.
-- A 2 GB cap evicts the overflow before the sink reads it: 1.5M sent − 740k delivered = 760k missing ≈ 1.3 GB worth, matching the order of magnitude predicted by the byte math (the 2 GB cap is exceeded for the entire second half of the sustain window). This was the main loss path on the original matrix; addressing it is the goal of this change.
+- A 2 GB cap evicts the overflow before the sink reads it: 1.5M sent − 740k delivered = 760k missing ≈ 1.3 GB worth, matching the order of magnitude predicted by the byte math (the 2 GB cap is exceeded for the entire second half of the sustain window). This appears to have been the main loss path on the original matrix; addressing it is the goal of this change.
 - A 5 GB cap gives ~2× headroom over the 50k peak buffer. Even if the sink briefly lags 3–5 s behind the writer, the buffer absorbs it without eviction.
 
 The match between `nats.bytes` end-state and the delivered count (1.26 GB ≈ 740k × 1.7 KB), combined with the harness's quiescence gate reporting `MaxPending == 0` at run end, suggests the sink kept pace with everything that survived eviction — the failing tier wasn't a sink-throughput limit, it was a buffer limit.
