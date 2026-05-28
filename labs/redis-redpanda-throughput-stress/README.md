@@ -80,10 +80,10 @@ Per-container caps total ~29 CPU and ~9.25 GiB. On a 32-core / 122 GiB host that
 
 **Expected outcomes on the calibrated host:**
 
-- Tiers 5k–30k: all `verdict.pass=true`.
-- 40k single: PASS.
-- 40k batch: `verdict.pass=false` is expected — the regional `region-events` stream (`MAXLEN=2M`) trims at this tier because the sink delivers more than the regional bound can hold. Documented research signal, not a regression.
-- 50k both modes: `verdict.pass=false` is expected — the pipeline genuinely tops out around 40k single / 30k batch loss-free on this host. 50k records where the ceiling lives.
+- Tiers 5k, 10k, 30k: all `verdict.pass=true` (rate + missing + p99 gates pass).
+- 20k: rate + missing gate; p99 gate skipped (observed p99 batch swings 14-876ms across consecutive matrix runs — too unstable to gate usefully).
+- 40k both modes: `verdict.pass=false` is expected — the regional `region-events` stream (`MAXLEN=2M`) trims at this tier because the bumped sink delivers more than the regional bound holds. Documented research signal, not a regression. Affects both modes (the original 50k pre-bump state only trimmed batch; the sink bumps lifted single throughput enough that 40k single also trims now).
+- 50k both modes: `verdict.pass=false` is expected — the pipeline genuinely tops out around 30k loss-free on this host. 50k records where the ceiling lives.
 
 To recalibrate on a different host:
 
