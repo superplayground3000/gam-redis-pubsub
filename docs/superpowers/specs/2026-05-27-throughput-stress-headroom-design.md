@@ -165,13 +165,13 @@ Implementation:
 
 - `scripts/lib/tier-defs.sh` `TIER_P99_MS[50000]` stays empty (skip the p99 gate at the ceiling tier — gating it would just confuse the signal).
 - 50k tier `verdict.pass=false` with `missing_ok=false` is the expected output for both modes. The lab's `bash scripts/stress-run.sh` summary will show two FAIL rows at the bottom; that is the research finding, not a regression.
-- 40k batch is a secondary documented signal: the regional `region-events` stream (`MAXLEN=2M`) trims at this tier because the sink now delivers enough messages to overrun the bound. Treat 40k batch as showing the next-pipeline-stage cap (regional-cache stream bound), not as a sink failure.
+- 40k **both modes** are a secondary documented signal: the regional `region-events` stream (`MAXLEN=2M`) trims at this tier because the bumped sink now delivers enough messages to overrun the bound. The first amendment scoped this to 40k batch only; the final matrix showed 40k single also trims (1.29M trimmed at 40k single vs 1.28M at 40k batch) — the sink-throughput lift generalized the regional-cap finding to single mode too. Treat both 40k rows as showing the next-pipeline-stage cap (regional-cache stream bound), not as a sink failure.
 
 Tiers ≤30k all pass missing gates. Two p99 ceilings drift upward under the new sink config and are recalibrated (10k batch and 30k batch).
 
 ### Why not push further
 
-The user explicitly chose to stop after data showed each successive knob set delivered diminishing returns. Reaching 50k loss-free would likely need: a second sink replica (or shared durable consumer), a higher `STREAM_MAXLEN` to absorb the 40k batch overflow, and possibly JetStream memory storage. Those are real options for a different lab focused on horizontal sink scaling — but they would dilute this lab's identity, which is "single sink replica, how far can it go." The current state preserves that question's answer.
+The user explicitly chose to stop after data showed each successive knob set delivered diminishing returns. Reaching 50k loss-free would likely need: a second sink replica (or shared durable consumer), a higher `STREAM_MAXLEN` to absorb the 40k batch overflow, and possibly JetStream memory storage. Those are real options for a different lab focused on horizontal sink scaling — but they would dilute this lab's identity, which is "single sink replica, how far can it go." The current state preserves that question's answer. The loss-free ceiling on this 32-core / 122 GiB host is **30k both modes** (was provisionally "40k single / 30k batch" in the first 2026-05-28 amendment draft, corrected after the final matrix showed 40k single also trims regional).
 
 ### Final knob inventory
 
@@ -185,6 +185,8 @@ The complete set of changes from the original lab baseline:
 | `connect/reverse.yaml` outputs | `max_in_flight: 256` → `1024` (both fan-out) | Queue depth needed to absorb 50k × 1.7 KB |
 | `scripts/lib/tier-defs.sh` | `DRAIN_S` default `10` → `30` | Sink needs ~25 s post-sustain to clear 50k backlog |
 | `scripts/lib/tier-defs.sh` | `TIER_P99_MS[10000]=100` → `800`, `[30000]=300` → `600` | Inflated p99 under new sink config |
-| `scripts/lib/tier-defs.sh` | `TIER_P99_MS[50000]=""` (unchanged, kept null) | Ceiling tier; gating noise |
+| `scripts/lib/tier-defs.sh` | `TIER_P99_MS[20000]=200` → `""` | 20k batch p99 swings 14-876ms across matrices — unstable, skip gate |
+| `scripts/lib/tier-defs.sh` | `TIER_P99_MS[40000]=8000` → `""` | Regional MAXLEN trim is the real gate at 40k both modes; p99 is noise |
+| `scripts/lib/tier-defs.sh` | `TIER_P99_MS[50000]=""` (unchanged, kept null) | Ceiling tier; missing is the real gate |
 
 The 5 GB cap, sink CPU, threads, max_in_flight, and DRAIN_S changes are the load-bearing pipeline improvements. The tier-defs ceiling adjustments are calibration to the new behavior.
