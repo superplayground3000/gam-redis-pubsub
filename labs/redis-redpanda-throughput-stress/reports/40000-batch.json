@@ -1,46 +1,46 @@
 {
   "tier": 40000,
   "mode": "batch",
-  "started_at": "2026-05-26T09:11:06.704861184Z",
+  "started_at": "2026-05-28T02:36:57.143601125Z",
   "duration_s": 30,
   "rate_target": 40000,
-  "rate_achieved": 39999.74148704905,
-  "rate_achieved_min": 39973.42518725441,
-  "sent": 1308511,
+  "rate_achieved": 39999.56655574545,
+  "rate_achieved_min": 39958.47227859807,
+  "sent": 1308010,
   "errors": 0,
-  "received": 1270459,
+  "received": 1276239,
   "received_by_pattern": {
-    "employee": 419325,
-    "org": 431371,
-    "role": 419763
+    "employee": 421620,
+    "org": 433644,
+    "role": 420975
   },
-  "missing": 38052,
-  "missing_pct": 2.908038220542281,
-  "trimmed": 1270459,
-  "received_errors": 10,
+  "missing": 31771,
+  "missing_pct": 2.4289569651608165,
+  "trimmed": 1276239,
+  "received_errors": 23,
   "latency_parse_errors": 0,
   "negative_latency_deltas": 0,
   "sync_latency_ms": {
-    "p50": 1568,
-    "p95": 5767,
-    "p99": 5875,
-    "p999": 5919,
-    "max": 5927,
-    "count": 1270459
+    "p50": 106,
+    "p95": 2295,
+    "p99": 2769,
+    "p999": 2847,
+    "max": 2861,
+    "count": 1276239
   },
   "redis": {
-    "central_xlen_max": 1308511,
+    "central_xlen_max": 1308010,
     "region_xlen_final": 0
   },
   "nats": {
-    "pending_max": 6707,
-    "bytes": 1837786135
+    "pending_max": 1818,
+    "bytes": 1835902692
   },
   "connect": {
-    "source_in": 5646495,
-    "source_out": 5646495,
-    "sink_in": 5608854,
-    "sink_out": 11217181
+    "source_in": 5501442,
+    "source_out": 5501442,
+    "sink_in": 5471514,
+    "sink_out": 10940958
   },
   "slo": {
     "rate_min_pct": 0.9,

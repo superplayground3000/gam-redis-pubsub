@@ -1,18 +1,18 @@
 {
   "tier": 5000,
   "mode": "batch",
-  "started_at": "2026-05-26T09:04:05.861486978Z",
+  "started_at": "2026-05-28T02:27:16.507038221Z",
   "duration_s": 30,
   "rate_target": 5000,
-  "rate_achieved": 4448.214771496805,
-  "rate_achieved_min": 3502.025350835326,
-  "sent": 145750,
+  "rate_achieved": 4534.453212478935,
+  "rate_achieved_min": 3500.4104686327832,
+  "sent": 150750,
   "errors": 0,
-  "received": 145750,
+  "received": 150750,
   "received_by_pattern": {
-    "employee": 47921,
-    "org": 49710,
-    "role": 48119
+    "employee": 49513,
+    "org": 51583,
+    "role": 49654
   },
   "missing": 0,
   "missing_pct": 0,
@@ -21,37 +21,37 @@
   "latency_parse_errors": 0,
   "negative_latency_deltas": 0,
   "sync_latency_ms": {
-    "p50": 8,
-    "p95": 14,
-    "p99": 401,
-    "p999": 876,
-    "max": 879,
-    "count": 145750
+    "p50": 7,
+    "p95": 13,
+    "p99": 487,
+    "p999": 1064,
+    "max": 1065,
+    "count": 150750
   },
   "redis": {
-    "central_xlen_max": 145750,
-    "region_xlen_final": 145750
+    "central_xlen_max": 150750,
+    "region_xlen_final": 150750
   },
   "nats": {
     "pending_max": 0,
-    "bytes": 210935844
+    "bytes": 218181513
   },
   "connect": {
-    "source_in": 297750,
-    "source_out": 297750,
-    "sink_in": 297750,
-    "sink_out": 595500
+    "source_in": 150750,
+    "source_out": 150750,
+    "sink_in": 150750,
+    "sink_out": 301500
   },
   "slo": {
     "rate_min_pct": 0.85,
-    "latency_p99_ms_max": null
+    "latency_p99_ms_max": 600
   },
   "verdict": {
     "pass": true,
     "detail": {
       "rate_floor_ok": true,
       "missing_ok": true,
-      "p99_latency_ok": null
+      "p99_latency_ok": true
     }
   },
   "quiescence_timeout": false

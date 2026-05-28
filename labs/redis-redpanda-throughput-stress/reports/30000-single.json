@@ -1,57 +1,57 @@
 {
   "tier": 30000,
   "mode": "single",
-  "started_at": "2026-05-26T09:10:09.017162802Z",
+  "started_at": "2026-05-28T02:35:39.000782281Z",
   "duration_s": 30,
   "rate_target": 30000,
-  "rate_achieved": 30019.500647333443,
-  "rate_achieved_min": 29985.284675555773,
-  "sent": 968559,
+  "rate_achieved": 30015.998116778712,
+  "rate_achieved_min": 29981.183072225598,
+  "sent": 969007,
   "errors": 0,
-  "received": 968559,
+  "received": 969007,
   "received_by_pattern": {
-    "employee": 319712,
-    "org": 329164,
-    "role": 319683
+    "employee": 319879,
+    "org": 329348,
+    "role": 319780
   },
   "missing": 0,
   "missing_pct": 0,
   "trimmed": 0,
   "received_errors": 0,
   "latency_parse_errors": 0,
-  "negative_latency_deltas": 212052,
+  "negative_latency_deltas": 256524,
   "sync_latency_ms": {
     "p50": 1,
-    "p95": 67,
-    "p99": 203,
-    "p999": 255,
-    "max": 269,
-    "count": 968559
+    "p95": 2,
+    "p99": 33,
+    "p999": 173,
+    "max": 221,
+    "count": 969007
   },
   "redis": {
-    "central_xlen_max": 968559,
-    "region_xlen_final": 968559
+    "central_xlen_max": 969007,
+    "region_xlen_final": 969007
   },
   "nats": {
-    "pending_max": 533,
-    "bytes": 1401891759
+    "pending_max": 0,
+    "bytes": 1402538954
   },
   "connect": {
-    "source_in": 4337984,
-    "source_out": 4337984,
-    "sink_in": 4337984,
-    "sink_out": 8675968
+    "source_in": 4193432,
+    "source_out": 4193432,
+    "sink_in": 4193432,
+    "sink_out": 8386864
   },
   "slo": {
     "rate_min_pct": 0.9,
-    "latency_p99_ms_max": null
+    "latency_p99_ms_max": 600
   },
   "verdict": {
     "pass": true,
     "detail": {
       "rate_floor_ok": true,
       "missing_ok": true,
-      "p99_latency_ok": null
+      "p99_latency_ok": true
     }
   },
   "quiescence_timeout": false
