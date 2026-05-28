@@ -76,7 +76,14 @@ Per-container caps total ~29 CPU and ~9.25 GiB. On a 32-core / 122 GiB host that
 
 ## Calibration mode (default)
 
-Out of the box `scripts/lib/tier-defs.sh` ships with `TIER_P99_MS` calibrated from a full-matrix run on a 32-core / 122 GiB host. All six tiers gate rate floor, `missing==0`, and a p99 sync-latency ceiling. The 50k tier passes loss-free under the default `NATS_MAX_BYTES=5GB`; on smaller hosts you may need to lower the matrix's top tier or raise `NATS_MAX_BYTES` further.
+`scripts/lib/tier-defs.sh` ships with `TIER_P99_MS` calibrated from a full-matrix run on a 32-core / 122 GiB host. All six tiers gate rate floor and `missing==0`; the p99 gate is enforced on tiers where the matrix produced a stable ceiling (5k, 10k, 20k, 30k, 40k) and skipped at 50k (ceiling tier — see below).
+
+**Expected outcomes on the calibrated host:**
+
+- Tiers 5k–30k: all `verdict.pass=true`.
+- 40k single: PASS.
+- 40k batch: `verdict.pass=false` is expected — the regional `region-events` stream (`MAXLEN=2M`) trims at this tier because the sink delivers more than the regional bound can hold. Documented research signal, not a regression.
+- 50k both modes: `verdict.pass=false` is expected — the pipeline genuinely tops out around 40k single / 30k batch loss-free on this host. 50k records where the ceiling lives.
 
 To recalibrate on a different host:
 
@@ -85,7 +92,7 @@ To recalibrate on a different host:
 3. Pick ceilings (suggested: `round_up_to_100ms(max(p99_batch, p99_single) * 1.25)`).
 4. Edit `TIER_P99_MS` in `scripts/lib/tier-defs.sh`.
 
-After calibration, the harness gates all three: rate, missing, p99.
+After calibration, the harness gates all three: rate, missing, p99 (on tiers where p99 is gated).
 
 ## Live `/rate` endpoint
 
