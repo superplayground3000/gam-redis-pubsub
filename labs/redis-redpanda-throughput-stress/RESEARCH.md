@@ -71,6 +71,14 @@ The actual fix at 50k required four additional knobs:
 
 The 5GB cap is still load-bearing — it stops eviction-driven loss — but the sink-side knobs are what turn 50k into a loss-free tier on this host. Per-container CPU caps total 34 after the bump on a 32-core host — a modest CFS overcommit, not "under budget"; this is fine in practice because not all containers peg their cap simultaneously, but worth recording.
 
+### And then: 50k declared as host ceiling
+
+The four-knob fix (sink CPU 6→12, pipeline.threads 2→4, max_in_flight 256→1024, DRAIN_S 10→30) delivered meaningful improvements at 50k — batch went from 754k missing to 457k (-39%), single from 679k to 568k (-16%), and p99 at 50k batch dropped from 12.2 s to 6.6 s — but did NOT reach loss-free.
+
+Rather than pursue an indefinite chase (next steps would be a second sink replica, higher `STREAM_MAXLEN`, or JetStream memory storage — none of which fit this single-sink lab's identity), the 50k tier is declared the host ceiling: `verdict.pass=false` at 50k for both modes is the expected research signal showing where this configuration tops out. 40k batch is a related signal — the regional `region-events` stream (`MAXLEN=2M`) trims at 40k batch because more messages now survive the sink, exposing the next-stage cap.
+
+Loss-free ceiling on this 32-core / 122 GiB host with the bumped config: 40k single / 30k batch.
+
 ## Why calibration-mode verdict
 
 There's no reference number for what p99 sync-latency *should* be at, say, 30k batch mode on a given host. Hard-coding a guess turns the verdict into noise. Ship with `TIER_P99_MS=""` for every tier; collector's `--slo-p99-ms <= 0` flag skips the p99 gate; run the full matrix once on real hardware; pick ceilings; commit them. Future runs gate on real numbers.
