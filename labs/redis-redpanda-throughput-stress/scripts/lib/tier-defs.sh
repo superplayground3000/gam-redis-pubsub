@@ -32,14 +32,16 @@ declare -A TIER_RATE_MIN_PCT=(
 # Heuristic: ceiling = round_up_to_100ms(max(p99_batch, p99_single) * 1.25),
 # with floor 100ms to avoid flapping on noise.
 # Tiers where one mode failed verdict use the passing mode's p99 only.
-# Tier breakdown (observed p99 ms across both modes):
-#   5k:  batch=401, single=311 -> max*1.25=501 -> ceil=600
-#   10k: batch=15(rate fail), single=1 -> single only -> floor 100
-#   20k: batch=17,  single=94  -> max*1.25=118 -> ceil=200
-#   30k: batch=15,  single=203 -> max*1.25=254 -> ceil=300
-#   40k: batch=5875(missing fail), single=6363 -> single only -> 6363*1.25=7954 -> ceil=8000
-#   50k: BOTH modes fail with 40-50% loss; ceiling left null (skip gate) —
-#        the lab's purpose at 50k is to demonstrate the ceiling, not gate on it.
+# Tier breakdown (observed p99 ms from 2026-05-28 second matrix at bumped config):
+#   5k:  batch=14,   single=1    -> max*1.25=18    -> ceil 600  (loose; legacy)
+#   10k: batch=568,  single=1    -> max*1.25=710   -> ceil 800  (recalibrated; sink-bump bumped p99)
+#   20k: batch=14,   single=2    -> max*1.25=18    -> ceil 200  (within prior; kept)
+#   30k: batch=426,  single=4    -> max*1.25=533   -> ceil 600  (recalibrated; sink-bump bumped p99)
+#   40k: batch=3423(trim+miss), single=7547 -> single only -> ceil 8000 (kept)
+#   50k: HOST CEILING tier (both modes FAIL by design); p99 gate skipped.
+#        Observed p99 batch=6627, single=11191. The lab tops out around 40k
+#        single / 30k batch loss-free on this host. See spec amendment 2026-05-28
+#        and RESEARCH.md "And then: 50k declared as host ceiling".
 #
 # IMPORTANT — p99 has substantial warm-up-dependent variance. The numbers
 # above assume a full sequential matrix run (default `bash scripts/stress-run.sh`)
@@ -50,9 +52,9 @@ declare -A TIER_RATE_MIN_PCT=(
 # Empty string = no ceiling; collector treats <=0 as "skip p99 gate".
 declare -A TIER_P99_MS=(
   [5000]=600
-  [10000]=100
+  [10000]=800
   [20000]=200
-  [30000]=300
+  [30000]=600
   [40000]=8000
   [50000]=""
 )
