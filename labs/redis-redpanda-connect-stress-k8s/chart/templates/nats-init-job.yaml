@@ -1,0 +1,53 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: nats-init
+  labels: { app: nats-init }
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: nats-init }
+    spec:
+      restartPolicy: OnFailure
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      initContainers:
+        - name: wait-nats
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nats --server nats://nats:{{ .Values.nats.clientPort }} rtt >/dev/null 2>&1; do
+                echo "waiting for nats..."; sleep 1;
+              done
+      containers:
+        - name: create-stream
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              SERVER="nats://nats:{{ .Values.nats.clientPort }}"
+              if nats --server "$SERVER" stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; then
+                echo "{{ .Values.nats.stream.name }} already exists"
+              else
+                nats --server "$SERVER" stream add {{ .Values.nats.stream.name }} \
+                  --subjects '{{ .Values.nats.stream.subjects }}' \
+                  --storage file \
+                  --replicas 1 \
+                  --retention limits \
+                  --discard old \
+                  --max-age {{ .Values.nats.stream.maxAge }} \
+                  --max-bytes {{ .Values.nats.stream.maxBytes }} \
+                  --max-msgs=-1 \
+                  --max-msg-size={{ .Values.nats.stream.maxMsgSize }} \
+                  --dupe-window {{ .Values.nats.stream.dupeWindow }} \
+                  --defaults
+              fi
+              nats --server "$SERVER" stream info {{ .Values.nats.stream.name }}
+          resources:
+            {{- toYaml .Values.resources.collector | nindent 12 }}

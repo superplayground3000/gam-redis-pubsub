@@ -1,0 +1,73 @@
+{{- if eq .Values.nats.persistence.mode "pvc" }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nats-data
+  labels: { app: nats }
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.nats.persistence.size }}
+  {{- if .Values.nats.persistence.storageClassName }}
+  storageClassName: {{ .Values.nats.persistence.storageClassName }}
+  {{- end }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nats
+  labels: { app: nats }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: nats }
+  template:
+    metadata:
+      labels: { app: nats }
+    spec:
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      containers:
+        - name: nats
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.nats.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["-js", "-sd", "/data", "-m", "{{ .Values.nats.monitorPort }}"]
+          ports:
+            - { name: client, containerPort: {{ .Values.nats.clientPort }} }
+            - { name: monitor, containerPort: {{ .Values.nats.monitorPort }} }
+          readinessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.nats.monitorPort }} }
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 15
+          livenessProbe:
+            httpGet: { path: /healthz, port: {{ .Values.nats.monitorPort }} }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            {{- toYaml .Values.resources.nats | nindent 12 }}
+      volumes:
+        - name: data
+        {{- if eq .Values.nats.persistence.mode "pvc" }}
+          persistentVolumeClaim:
+            claimName: nats-data
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nats
+  labels: { app: nats }
+spec:
+  selector: { app: nats }
+  ports:
+    - { name: client, port: {{ .Values.nats.clientPort }}, targetPort: {{ .Values.nats.clientPort }} }
+    - { name: monitor, port: {{ .Values.nats.monitorPort }}, targetPort: {{ .Values.nats.monitorPort }} }
