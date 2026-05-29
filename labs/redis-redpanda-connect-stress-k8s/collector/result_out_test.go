@@ -30,12 +30,11 @@ func TestWriteReportStdoutEmitsSingleSentinelLine(t *testing.T) {
 	if len(lines) != 1 {
 		t.Fatalf("want exactly 1 line, got %d: %q", len(lines), out)
 	}
-	const prefix = "RESULT_JSON:"
-	if !strings.HasPrefix(lines[0], prefix) {
-		t.Fatalf("line must start with %q, got %q", prefix, lines[0])
+	if !strings.HasPrefix(lines[0], resultSentinel) {
+		t.Fatalf("line must start with %q, got %q", resultSentinel, lines[0])
 	}
 	var r Report
-	if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[0], prefix)), &r); err != nil {
+	if err := json.Unmarshal([]byte(strings.TrimPrefix(lines[0], resultSentinel)), &r); err != nil {
 		t.Fatalf("payload after sentinel must be valid JSON: %v", err)
 	}
 	if r.Verdict.Pass != false || r.Tier != 10 {
@@ -67,5 +66,20 @@ func TestWriteReportFileModeKeepsExitOnFail(t *testing.T) {
 	}
 	if !bytes.Contains(b, []byte("\n")) {
 		t.Fatalf("file mode should still write indented (multi-line) JSON")
+	}
+}
+
+func TestWriteReportFileModePassExitsZero(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "run.json")
+	exitFail, err := writeReport(path, &bytes.Buffer{}, mkReport(true))
+	if err != nil {
+		t.Fatalf("file write failed: %v", err)
+	}
+	if exitFail {
+		t.Fatalf("file mode must report exitFail=false on a passing verdict")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("report file not written: %v", err)
 	}
 }
