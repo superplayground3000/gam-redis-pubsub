@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: connect-sink
+  labels: { app: connect-sink }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: connect-sink }
+  template:
+    metadata:
+      labels: { app: connect-sink }
+    spec:
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      initContainers:
+        - name: wait-redis-region
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.redis.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - until redis-cli -h redis-region ping | grep -q PONG; do echo waiting redis-region; sleep 1; done
+        - name: wait-stream
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - until nats --server nats://nats:{{ .Values.nats.clientPort }} stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done
+      containers:
+        - name: connect
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.connect.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["run", "/connect.yaml"]
+          ports:
+            - containerPort: 4195
+          readinessProbe:
+            httpGet: { path: /ready, port: 4195 }
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /ping, port: 4195 }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /connect.yaml
+              subPath: connect.yaml
+          resources:
+            {{- toYaml .Values.resources.connect | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: connect-sink-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: connect-sink
+  labels: { app: connect-sink }
+spec:
+  selector: { app: connect-sink }
+  ports:
+    - name: http
+      port: 4195
+      targetPort: 4195
