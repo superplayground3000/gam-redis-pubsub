@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -91,11 +92,12 @@ func main() {
 		log.Fatalf("run failed: %v", err)
 	}
 
-	if err := writeJSON(*out, r); err != nil {
-		log.Fatalf("write %s: %v", *out, err)
+	exitFail, err := writeReport(*out, os.Stdout, r)
+	if err != nil {
+		log.Fatalf("emit report (%s): %v", *out, err)
 	}
-	log.Printf("report written to %s; verdict.pass=%v", *out, r.Verdict.Pass)
-	if !r.Verdict.Pass {
+	log.Printf("report emitted (out=%s); verdict.pass=%v", *out, r.Verdict.Pass)
+	if exitFail {
 		os.Exit(1)
 	}
 }
@@ -123,6 +125,31 @@ func writeJSON(path string, v any) error {
 		return err
 	}
 	return os.Rename(tmpName, path)
+}
+
+const resultSentinel = "RESULT_JSON:"
+
+// writeReport emits the report. When path == "-" it prints exactly one compact
+// "RESULT_JSON:{...}" line to stdout and returns exitFail=false unconditionally:
+// in stdout mode the verdict travels in the JSON, never the process exit code
+// (so a legitimately-failing verdict does not trip a K8s Job into failure/retry).
+// For a real path it writes indented JSON atomically (legacy) and returns
+// exitFail = !r.Verdict.Pass so the caller exits 1 on a failing verdict.
+func writeReport(path string, stdout io.Writer, r Report) (exitFail bool, err error) {
+	if path == "-" {
+		b, err := json.Marshal(r)
+		if err != nil {
+			return false, err
+		}
+		if _, err := fmt.Fprintf(stdout, "%s%s\n", resultSentinel, b); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if err := writeJSON(path, r); err != nil {
+		return false, err
+	}
+	return !r.Verdict.Pass, nil
 }
 
 func Run(ctx context.Context, cfg RunConfig) (Report, error) {
