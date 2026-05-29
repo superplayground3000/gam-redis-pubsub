@@ -30,7 +30,7 @@ spec:
         - name: connect
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.connect.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["run", "/connect.yaml"]
+          args: ["run", "/connect.yaml"]
           ports:
             - containerPort: 4195
           readinessProbe:
