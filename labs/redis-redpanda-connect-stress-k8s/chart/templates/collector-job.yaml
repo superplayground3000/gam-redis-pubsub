@@ -1,0 +1,38 @@
+{{- if .Values.collector.run }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Values.collector.jobName | default (printf "collector-%v-%s-%s" .Values.collector.tier .Values.collector.mode .Values.profile) }}
+  labels: { app: collector }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: collector }
+    spec:
+      restartPolicy: Never
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      containers:
+        - name: collector
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.collector.image) }}
+          imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.collector.pullPolicy) }}
+          args:
+            - --tier={{ .Values.collector.tier }}
+            - --mode={{ .Values.collector.mode }}
+            - --profile={{ .Values.profile }}
+            - --duration={{ .Values.collector.durationS }}s
+            - --warmup={{ .Values.collector.warmupS }}s
+            - --drain={{ .Values.collector.drainS }}s
+            - --out=-
+            - --slo-rate-pct={{ .Values.collector.sloRatePct }}
+            - --slo-p99-ms={{ .Values.collector.sloP99Ms }}
+            - --slo-allow-missing={{ .Values.collector.sloAllowMissing }}
+            {{- if eq .Values.collector.mode "chaos" }}
+            - --chaos-at-s={{ .Values.collector.chaosAtS }}
+            - --chaos-duration={{ .Values.collector.chaosDurationS }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources.collector | nindent 12 }}
+{{- end }}
