@@ -85,6 +85,12 @@ fi
 
 mkdir -p reports
 
+# Resolve the nats-box image (with images.registry prefix) ONCE, by rendering the
+# nats-init Job template with the same values. Captured as a string so it survives
+# the nats-init Job being TTL-garbage-collected partway through a long matrix run.
+PURGE_IMG="$(helm template "${RELEASE}" ./chart -n "${NS}" -f "${VALUES_FILE}" \
+  --set "profile=${PROFILE}" -s templates/nats-init-job.yaml | awk '/image:/{print $2; exit}')"
+
 jetstream_bytes() {
   curl -fs "http://127.0.0.1:18222/jsz?streams=true&consumers=true&accounts=true" \
     | python3 -c 'import json,sys
@@ -172,12 +178,11 @@ run_one() {
     (( rc != 0 )) && echo "[chaos] WARN: scaler exited ${rc}" >&2
   fi
 
-  # Purge JetStream so the next run starts hermetic. Read the fully-resolved
-  # image (with images.registry prefix) from the deployed nats-init Job.
-  local purge_img
-  purge_img="$(kubectl -n "${NS}" get job nats-init -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
+  # Purge JetStream so the next run starts hermetic, using the pre-resolved
+  # nats-box image (PURGE_IMG, captured before the loop so TTL-GC of the
+  # nats-init Job can't leave us with an empty image ref mid-matrix).
   kubectl -n "${NS}" run "nats-purge-$(date +%s)" --rm -i --restart=Never \
-    --image="${purge_img}" -- \
+    --image="${PURGE_IMG}" -- \
     nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
     || echo "[purge] WARN: stream purge failed (continuing)" >&2
 }

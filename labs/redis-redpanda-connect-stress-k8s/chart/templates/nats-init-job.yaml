@@ -1,7 +1,9 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: nats-init
+  # Hash-suffixed so a changed stream config or image yields a NEW Job name
+  # rather than failing `helm upgrade` on the immutable completed Job (spec §5.2).
+  name: nats-init-{{ printf "%s|%s" (toYaml .Values.nats.stream) (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) | sha256sum | trunc 8 }}
   labels: { app: nats-init }
 spec:
   backoffLimit: 6
