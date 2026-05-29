@@ -15,6 +15,7 @@ NS="${RRCS_NS:-rrcs-k8s}"
 RELEASE="${RRCS_RELEASE:-rrcs}"
 PROFILE="${PROFILE_QOS:-alo}"
 VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
+RESULT_SENTINEL="RESULT_JSON:"
 TIERS=("${DEFAULT_TIERS[@]}")
 MODES=("${DEFAULT_MODES[@]}")
 
@@ -50,17 +51,18 @@ for m in "${MODES[@]}"; do
 done
 
 NO_ARGS_RUN=$(( $# == 0 ? 1 : 0 ))
-PIDS=()
+CHAOS_PID=""
 PF_PID=""
 cleanup() {
-  for pid in "${PIDS[@]}"; do kill "${pid}" >/dev/null 2>&1 || true; done
+  if [[ -n "${CHAOS_PID}" ]]; then kill "${CHAOS_PID}" >/dev/null 2>&1 || true; fi
   if [[ -n "${PF_PID}" ]]; then kill "${PF_PID}" >/dev/null 2>&1 || true; fi
   if (( NO_ARGS_RUN )); then
     echo "[teardown] helm uninstall ${RELEASE} -n ${NS}"
     helm uninstall "${RELEASE}" -n "${NS}" >/dev/null 2>&1 || true
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 # Boot the chart (idempotent). nats-init is a plain Job, so --wait does not deadlock.
 echo "[boot] helm upgrade --install ${RELEASE} (profile=${PROFILE})"
@@ -73,7 +75,12 @@ for m in "${MODES[@]}"; do [[ "$m" == "chaos" ]] && needs_pf=1; done
 if (( needs_pf )); then
   kubectl -n "${NS}" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
   PF_PID=$!
-  sleep 2
+  pf_ok=0
+  for _ in $(seq 1 15); do
+    if curl -fs "http://127.0.0.1:18222/jsz" >/dev/null 2>&1; then pf_ok=1; break; fi
+    sleep 1
+  done
+  (( pf_ok )) || { echo "[error] NATS port-forward not ready on :18222" >&2; exit 1; }
 fi
 
 mkdir -p reports
@@ -88,11 +95,26 @@ for a in d.get("account_details",[]):
 print(b)'
 }
 
+# Returns 0 = Complete, 1 = Failed, 2 = timed out.
+wait_job_terminal() {
+  local job="$1" timeout_s="$2" deadline
+  deadline=$(( $(date +%s) + timeout_s ))
+  while (( $(date +%s) < deadline )); do
+    local complete failed
+    complete=$(kubectl -n "${NS}" get "job/${job}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+    failed=$(kubectl -n "${NS}" get "job/${job}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+    [[ "${complete}" == "True" ]] && return 0
+    [[ "${failed}" == "True" ]] && return 1
+    sleep 2
+  done
+  return 2
+}
+
 run_one() {
   local tier="$1" mode="$2"
   local p99_ms="${TIER_P99_MS[$tier]}"
   local rate_min_pct="${TIER_RATE_MIN_PCT[$tier]}"
-  local allow_missing chaos_pid="" chaos_sets=()
+  local allow_missing chaos_sets=()
   allow_missing="$(allow_missing_for_profile "${PROFILE}")"
 
   if [[ "${mode}" == "chaos" ]]; then
@@ -103,8 +125,7 @@ run_one() {
     fi
     chaos_sets=(--set "collector.chaosAtS=$(chaos_at_s)" --set "collector.chaosDurationS=${CHAOS_DOWN_S}")
     ( sleep "${WARMUP_S}"; sleep "$(chaos_at_s)"; bash "${SCRIPT_DIR}/chaos/scale-connect-sink.sh" "${CHAOS_DOWN_S}" ) &
-    chaos_pid=$!
-    PIDS+=("${chaos_pid}")
+    CHAOS_PID=$!
   fi
 
   local job
@@ -130,31 +151,33 @@ run_one() {
   # Wait for terminal state: complete OR failed (a failing verdict is NOT a Job
   # failure - the collector exits 0 on report; only a genuine error fails it).
   local timeout_s=$(( DURATION_S + WARMUP_S + DRAIN_S + 120 ))
-  if kubectl -n "${NS}" wait --for=condition=complete --timeout="${timeout_s}s" "job/${job}" 2>/dev/null; then
-    if kubectl -n "${NS}" logs "job/${job}" | sed -n 's/^RESULT_JSON://p' | tail -n 1 > "reports/${tier}-${mode}-${PROFILE}.json" \
-       && [[ -s "reports/${tier}-${mode}-${PROFILE}.json" ]]; then
-      echo "[ok] report saved"
-    else
-      echo "[ERROR] no RESULT_JSON in collector logs for ${job}" >&2
-      kubectl -n "${NS}" logs "job/${job}" | tail -20 >&2
-      rm -f "reports/${tier}-${mode}-${PROFILE}.json"
-    fi
+  local term_rc=0
+  wait_job_terminal "${job}" "${timeout_s}" || term_rc=$?
+  if (( term_rc == 0 )) \
+     && kubectl -n "${NS}" logs "job/${job}" | sed -n "s/^${RESULT_SENTINEL}//p" | tail -n 1 > "reports/${tier}-${mode}-${PROFILE}.json" \
+     && [[ -s "reports/${tier}-${mode}-${PROFILE}.json" ]]; then
+    echo "[ok] report saved"
   else
-    echo "[ERROR] collector job ${job} did not complete (genuine failure)" >&2
+    echo "[ERROR] collector ${job} did not produce a verdict (term_rc=${term_rc})" >&2
     kubectl -n "${NS}" logs "job/${job}" --tail=20 >&2 || true
     rm -f "reports/${tier}-${mode}-${PROFILE}.json"
   fi
 
   kubectl -n "${NS}" delete "job/${job}" --wait=true >/dev/null 2>&1 || true
 
-  if [[ -n "${chaos_pid}" ]]; then
-    set +e; wait "${chaos_pid}"; local rc=$?; set -e
+  if [[ -n "${CHAOS_PID}" ]]; then
+    local rc
+    set +e; wait "${CHAOS_PID}"; rc=$?; set -e
+    CHAOS_PID=""
     (( rc != 0 )) && echo "[chaos] WARN: scaler exited ${rc}" >&2
   fi
 
-  # Purge JetStream so the next run starts hermetic (full --server URL, fix #4).
+  # Purge JetStream so the next run starts hermetic. Read the fully-resolved
+  # image (with images.registry prefix) from the deployed nats-init Job.
+  local purge_img
+  purge_img="$(kubectl -n "${NS}" get job nats-init -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null || true)"
   kubectl -n "${NS}" run "nats-purge-$(date +%s)" --rm -i --restart=Never \
-    --image="$(helm show values ./chart | awk '/^natsBox:/{f=1} f&&/image:/{print $2; exit}')" -- \
+    --image="${purge_img}" -- \
     nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
     || echo "[purge] WARN: stream purge failed (continuing)" >&2
 }
