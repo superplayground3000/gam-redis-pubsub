@@ -1,0 +1,85 @@
+# Active QoS profile: alo | amo | eoe. Selects which connect config pair is mounted.
+profile: alo
+
+# The chart does NOT template a Namespace (design fix #3). Install with:
+#   helm install rrcs ./chart -n rrcs-k8s --create-namespace
+
+images:
+  registry: ""              # prepended to every image ref. "" => use ref as-is.
+  pullPolicy: IfNotPresent  # global default; public images need this on kind.
+  pullSecrets: []           # list of { name: <secret-name> }
+
+redis:
+  image: redis:7.4-alpine
+
+nats:
+  image: nats:2.10-alpine
+  clientPort: 4222
+  monitorPort: 8222
+  stream:
+    name: APP_EVENTS
+    subjects: "app.events.>"
+    maxAge: "1h"
+    maxBytes: "256MB"
+    maxMsgSize: "1MB"
+    dupeWindow: "5m"
+  persistence:
+    mode: emptyDir          # emptyDir | pvc
+    size: 4Gi               # used only when mode=pvc
+    storageClassName: ""    # used only when mode=pvc; "" => omit (cluster default)
+
+natsBox:
+  image: natsio/nats-box:0.14.5
+
+connect:
+  image: hpdevelop/connect:4.92.0-claudefix
+
+writer:
+  image: redis-rrcs/writer:dev
+  pullPolicy: ""            # "" => inherit images.pullPolicy
+  env:
+    STREAM_MAXLEN: "100000"
+    WORKERS: "8"
+    PIPELINE_DEPTH: "50"
+    KEY_SPACE_SIZE: "100000"
+    PAYLOAD_BYTES: "200"
+    MAX_RATE: "20000"
+
+collector:
+  image: redis-rrcs/collector:dev
+  pullPolicy: ""            # "" => inherit images.pullPolicy
+  # The harness sets the fields below per-run via `helm template -s ... --set`.
+  run: false               # gate: only the harness renders the collector Job
+  jobName: ""              # unique per-run name; defaults to a derived name if empty
+  tier: 0
+  mode: throughput
+  durationS: 30
+  warmupS: 5
+  drainS: 10
+  sloRatePct: "0.95"
+  sloP99Ms: "1000"
+  sloAllowMissing: false
+  chaosAtS: 0
+  chaosDurationS: 8
+
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+resources:
+  redis:
+    requests: { cpu: 250m, memory: 128Mi }
+    limits:   { cpu: "2",  memory: 512Mi }
+  nats:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  connect:
+    requests: { cpu: 500m, memory: 256Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  writer:
+    requests: { cpu: 250m, memory: 64Mi }
+    limits:   { cpu: "2",  memory: 256Mi }
+  collector:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 128Mi }
