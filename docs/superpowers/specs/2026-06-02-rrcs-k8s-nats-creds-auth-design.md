@@ -2,7 +2,7 @@
 
 **Lab:** `labs/redis-redpanda-connect-stress-k8s/`
 **Date:** 2026-06-02
-**Status:** design
+**Status:** design — plus stop-time review fix §13 (collector + writer wiring for configurable NATS stream name and external Redis URLs; external Redis password auth scoped out of v1)
 
 ---
 
@@ -21,6 +21,7 @@ After this change:
 - nats-account-server / full JWT resolver (the lab has one static account, so the in-process `MEMORY` resolver with a preloaded account JWT is the right call).
 - Auth toggle. Auth is always-on in this lab. The no-auth original lives at `labs/redis-redpanda-connect-stress/` for anyone who needs it.
 - Configurable Redis stream keys (`app.events`, `region-events`). The chart's writer owns those — the user said "topics of NATS"; Redis stream naming stays chart-internal. If a real conflict arises, fold in later.
+- **External Redis password / ACL auth.** The `redis.{central,region}.external.authSecret` field exists in the values surface (§4) as a reserved-but-not-wired knob for a future follow-up. For v1, **external Redis must be unauthenticated** (reachable open from the cluster — same as bundled). Adding auth requires Go changes in both the writer and the collector (they currently take bare `host:port`, not credentialed URLs), which is a discrete piece of work better scoped on its own. NATS credential auth (the main goal) is fully in scope.
 
 ## 2. Two modes, per backend, independently togglable
 
@@ -75,6 +76,10 @@ nats:
   external:
     enabled: false                # bundled (default) → chart deploys NATS + mints creds
     url: ""                       # required when enabled, e.g. "nats://nats.prod.example.com:4222"
+    monitorUrl: ""                # required when enabled IF you want collector/harness JetStream
+                                  # metrics (HTTP /jsz). e.g. "http://nats-monitor.prod:8222".
+                                  # When "", collector skips /jsz queries and the harness skips
+                                  # chaos pre-flight (both with warnings).
     auth:
       publisherSecret: ""         # pre-created Secret name, key: user.creds
       subscriberSecret: ""
@@ -112,13 +117,13 @@ redis:
   central:
     external:
       enabled: false
-      url: ""                      # e.g. "redis://redis.prod:6379" or "rediss://..." for TLS
-      authSecret: ""               # optional; pre-created Secret with keys `password` (and optional `username`)
+      url: ""                      # required when enabled, e.g. "redis://redis.prod:6379"
+      authSecret: ""               # RESERVED for a follow-up; v1 does NOT consume it (see §2 non-goals)
   region:
     external:
       enabled: false
       url: ""
-      authSecret: ""
+      authSecret: ""               # RESERVED for a follow-up; v1 does NOT consume it
 ```
 
 `values-dev.yaml` is unchanged in spirit (writer/collector `pullPolicy: Never`, NATS emptyDir). A new `values-external.yaml.example` is committed showing the external-mode shape.
@@ -339,4 +344,99 @@ This is an enhancement to an existing lab, not a new lab — so the `/research-l
 
 - Whether `kubectl run --overrides` or a tiny in-cluster `Job` template is the cleaner harness purge mechanism in external mode (both work; let the plan pick).
 - Whether to grant publisher additionally a `pub _R_.>` permission for request/reply patterns (not used by current connect YAMLs; lean: don't add — YAGNI).
-- Whether Redis auth env vars on the writer use `REDIS_USERNAME`/`REDIS_PASSWORD` env split or a single `REDIS_URL` form. Writer code change either way; minor.
+- Whether Redis auth env vars on the writer use `REDIS_USERNAME`/`REDIS_PASSWORD` env split or a single `REDIS_URL` form. Deferred until the follow-up that wires external Redis auth.
+
+## 13. Stop-time review fix: collector + writer wiring for configurable stream name and external Redis/NATS URLs
+
+Codex stop-time review caught a real gap: §§3–6 made `nats.stream.name` and external NATS/Redis URLs configurable for the chart templates and connect YAMLs, but did NOT thread them through the collector and writer. The collector defaults to in-cluster Service names (`http://nats:8222`, `redis-central:6379`, `redis-region:6379`) and `--nats-stream=APP_EVENTS`; the writer's `REDIS_ADDR` is hardcoded to `redis-central:6379`. Any deployment using a non-default stream name OR external mode would break in two ways: the collector queries the wrong JetStream (wrong/missing pending metrics → unsound quiescence wait), and in external Redis mode the collector + writer can't reach Redis at all.
+
+### 13.1 New `_helpers.tpl` templates
+
+```
+{{/* NATS monitoring URL (HTTP /jsz). Bundled defaults to in-cluster Service.
+     External mode: returns the user-supplied URL, or "" if unset (callers gate). */}}
+{{- define "rrcs.nats.monitorUrl" -}}
+{{- if .Values.nats.external.enabled -}}
+{{- .Values.nats.external.monitorUrl -}}
+{{- else -}}
+http://nats:{{ .Values.nats.monitorPort }}
+{{- end -}}
+{{- end -}}
+
+{{/* Strip the URL scheme so the writer/collector get host:port (their flags
+     and env vars do not accept URLs in v1; see §2 non-goals). */}}
+{{- define "rrcs.redis.central.hostPort" -}}
+{{- $u := include "rrcs.redis.central.url" . -}}
+{{- regexReplaceAll "^rediss?://" $u "" -}}
+{{- end -}}
+{{- define "rrcs.redis.region.hostPort" -}}
+{{- $u := include "rrcs.redis.region.url" . -}}
+{{- regexReplaceAll "^rediss?://" $u "" -}}
+{{- end -}}
+```
+
+### 13.2 Collector Job template (`chart/templates/collector-job.yaml`) — add three flags
+
+Append to the existing `args:` list:
+```yaml
+            - --nats-stream={{ .Values.nats.stream.name }}
+            - --nats={{ include "rrcs.nats.monitorUrl" . | quote }}
+            - --redis-central={{ include "rrcs.redis.central.hostPort" . | quote }}
+            - --redis-region={{ include "rrcs.redis.region.hostPort" . | quote }}
+```
+These override the collector's defaults so a renamed stream and external Redis/NATS endpoints land correctly. `--writer`, `--connect-src`, `--connect-sink` stay at their chart-internal Service defaults (those Services exist in both modes; the collector pod runs in-cluster regardless).
+
+When `nats.external.monitorUrl` is `""` in external mode, `include "rrcs.nats.monitorUrl"` returns `""`. The collector treats an empty `--nats` as "skip JetStream HTTP queries" — a small, defensive change to `collector/sampler.go` / `collector/quiescence.go`: when `cfg.NATSURL == ""`, those samplers return zero values and the quiescence wait falls back to a pure Redis-XLEN check (already implemented as the fallback path for transient NATS unavailability — same code path).
+
+### 13.3 Writer template (`chart/templates/writer.yaml`) — template REDIS_ADDR
+
+The existing literal:
+```yaml
+- { name: REDIS_ADDR, value: "redis-central:6379" }
+```
+becomes:
+```yaml
+- { name: REDIS_ADDR, value: {{ include "rrcs.redis.central.hostPort" . | quote }} }
+```
+No writer code change (`REDIS_ADDR` already accepts `host:port`). The `wait-redis-central` initContainer's `redis-cli -h redis-central ping` becomes `redis-cli -h {{ include "rrcs.redis.central.hostPort" . }} ping` (split host from `host:port` via `cut -d: -f1` in the inline command, or just pass the full hostPort to `-u redis://<host:port>` — let the plan pick the cleaner form).
+
+### 13.4 Harness (`scripts/stress-run.sh`) — gate chaos pre-flight
+
+The existing chaos pre-flight `kubectl port-forward svc/nats 18222:8222` assumes the bundled `nats` Service exists. In external NATS mode it doesn't. Replace with:
+```bash
+NATS_MONITOR_URL="$(helm get values rrcs -n "$NS" -o json | jq -r '.nats.external.monitorUrl // empty')"
+NATS_EXTERNAL="$(helm get values rrcs -n "$NS" -o json | jq -r '.nats.external.enabled // false')"
+if [[ "$NATS_EXTERNAL" == "true" ]]; then
+  if [[ -z "$NATS_MONITOR_URL" ]]; then
+    echo "[chaos-preflight] WARN: nats.external.monitorUrl is unset; skipping JetStream bytes pre-flight" >&2
+    chaos_preflight_skipped=1
+  else
+    # use NATS_MONITOR_URL directly (no port-forward needed if reachable from host)
+    JSZ_URL="${NATS_MONITOR_URL%/}/jsz"
+  fi
+else
+  kubectl -n "$NS" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
+  PF_PID=$!
+  # ... existing readiness poll ...
+  JSZ_URL="http://127.0.0.1:18222/jsz"
+fi
+```
+The `jetstream_bytes()` function uses `JSZ_URL` instead of the hardcoded port-forward URL. When pre-flight is skipped, chaos cells still run — they just don't get the >200MB safety abort. The user accepts that limitation in external mode (documented in `values-external.yaml.example`).
+
+### 13.5 Reaffirmation: what stays as-is
+
+- Redis stream keys `app.events` / `region-events` (writer's `STREAM_KEY`, collector's `Trim(ctx, "app.events")` / `XLen(ctx, "region-events")`) — chart-internal, unchanged (§2 non-goal).
+- Connect-source/sink Service addresses inside the cluster — unchanged.
+- The narrow `$JS.API.STREAM.INFO.<stream-name>` perm in publisher/subscriber JWTs — already produced by `gen-nats-auth.sh` reading `chart/values.yaml`'s `nats.stream.name` (§3, §8). Stream rename → re-run gen script → re-commit.
+
+### 13.6 Files added/changed by §13 (delta on top of §§3–6)
+
+| File | Change |
+|---|---|
+| `chart/templates/_helpers.tpl` | Add `rrcs.nats.monitorUrl`, `rrcs.redis.central.hostPort`, `rrcs.redis.region.hostPort` |
+| `chart/templates/collector-job.yaml` | Append 4 args (`--nats-stream`, `--nats`, `--redis-central`, `--redis-region`) |
+| `chart/templates/writer.yaml` | Template `REDIS_ADDR` env + `wait-redis-central` initContainer host |
+| `chart/values.yaml` | Add `nats.external.monitorUrl` field |
+| `collector/sampler.go` + `collector/quiescence.go` | Treat empty `--nats` as "skip JetStream HTTP queries"; fall through to Redis-XLEN-only quiescence (uses the existing fallback path) |
+| `scripts/stress-run.sh` | Gate chaos pre-flight on `nats.external.enabled` + `monitorUrl`; skip with warning when unset |
+| `values-external.yaml.example` | Document `nats.external.monitorUrl` + the external-mode chaos-pre-flight limitation |
