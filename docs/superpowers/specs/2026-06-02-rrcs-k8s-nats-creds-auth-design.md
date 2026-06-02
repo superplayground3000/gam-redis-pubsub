@@ -2,7 +2,7 @@
 
 **Lab:** `labs/redis-redpanda-connect-stress-k8s/`
 **Date:** 2026-06-02
-**Status:** design — plus stop-time review fix §13 (collector + writer wiring for configurable NATS stream name and external Redis URLs; external Redis password auth scoped out of v1)
+**Status:** design — stop-time review fix §13 (collector + writer wiring; external Redis password auth scoped out of v1), plus Codex early-review fixes §14 (narrow subscriber's CONSUMER perms; use `nsc generate config --mem-resolver` for the resolver snippet)
 
 ---
 
@@ -56,14 +56,23 @@ In external NATS mode the chart **never** runs `nats-init` against the external 
 | User (`.creds` file) | Used by | Publish allow | Subscribe allow |
 |---|---|---|---|
 | `publisher.creds` | connect-source | `app.events.>`, `$JS.API.STREAM.INFO.APP_EVENTS` | `_INBOX.>` |
-| `subscriber.creds` | connect-sink | `$JS.ACK.APP_EVENTS.>`, `$JS.API.STREAM.INFO.APP_EVENTS`, `$JS.API.CONSUMER.>` (for the durable's own ops) | `_INBOX.>` plus the consumer's deliver subject |
+| `subscriber.creds` | connect-sink | `$JS.ACK.APP_EVENTS.region-writer.>`, `$JS.API.STREAM.INFO.APP_EVENTS`, **plus the four narrow consumer subjects below** | `_INBOX.>` (covers the auto-generated push deliver subject; explicit only if a custom `deliver_subject` outside `_INBOX` is ever set) |
 | `admin.creds` | `nats-init` Job + harness purge | `$JS.API.>` (full JetStream admin) | `_INBOX.>` |
+
+**Subscriber's four narrow consumer subjects** (named in `<stream>.<durable>` form using values `nats.stream.name` and `nats.stream.consumer.durable`):
+
+- `$JS.API.CONSUMER.DURABLE.CREATE.<stream>.<durable>` — older-form durable create (NATS server ≤ 2.9).
+- `$JS.API.CONSUMER.CREATE.<stream>.<durable>` — newer-form create (NATS 2.10+).
+- `$JS.API.CONSUMER.CREATE.<stream>.<durable>.>` — newer-form with single-filter-subject suffix (NATS 2.10+).
+- `$JS.API.CONSUMER.INFO.<stream>.<durable>` — separate subject; **not** covered by `CREATE`, must be listed explicitly.
+
+Granting all four makes the lab robust across NATS server versions while staying narrower than the original `$JS.API.CONSUMER.>`. (The pull-mode `MSG.NEXT.<stream>.<durable>` subject is not granted — the lab uses push delivery; add it later if anyone switches to a pull consumer.)
 
 **Notes on the permission shape:**
 - Publisher cannot subscribe to the stream or create/drain it; a buggy/compromised source can't re-inject downstream messages.
-- Subscriber cannot publish into `app.events.>`; a buggy/compromised sink can't taint the source side.
+- Subscriber cannot publish into `app.events.>`; a buggy/compromised sink can't taint the source side. The narrow CONSUMER subjects also scope it to *its* durable — a compromised sink can't create or inspect arbitrary consumers on the stream.
 - The narrow `$JS.API.STREAM.INFO.<stream-name>` pub allow on publisher AND subscriber lets each one's initContainer verify stream readiness with its OWN creds — admin creds never bleed into data-plane pods.
-- Stream name in the permission is parameterized: `gen-nats-auth.sh` reads `chart/values.yaml`'s `nats.stream.name` and bakes that exact name into the perm. Change the stream name → re-run the gen script → re-commit.
+- Stream name AND durable name in the permissions are parameterized: `gen-nats-auth.sh` reads `chart/values.yaml`'s `nats.stream.name` and `nats.stream.consumer.durable` and bakes both into the relevant perms. Change either → re-run the gen script → re-commit.
 
 In **external mode** the chart is agnostic to your hierarchy. You sign users in your own operator/account, give publisher/subscriber the equivalent narrow `$JS.API.STREAM.INFO.<your-stream>` permission, and reference the Secrets by name in `values-external.yaml`.
 
@@ -310,10 +319,10 @@ A new committed script. Requires `nsc` installed locally (https://github.com/nat
 2. Creates an isolated nsc store under `chart/files/nats-auth/.nsc-store/` (does not pollute the user's global nsc store).
 3. Operator: `RRCS-OP` (idempotent; reuses an existing store on rerun unless `--force`).
 4. Account: `APP` with JetStream enabled, no explicit limits.
-5. Three users, with permissions exactly as Section 3 describes (publisher / subscriber / admin), with `$JS.API.STREAM.INFO.<resolved-stream-name>` baked into publisher and subscriber.
+5. Three users, with permissions exactly as Section 3 describes (publisher / subscriber / admin), with `$JS.API.STREAM.INFO.<resolved-stream-name>` baked into publisher and subscriber, and the four narrow consumer subjects (DURABLE.CREATE, CREATE, CREATE.…>, INFO) baked into subscriber with the resolved durable name. Permissions are passed as repeated `--allow-pub '<subject>'` and `--allow-sub '<subject>'` flags on `nsc add user`; the `$` in JetStream subjects is shell-quoted to prevent expansion.
 6. Exports artifacts into `chart/files/nats-auth/`:
    - `operator.jwt`, `APP.jwt` (public-key JWTs, safe).
-   - `nats-server.conf` (the `operator + resolver MEMORY + resolver_preload` snippet, ready for the ConfigMap to splice in).
+   - `nats-server.conf` — produced by `nsc generate config --mem-resolver --config-file chart/files/nats-auth/nats-server.conf` (built-in `nsc` command that emits a fully-formed `operator: … ; resolver: MEMORY ; resolver_preload { … }` snippet directly; no hand-assembly from `nsc describe` outputs needed).
    - `publisher.creds`, `subscriber.creds`, `admin.creds`.
 7. Refuses to overwrite an existing populated `chart/files/nats-auth/`; `--force` regenerates.
 8. A `chart/files/nats-auth/README.md` (also produced by the script) documents: "these are lab fixture identities with no real privilege; do NOT reuse for any other deployment. In production, signing keys live in a secret manager (Vault / External Secrets Operator) and user creds are provisioned into K8s Secrets out-of-band — that's exactly what external mode in this chart consumes."
@@ -440,3 +449,16 @@ The `jetstream_bytes()` function uses `JSZ_URL` instead of the hardcoded port-fo
 | `collector/sampler.go` + `collector/quiescence.go` | Treat empty `--nats` as "skip JetStream HTTP queries"; fall through to Redis-XLEN-only quiescence (uses the existing fallback path) |
 | `scripts/stress-run.sh` | Gate chaos pre-flight on `nats.external.enabled` + `monitorUrl`; skip with warning when unset |
 | `values-external.yaml.example` | Document `nats.external.monitorUrl` + the external-mode chaos-pre-flight limitation |
+
+## 14. Codex early-review fixes
+
+After an early cross-model review of the spec, two improvements were folded in (both improvements rather than correctness blockers — the spec was functionally correct as written; these are tighter least-privilege scoping and a simpler implementation path):
+
+**§3 — narrow the subscriber's CONSUMER permissions.** The original `pub $JS.API.CONSUMER.>` worked but was broader than necessary. Replaced with four narrow subjects scoped to the lab's specific stream+durable (`DURABLE.CREATE`, `CREATE`, `CREATE.…>`, `INFO`), parameterized by `nats.stream.name` and `nats.stream.consumer.durable`. The four-subject set is robust across NATS server versions (old single-flag durable create vs. NATS 2.10's filter-suffix form) while preventing a compromised sink from inspecting or creating arbitrary consumers on the stream. Push-mode delivery still relies on `sub _INBOX.>` (the auto-generated deliver subject lives in that namespace); no change there.
+
+**§8 — use the built-in `nsc generate config --mem-resolver`.** The original described assembling `nats-server.conf` from `nsc describe operator/account` outputs. `nsc generate config --mem-resolver --config-file <out>` is a single built-in that emits the complete `operator: … ; resolver: MEMORY ; resolver_preload { … }` snippet directly. Simpler, fewer moving parts, more correct (no risk of malformed assembly).
+
+**Verified to still hold (no change needed):**
+- `nsc add user --allow-pub '$JS.API.STREAM.INFO.<stream>'` syntax is valid; the script shell-quotes `$` to prevent expansion.
+- Push deliver subject auto-assigned to `_INBOX.*` is covered by the existing `sub _INBOX.>` allow.
+- None of the six `chart/files/connect/{alo,amo,eoe}-{forward,reverse}.yaml` files contain literal `{{` or `}}` — Bloblang uses `${! ... }` and env-var interpolation uses `${VAR:default}`, so §5.4's `tpl`-rendering switch is collision-free.
