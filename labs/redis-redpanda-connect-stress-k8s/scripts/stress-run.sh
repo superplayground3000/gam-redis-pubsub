@@ -69,18 +69,42 @@ echo "[boot] helm upgrade --install ${RELEASE} (profile=${PROFILE})"
 helm upgrade --install "${RELEASE}" ./chart -n "${NS}" --create-namespace \
   --set "profile=${PROFILE}" -f "${VALUES_FILE}" --wait --timeout 5m
 
+# Resolve runtime config from the installed release (external-mode-aware).
+HELM_VALUES_JSON="$(helm get values "${RELEASE}" -n "${NS}" -o json)"
+STREAM_NAME="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.stream.name // "APP_EVENTS"')"
+NATS_EXTERNAL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.enabled // false')"
+NATS_MONITOR_URL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.monitorUrl // empty')"
+NATS_URL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.url // empty')"
+[[ -z "$NATS_URL" ]] && NATS_URL="nats://nats:4222"
+if [[ "$NATS_EXTERNAL" == "true" ]]; then
+  ADMIN_SECRET="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.auth.adminSecret // empty')"
+else
+  ADMIN_SECRET="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.auth.secrets.admin // "admin-creds"')"
+fi
+echo "[config] stream=${STREAM_NAME} ext=${NATS_EXTERNAL} url=${NATS_URL} mon=${NATS_MONITOR_URL:-<unset>} admin=${ADMIN_SECRET:-<unset>}"
+
 # One port-forward for the chaos pre-flight (NATS monitoring), opened lazily.
 needs_pf=0
 for m in "${MODES[@]}"; do [[ "$m" == "chaos" ]] && needs_pf=1; done
 if (( needs_pf )); then
-  kubectl -n "${NS}" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
-  PF_PID=$!
-  pf_ok=0
-  for _ in $(seq 1 15); do
-    if curl -fs "http://127.0.0.1:18222/jsz" >/dev/null 2>&1; then pf_ok=1; break; fi
-    sleep 1
-  done
-  (( pf_ok )) || { echo "[error] NATS port-forward not ready on :18222" >&2; exit 1; }
+  if [[ "$NATS_EXTERNAL" == "true" ]]; then
+    if [[ -z "$NATS_MONITOR_URL" ]]; then
+      echo "[chaos-preflight] WARN: nats.external.monitorUrl unset; skipping JetStream bytes pre-flight" >&2
+      JSZ_URL=""
+    else
+      JSZ_URL="${NATS_MONITOR_URL%/}/jsz"
+    fi
+  else
+    kubectl -n "${NS}" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
+    PF_PID=$!
+    pf_ok=0
+    for _ in $(seq 1 15); do
+      if curl -fs "http://127.0.0.1:18222/jsz" >/dev/null 2>&1; then pf_ok=1; break; fi
+      sleep 1
+    done
+    (( pf_ok )) || { echo "[error] NATS port-forward not ready on :18222" >&2; exit 1; }
+    JSZ_URL="http://127.0.0.1:18222/jsz"
+  fi
 fi
 
 mkdir -p reports
@@ -92,12 +116,14 @@ PURGE_IMG="$(helm template "${RELEASE}" ./chart -n "${NS}" -f "${VALUES_FILE}" \
   --set "profile=${PROFILE}" -s templates/nats-init-job.yaml | awk '/image:/{print $2; exit}')"
 
 jetstream_bytes() {
-  curl -fs "http://127.0.0.1:18222/jsz?streams=true&consumers=true&accounts=true" \
-    | python3 -c 'import json,sys
+  [[ -z "${JSZ_URL:-}" ]] && { echo 0; return; }
+  curl -fs "${JSZ_URL}?streams=true&consumers=true&accounts=true" \
+    | STREAM_NAME="${STREAM_NAME}" python3 -c 'import json,os,sys
+target=os.environ["STREAM_NAME"]
 d=json.load(sys.stdin); b=0
 for a in d.get("account_details",[]):
  for s in a.get("stream_detail",[]):
-  if s.get("name")=="APP_EVENTS": b=s.get("state",{}).get("bytes",0)
+  if s.get("name")==target: b=s.get("state",{}).get("bytes",0)
 print(b)'
 }
 
@@ -178,12 +204,27 @@ run_one() {
     (( rc != 0 )) && echo "[chaos] WARN: scaler exited ${rc}" >&2
   fi
 
-  # Purge JetStream so the next run starts hermetic, using the pre-resolved
-  # nats-box image (PURGE_IMG, captured before the loop so TTL-GC of the
-  # nats-init Job can't leave us with an empty image ref mid-matrix).
-  kubectl -n "${NS}" run "nats-purge-$(date +%s)" --rm -i --restart=Never \
-    --image="${PURGE_IMG}" -- \
-    nats --server nats://nats:4222 stream purge APP_EVENTS -f >/dev/null 2>&1 \
+  # Purge JetStream so the next run starts hermetic. Mount admin creds (chart-
+  # rendered in bundled mode, user-supplied Secret name in external mode); skip
+  # with warning if admin Secret is not configured.
+  if [[ -z "${ADMIN_SECRET}" ]]; then
+    echo "[purge] WARN: admin creds not configured (skipping purge — runs are not hermetic)" >&2
+    return 0
+  fi
+  local purge_name
+  purge_name="nats-purge-$(date +%s)"
+  kubectl -n "${NS}" run "${purge_name}" --rm -i --restart=Never --image="${PURGE_IMG}" \
+    --overrides='{
+      "spec": {
+        "volumes": [{"name": "creds", "secret": {"secretName": "'"${ADMIN_SECRET}"'", "defaultMode": 256}}],
+        "containers": [{
+          "name": "'"${purge_name}"'",
+          "image": "'"${PURGE_IMG}"'",
+          "volumeMounts": [{"name": "creds", "mountPath": "/tmp/creds", "readOnly": true}],
+          "command": ["nats", "--server", "'"${NATS_URL}"'", "--creds", "/tmp/creds/user.creds", "stream", "purge", "'"${STREAM_NAME}"'", "-f"]
+        }]
+      }
+    }' >/dev/null 2>&1 \
     || echo "[purge] WARN: stream purge failed (continuing)" >&2
 }
 
