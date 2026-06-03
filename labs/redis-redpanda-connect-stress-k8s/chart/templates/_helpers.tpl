@@ -92,16 +92,25 @@ redis://redis-region:6379
 {{/*
 rrcs.redis.{central,region}.hostPort — host:port form (URL scheme stripped),
 for the writer's REDIS_ADDR env, the collector's --redis-* flags, and the
-init-container redis-cli ping.
+init-container redis-cli ping. These consumers DO NOT speak TLS in v1, so a
+rediss:// URL would silently downgrade to plain TCP everywhere outside the
+connect configs. Fail-closed: external Redis TLS belongs in the same
+follow-up that wires writer/collector auth (spec §2 non-goal).
 */}}
 {{- define "rrcs.redis.central.hostPort" -}}
 {{- $u := include "rrcs.redis.central.url" . -}}
-{{- regexReplaceAll "^rediss?://" $u "" -}}
+{{- if hasPrefix "rediss://" $u -}}
+{{- fail (printf "redis.central.external: TLS (rediss://) is not supported in v1 — writer/collector/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; TLS is deferred to the same follow-up as external Redis auth (spec §2)." $u) -}}
+{{- end -}}
+{{- regexReplaceAll "^redis://" $u "" -}}
 {{- end -}}
 
 {{- define "rrcs.redis.region.hostPort" -}}
 {{- $u := include "rrcs.redis.region.url" . -}}
-{{- regexReplaceAll "^rediss?://" $u "" -}}
+{{- if hasPrefix "rediss://" $u -}}
+{{- fail (printf "redis.region.external: TLS (rediss://) is not supported in v1 — writer/collector/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; TLS is deferred to the same follow-up as external Redis auth (spec §2)." $u) -}}
+{{- end -}}
+{{- regexReplaceAll "^redis://" $u "" -}}
 {{- end -}}
 
 {{/*

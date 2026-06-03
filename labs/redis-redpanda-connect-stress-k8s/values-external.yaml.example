@@ -29,6 +29,12 @@ nats:
       adminSecret: prod-admin-creds                          # optional; "" skips harness purge
 
 redis:
+  # NOTE: external Redis TLS (rediss://) is NOT supported in v1. Connect can
+  # speak TLS, but the writer + collector + init-container redis clients
+  # consume host:port only and would silently downgrade to plain TCP. Use
+  # redis:// for v1 (the chart will fail-render with a clear error if you set
+  # rediss://). External Redis password/ACL auth is also deferred (spec §2
+  # non-goal); both will be wired together in a follow-up.
   central:
     external:
       enabled: true
