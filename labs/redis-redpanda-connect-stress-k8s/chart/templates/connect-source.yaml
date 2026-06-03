@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: connect-source
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
   labels: { app: connect-source }
 spec:
   replicas: 1
@@ -59,7 +59,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: connect-source-config
+            name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source-config") }}
         - name: nats-creds
           secret:
             secretName: {{ include "rrcs.nats.credsSecret.publisher" . }}
@@ -68,7 +68,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: connect-source
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
   labels: { app: connect-source }
 spec:
   selector: { app: connect-source }
