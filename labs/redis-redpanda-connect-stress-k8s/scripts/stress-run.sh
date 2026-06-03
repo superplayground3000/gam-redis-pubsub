@@ -135,7 +135,7 @@ print(b)'
 
 # Returns 0 = Complete, 1 = Failed, 2 = timed out.
 wait_job_terminal() {
-  local job="$1" timeout_s="$2" deadline
+  local job_full="$1" timeout_s="$2" deadline
   deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
     local complete failed
@@ -191,7 +191,7 @@ run_one() {
   # failure - the collector exits 0 on report; only a genuine error fails it).
   local timeout_s=$(( DURATION_S + WARMUP_S + DRAIN_S + 120 ))
   local term_rc=0
-  wait_job_terminal "${job}" "${timeout_s}" || term_rc=$?
+  wait_job_terminal "${job_full}" "${timeout_s}" || term_rc=$?
   if (( term_rc == 0 )) \
      && kubectl -n "${NS}" logs "job/${job_full}" | sed -n "s/^${RESULT_SENTINEL}//p" | tail -n 1 > "reports/${tier}-${mode}-${PROFILE}.json" \
      && [[ -s "reports/${tier}-${mode}-${PROFILE}.json" ]]; then
