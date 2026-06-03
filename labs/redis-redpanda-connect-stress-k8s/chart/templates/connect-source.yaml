@@ -19,7 +19,7 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
-            - until redis-cli -h redis-central ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
+            - HP="{{ include "rrcs.redis.central.hostPort" . }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
         - name: wait-stream
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
