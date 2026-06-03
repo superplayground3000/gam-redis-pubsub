@@ -12,9 +12,11 @@ http:
 input:
   label: jetstream_source
   nats_jetstream:
-    urls: [nats://nats:4222]
-    subject: app.events.>
-    durable: region-writer
+    urls: ["{{ include "rrcs.nats.url" . }}"]
+    auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
+    subject: {{ .Values.nats.stream.subjects | quote }}
+    stream: {{ .Values.nats.stream.name | quote }}
+    durable: {{ .Values.nats.stream.consumer.durable | quote }}
     deliver: all
     ack_wait: 30s
 
@@ -52,7 +54,7 @@ output:
           key: ${! meta("key") }
           max_in_flight: 64
       - redis_streams:
-          url: redis://redis-region:6379
+          url: {{ include "rrcs.redis.region.url" . }}
           stream: region-events
           body_key: value
           max_length: 100000
@@ -63,11 +65,11 @@ output:
 cache_resources:
   - label: region_kv
     redis:
-      url: redis://redis-region:6379
+      url: {{ include "rrcs.redis.region.url" . }}
       kind: simple
   - label: dedup_cache
     redis:
-      url: redis://redis-region:6379
+      url: {{ include "rrcs.redis.region.url" . }}
       kind: simple
 
 logger:

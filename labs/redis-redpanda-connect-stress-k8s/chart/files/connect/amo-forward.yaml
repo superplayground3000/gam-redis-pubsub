@@ -13,7 +13,7 @@ http:
 input:
   label: redis_source
   redis_streams:
-    url: redis://redis-central:6379
+    url: {{ include "rrcs.redis.central.url" . }}
     kind: simple
     streams: [app.events]
     consumer_group: propagator
@@ -44,8 +44,9 @@ pipeline:
 output:
   label: jetstream_sink
   nats_jetstream:
-    urls: [nats://nats:4222]
-    subject: app.events.${! meta("pattern") }
+    urls: ["{{ include "rrcs.nats.url" . }}"]
+    auth: { user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }} }
+    subject: {{ .Values.nats.stream.publishSubject | quote }}
     # Deliberately NO Nats-Msg-Id header in AMO so dedup never absorbs anything.
     headers:
       Content-Type: application/json
