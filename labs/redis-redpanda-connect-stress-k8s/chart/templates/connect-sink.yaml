@@ -25,7 +25,11 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
-            - until nats --server nats://nats:{{ .Values.nats.clientPort }} stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done
+            - until nats --server {{ include "rrcs.nats.url" . | quote }} --creds /etc/nats-creds/subscriber/user.creds stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done
+          volumeMounts:
+            - name: nats-creds
+              mountPath: /etc/nats-creds/subscriber
+              readOnly: true
       containers:
         - name: connect
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.connect.image) }}
@@ -47,12 +51,19 @@ spec:
             - name: config
               mountPath: /connect.yaml
               subPath: connect.yaml
+            - name: nats-creds
+              mountPath: /etc/nats-creds/subscriber
+              readOnly: true
           resources:
             {{- toYaml .Values.resources.connect | nindent 12 }}
       volumes:
         - name: config
           configMap:
             name: connect-sink-config
+        - name: nats-creds
+          secret:
+            secretName: {{ include "rrcs.nats.credsSecret.subscriber" . }}
+            defaultMode: 0400
 ---
 apiVersion: v1
 kind: Service
