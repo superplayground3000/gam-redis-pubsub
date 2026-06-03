@@ -10,23 +10,54 @@ images:
   pullSecrets: []           # list of { name: <secret-name> }
 
 redis:
-  image: redis:7.4-alpine
+  image: redis:7.4-alpine          # used only in bundled mode
+  central:
+    external:
+      enabled: false
+      url: ""                      # required when enabled, e.g. "redis://redis.prod:6379"
+      authSecret: ""               # RESERVED — v1 does NOT consume it (see spec §2 non-goals)
+  region:
+    external:
+      enabled: false
+      url: ""
+      authSecret: ""               # RESERVED — v1 does NOT consume it
 
 nats:
+  external:
+    enabled: false                # bundled (default) → chart deploys NATS + mints creds
+    url: ""                       # required when enabled, e.g. "nats://nats.prod.example.com:4222"
+    monitorUrl: ""                # optional; "" → collector skips /jsz queries, harness skips chaos pre-flight
+    auth:
+      publisherSecret: ""         # pre-created Secret name, key: user.creds
+      subscriberSecret: ""
+      adminSecret: ""             # optional; "" → harness purge is skipped with warning
+  # ── bundled-mode config below; ignored when external.enabled=true ──
   image: nats:2.10-alpine
   clientPort: 4222
   monitorPort: 8222
   stream:
     name: APP_EVENTS
-    subjects: "app.events.>"
+    subjects: "app.events.>"   # subjects the stream binds to
+    publishSubject: "app.events.${! meta(\"pattern\") }"   # what connect-source publishes to
+    consumer:
+      durable: "region-writer"
     maxAge: "1h"
     maxBytes: "256MB"
     maxMsgSize: "1MB"
     dupeWindow: "5m"
   persistence:
-    mode: emptyDir          # emptyDir | pvc
-    size: 4Gi               # used only when mode=pvc
-    storageClassName: ""    # used only when mode=pvc; "" => omit (cluster default)
+    mode: emptyDir
+    size: 4Gi
+    storageClassName: ""
+  auth:                            # bundled-mode rendered creds Secrets + in-pod mount paths
+    secrets:
+      publisher: publisher-creds
+      subscriber: subscriber-creds
+      admin: admin-creds
+    creds:
+      publisher: /etc/nats-creds/publisher/user.creds
+      subscriber: /etc/nats-creds/subscriber/user.creds
+      admin: /etc/nats-creds/admin/user.creds
 
 natsBox:
   image: natsio/nats-box:0.14.5
