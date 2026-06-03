@@ -1,3 +1,4 @@
+{{- if not .Values.nats.external.enabled }}
 {{- if eq .Values.nats.persistence.mode "pvc" }}
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -33,7 +34,7 @@ spec:
         - name: nats
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.nats.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          args: ["-js", "-sd", "/data", "-m", "{{ .Values.nats.monitorPort }}"]
+          args: ["-c", "/etc/nats/nats-server.conf"]
           ports:
             - { name: client, containerPort: {{ .Values.nats.clientPort }} }
             - { name: monitor, containerPort: {{ .Values.nats.monitorPort }} }
@@ -50,6 +51,10 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: config
+              mountPath: /etc/nats/nats-server.conf
+              subPath: nats-server.conf
+              readOnly: true
           resources:
             {{- toYaml .Values.resources.nats | nindent 12 }}
       volumes:
@@ -60,6 +65,9 @@ spec:
         {{- else }}
           emptyDir: {}
         {{- end }}
+        - name: config
+          configMap:
+            name: nats-config
 ---
 apiVersion: v1
 kind: Service
@@ -71,3 +79,4 @@ spec:
   ports:
     - { name: client, port: {{ .Values.nats.clientPort }}, targetPort: {{ .Values.nats.clientPort }} }
     - { name: monitor, port: {{ .Values.nats.monitorPort }}, targetPort: {{ .Values.nats.monitorPort }} }
+{{- end }}
