@@ -25,8 +25,59 @@ done
 
 OUT="chart/files/nats-auth"
 NSC_STORE_DIR="${OUT}/.nsc-store"
-STREAM_NAME="${STREAM_NAME:-APP_EVENTS}"
-DURABLE_NAME="${DURABLE_NAME:-region-writer}"
+# Resolve from chart/values.yaml unless an explicit env var overrides.
+# Fall back to built-in defaults only if values.yaml is missing or unparseable.
+parse_values() {
+  local key="$1" default="$2"
+  if [[ -f chart/values.yaml ]]; then
+    # awk walks the YAML hierarchy under `nats:` to find the requested key.
+    # `key` is one of: nats.stream.name, nats.stream.consumer.durable
+    local val
+    case "$key" in
+      nats.stream.name)
+        # shellcheck disable=SC2016
+        # SC2016: awk program is single-quoted intentionally — $0/etc are awk
+        # field refs, not shell variables.
+        val="$(awk '
+          /^nats:/{in_nats=1; next}
+          /^[a-zA-Z]/{in_nats=0}
+          in_nats && /^  stream:/{in_stream=1; next}
+          in_nats && /^  [a-zA-Z]/{in_stream=0}
+          in_stream && /^    name:/{
+            gsub(/^    name:[[:space:]]*/,"")
+            gsub(/^"|"$/,"")
+            print
+            exit
+          }
+        ' chart/values.yaml)"
+        ;;
+      nats.stream.consumer.durable)
+        # shellcheck disable=SC2016
+        # SC2016: awk program is single-quoted intentionally — $0/etc are awk
+        # field refs, not shell variables.
+        val="$(awk '
+          /^nats:/{in_nats=1; next}
+          /^[a-zA-Z]/{in_nats=0}
+          in_nats && /^  stream:/{in_stream=1; next}
+          in_nats && /^  [a-zA-Z]/{in_stream=0}
+          in_stream && /^    consumer:/{in_consumer=1; next}
+          in_stream && /^    [a-zA-Z]/{in_consumer=0}
+          in_consumer && /^      durable:/{
+            gsub(/^      durable:[[:space:]]*/,"")
+            gsub(/^"|"$/,"")
+            print
+            exit
+          }
+        ' chart/values.yaml)"
+        ;;
+    esac
+    [[ -n "$val" ]] && { echo "$val"; return; }
+  fi
+  echo "$default"
+}
+
+STREAM_NAME="${STREAM_NAME:-$(parse_values nats.stream.name APP_EVENTS)}"
+DURABLE_NAME="${DURABLE_NAME:-$(parse_values nats.stream.consumer.durable region-writer)}"
 OPERATOR_NAME="${OPERATOR_NAME:-RRCS-OP}"
 ACCOUNT_NAME="${ACCOUNT_NAME:-APP}"
 
@@ -43,7 +94,10 @@ export XDG_CONFIG_HOME="${PWD}/${NSC_STORE_DIR}/config"
 mkdir -p "${OUT}" "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}"
 
 if (( FORCE )); then
+  # Wipe both the isolated nsc state AND any previously-emitted artifacts in OUT.
+  # nsc generate config refuses to overwrite, so we must clear it on --force.
   rm -rf "${NSC_STORE_DIR}"
+  rm -f "${OUT}"/*.jwt "${OUT}"/*.creds "${OUT}"/nats-server.conf "${OUT}"/README.md
   mkdir -p "${XDG_DATA_HOME}" "${XDG_CONFIG_HOME}"
 fi
 
