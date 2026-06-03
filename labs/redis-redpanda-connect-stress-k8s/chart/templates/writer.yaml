@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: writer
+  name: {{ include "rrcs.name" (dict "root" $ "base" "writer") }}
   labels: { app: writer }
 spec:
   replicas: 1
@@ -25,7 +25,7 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
-            - until wget -q --spider http://connect-source:4195/ready; do echo waiting connect-source; sleep 1; done
+            - until wget -q --spider http://{{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}:4195/ready; do echo waiting connect-source; sleep 1; done
       containers:
         - name: writer
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.writer.image) }}
@@ -59,7 +59,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: writer
+  name: {{ include "rrcs.name" (dict "root" $ "base" "writer") }}
   labels: { app: writer }
 spec:
   selector: { app: writer }
