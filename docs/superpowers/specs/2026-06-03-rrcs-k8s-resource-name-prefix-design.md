@@ -54,7 +54,7 @@ The binding limit is almost always the 63-char Pod-name budget, because controll
 | Job → Pod (`<job>-<5char>`) | 6 chars | 57 |
 | ConfigMap / Secret / PVC (no Pods) | none — DNS subdomain (253 chars) | 253 |
 
-**Chart shape note.** All workload-owning resources in this chart are `kind: Deployment` — including `nats` (`chart/templates/nats.yaml` line 19). There is no StatefulSet; the optional `nats-data` PVC is rendered as a standalone PVC and bound via `volumes.persistentVolumeClaim.claimName`, not via `volumeClaimTemplates`. The Deployment row above applies to `nats`, `writer`, `connect-source`, `connect-sink`, `redis-central`, `redis-region`.
+**Chart shape note.** The chart renders two kinds of Pod-owning workload: six `Deployment`s (`nats`, `writer`, `connect-source`, `connect-sink`, `redis-central`, `redis-region` — `chart/templates/nats.yaml:19`, etc.) and up to two `Job`s (`nats-init` always when NATS is bundled; the collector Job when `collector.run=true`). **There is no StatefulSet.** The optional `nats-data` PVC (only when `nats.persistence.mode=pvc`) is rendered as a standalone PVC and bound by the nats Deployment via `volumes.persistentVolumeClaim.claimName`, not via `volumeClaimTemplates`. The Deployment row above applies to the six Deployments; the Job rows apply to `nats-init` and the collector.
 
 **Longest base names today, per class:**
 
@@ -62,7 +62,7 @@ The binding limit is almost always the 63-char Pod-name budget, because controll
 |---|---|---|---|---|
 | Deployment | `connect-source` (14) | 18 | ≈ 35 | ✓ (46-char effective budget) |
 | Service | `connect-source` (14) | 18 | 18 (no Pod) | ✓ (63-char effective budget) |
-| ConfigMap | `connect-source-config` (20) | 24 | 24 (no Pod) | ✓ (253-char effective budget) |
+| ConfigMap | `connect-source-config` (21) | 25 | 25 (no Pod) | ✓ (253-char effective budget) |
 | Static Job | `nats-init-<8hex>` (18) | 22 | 28 | ✓ (57-char effective budget) |
 | **Harness collector Job** | **`collector-10000-throughput-alo-1234567890` (41)** | **45** | **≈ 51** | **✓ — but the binding constraint for custom prefixes** |
 
