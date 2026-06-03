@@ -37,7 +37,41 @@ Semantics:
 - `resourcePrefix: ""` → no-op; rendered names match the pre-change behavior exactly. This is the back-compat escape hatch.
 - `resourcePrefix: "tenant-a-"` → `tenant-a-writer`, `tenant-a-nats`, etc.
 
-Length budget: longest base name is `connect-source-config` (20 chars). Plus a `lab-` (4-char) prefix → 24 chars; well under the K8s DNS-1123 limit (63). Prefixes >40 chars combined with the longest base names risk truncation errors at install time — documented in the README knob table, not enforced in templates.
+### 2.1 Length budget (corrected)
+
+Three classes of rendered name have different effective budgets against the K8s DNS-1123 label limit (63 chars):
+
+| Class | Longest base seen today | Pod suffix overhead | Effective budget for `prefix + base` |
+|---|---|---|---|
+| ConfigMap / Secret / Service / Deployment | `connect-source-config` (20) | — | 63 |
+| StatefulSet (`nats` → pod `nats-0`) | `nats` (4) | `-0` (2) | 61 |
+| Static Job (`nats-init-<8hex>`) | `nats-init-<8>` (18) | `-<5>` (6) | 57 |
+| **Harness-generated collector Job** | **`collector-10000-throughput-alo-1234567890` (41)** | `-<5>` (6) | **57** |
+
+The collector Job is the binding constraint, not `connect-source-config`. The harness builds its name as `collector-${tier}-${mode}-${PROFILE}-$(date +%s)` (`scripts/stress-run.sh:167`), so the Job-name base can be 41 chars under current tiers/modes/profiles.
+
+**Default `lab-` (4 chars):** `lab-` + 41 = 45; pod 51 — comfortable headroom.
+
+**Custom prefix headroom for the collector Job:** 57 − 41 = 16 chars. A prefix longer than 16 chars combined with the longest harness-generated Job name will produce a pod name that exceeds the 63-char DNS-1123 limit. The K8s Job controller surfaces this as `Failed create pod: name length must be no more than 63 characters`, which is the right failure to inherit — but the chart should *also* fail-loud at `helm template` time so the operator catches it before applying.
+
+### 2.2 Render-time fail-loud guard
+
+`chart/templates/collector-job.yaml` rejects names that would not leave room for the Pod's 6-char random suffix:
+
+```gotemplate
+{{- $name := include "rrcs.name" (dict "root" $ "base" (default (printf "collector-%v-%s-%s" .Values.collector.tier .Values.collector.mode .Values.profile) .Values.collector.jobName)) -}}
+{{- if gt (len $name) 57 -}}
+{{- fail (printf "collector Job name %q (%d chars) exceeds the 57-char budget (63 DNS-1123 limit minus the 6-char Pod random suffix). Shorten resourcePrefix (currently %q) or collector.jobName." $name (len $name) .Values.resourcePrefix) -}}
+{{- end -}}
+```
+
+Equivalent guards are not needed on the other Job (`nats-init`) — its name is `nats-init-<8hex>` = 18 chars, and `lab-` + 18 = 22 → pod 28, leaving 35 chars of prefix headroom; no realistic prefix exhausts that. Document the budget for `nats-init` in the spec for completeness; do not add a redundant guard.
+
+### 2.3 README budget documentation
+
+The README knob row for `resourcePrefix` states:
+
+> Default `lab-`. Total rendered name + Pod suffix must stay under the K8s DNS-1123 64-char label limit. The collector Job is the binding case: a custom prefix combined with the harness-generated `collector-<tier>-<mode>-<profile>-<unix-ts>` Job base (up to 41 chars today) leaves ~16 chars for the prefix. `helm template` fails loud if you exceed this.
 
 ## 3. The `rrcs.name` helper
 
@@ -174,6 +208,9 @@ Pod labels (`app: writer`, `app: connect-source`, etc.) and the Service `spec.se
 7. Diff `helm template` output (default `lab-`) against pre-change `master`:
    - The only differences are the expected name and reference substitutions.
 
+8. `helm template ... --set resourcePrefix=this-is-a-long-prefix-` (>16 chars) with a representative `collector.jobName=collector-10000-throughput-alo-1234567890`:
+   - Render **must** fail with the §2.2 guard message naming the over-budget Job and the rendered length.
+
 A full kind e2e is **not** part of this change's validation because the chart structure is unchanged — only string substitution. If the renders pass the consistency check, the cluster behavior is unchanged.
 
 ## 10. Files changed
@@ -188,6 +225,7 @@ A full kind e2e is **not** part of this change's validation because the chart st
 
 ## 11. Out of scope (deferred)
 
+- Automatic truncation of over-budget names. The §2.2 render-time guard fails loudly with the rendered length and the offending Job name; the operator picks a shorter prefix. The chart never mutates operator input.
 - A second knob to rename labels — no use case.
 - Per-component prefix overrides (`writer.resourcePrefix: ...`) — YAGNI.
 - A Helm `fullname` helper that combines `.Release.Name + resourcePrefix + base` — the user asked for a literal `lab-` default, not a release-derived name. Adding `.Release.Name` would change the rename semantics and is not what was requested.
