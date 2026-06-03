@@ -33,6 +33,9 @@ type NATSSnap struct {
 }
 
 func ScrapeJSZ(ctx context.Context, baseURL, streamName string) (NATSSnap, error) {
+	if baseURL == "" {
+		return NATSSnap{}, nil
+	}
 	req, _ := http.NewRequestWithContext(ctx, "GET",
 		baseURL+"/jsz?streams=true&consumers=true&accounts=true", nil)
 	resp, err := httpClient.Do(req)
