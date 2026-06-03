@@ -163,3 +163,17 @@ Usage: {{ include "rrcs.nats.stream.publishSubject" . }}
 {{- .Values.nats.auth.secrets.admin -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+rrcs.name — prepend resourcePrefix to a base name. Every chart-rendered
+Kubernetes resource name flows through this helper (after subsequent
+commits wire it in), so the prefix lives in exactly one place. Returns
+the empty string when the base is empty, so optional Secret/URL helpers
+that may yield "" do not collapse to the bare prefix.
+Usage: {{ include "rrcs.name" (dict "root" $ "base" "writer") }}
+*/}}
+{{- define "rrcs.name" -}}
+{{- if ne .base "" -}}
+{{- printf "%s%s" .root.Values.resourcePrefix .base -}}
+{{- end -}}
+{{- end -}}

@@ -1,6 +1,19 @@
 # Active QoS profile: alo | amo | eoe. Selects which connect config pair is mounted.
 profile: alo
 
+# Prefix that the rrcs.name helper prepends to every chart-rendered
+# Kubernetes resource name (this chart renders: Deployments, Services,
+# ConfigMaps, Secrets, Jobs, and one optional PVC). Empty string
+# disables prefixing for back-compat with any existing values overrides
+# that reference the unprefixed names.
+#
+# Length budget: see docs/superpowers/specs/2026-06-03-rrcs-k8s-resource-name-prefix-design.md §2.1.
+# Binding case is the harness-generated collector Job
+# (collector-<tier>-<mode>-<profile>-<unix-ts>, up to 41 chars): default
+# "lab-" leaves ~16 chars of headroom for any custom prefix. The
+# collector-Job template fails loud at render time if you exceed this.
+resourcePrefix: "lab-"
+
 # The chart does NOT template a Namespace (design fix #3). Install with:
 #   helm install rrcs ./chart -n rrcs-k8s --create-namespace
 
