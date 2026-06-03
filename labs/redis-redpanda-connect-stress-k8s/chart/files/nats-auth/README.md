@@ -8,11 +8,12 @@ Hierarchy:
 - Account:  APP (JetStream enabled, unlimited)
 - Users:    publisher, subscriber, admin
 
-Stream/durable bound into the user JWT permissions:
-- Stream:  APP_EVENTS
-- Durable: region-writer
+Stream/durable/subject prefix bound into the user JWT permissions:
+- Stream:         APP_EVENTS
+- Durable:        region-writer
+- Subject prefix: app.events  (publisher --allow-pub app.events.>)
 
-To rotate or change stream/durable names: rerun with --force.
+To rotate or change stream/durable/prefix: rerun with --force.
 
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets

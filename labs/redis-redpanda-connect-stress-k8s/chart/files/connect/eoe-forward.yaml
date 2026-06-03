@@ -44,7 +44,7 @@ output:
   nats_jetstream:
     urls: ["{{ include "rrcs.nats.url" . }}"]
     auth: { user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }} }
-    subject: {{ .Values.nats.stream.publishSubject | quote }}
+    subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
     headers:
       Nats-Msg-Id: ${! meta("event_id") }
       Content-Type: application/json

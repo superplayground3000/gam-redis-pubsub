@@ -45,11 +45,27 @@ spec:
               set -e
               SERVER="nats://nats:{{ .Values.nats.clientPort }}"
               CREDS="/etc/nats-creds/admin/user.creds"
-              if nats --server "$SERVER" --creds "$CREDS" stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; then
-                echo "{{ .Values.nats.stream.name }} already exists"
+              STREAM={{ .Values.nats.stream.name | quote }}
+              DESIRED_SUBJECTS='{{ include "rrcs.nats.stream.subjects" . }}'
+              if nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" >/dev/null 2>&1; then
+                # Stream exists. Reconcile bound subjects so a subjectPrefix change
+                # on `helm upgrade` actually takes effect — without this, the new
+                # init Job (hash-renamed by the values change) would no-op and
+                # publishers + the connect-sink consumer would move to the new
+                # prefix while the stream stayed bound to the old one, silently
+                # dropping every message.
+                CURRENT_SUBJECTS=$(nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" --json \
+                                   | jq -r '.config.subjects | join(",")')
+                if [ "$CURRENT_SUBJECTS" != "$DESIRED_SUBJECTS" ]; then
+                  echo "reconcile: $STREAM subjects [$CURRENT_SUBJECTS] -> [$DESIRED_SUBJECTS]"
+                  nats --server "$SERVER" --creds "$CREDS" stream edit "$STREAM" \
+                    --subjects="$DESIRED_SUBJECTS" --force
+                else
+                  echo "$STREAM exists with desired subjects [$DESIRED_SUBJECTS]"
+                fi
               else
-                nats --server "$SERVER" --creds "$CREDS" stream add {{ .Values.nats.stream.name }} \
-                  --subjects '{{ .Values.nats.stream.subjects }}' \
+                nats --server "$SERVER" --creds "$CREDS" stream add "$STREAM" \
+                  --subjects "$DESIRED_SUBJECTS" \
                   --storage file \
                   --replicas 1 \
                   --retention limits \
@@ -61,7 +77,7 @@ spec:
                   --dupe-window {{ .Values.nats.stream.dupeWindow }} \
                   --defaults
               fi
-              nats --server "$SERVER" --creds "$CREDS" stream info {{ .Values.nats.stream.name }}
+              nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM"
           volumeMounts:
             - name: admin-creds
               mountPath: /etc/nats-creds/admin

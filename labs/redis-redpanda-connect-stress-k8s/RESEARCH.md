@@ -6,11 +6,15 @@ NATS and each Redis. Two design decisions worth remembering:
 
 - **Permission narrowness.** Publisher and subscriber don't share admin
   creds; each gets exactly the JetStream API subjects it needs (publisher:
-  `app.events.>` + read on `$JS.API.STREAM.INFO.<stream>`; subscriber:
+  `<subjectPrefix>.>` + read on `$JS.API.STREAM.INFO.<stream>`; subscriber:
   ack on `$JS.ACK.<stream>.<durable>.>` + the four narrow CONSUMER subjects
   scoped to its own durable + the same stream-info read). A compromised
   source can't drain the stream; a compromised sink can't inspect other
   consumers. This is the production pattern; lab demonstrates the format.
+  `<subjectPrefix>` defaults to `app.events` and is set via
+  `nats.stream.subjectPrefix` in `chart/values.yaml`; that single key feeds
+  the JetStream `--subjects` bind, the connect-source `publishSubject`, and
+  the publisher JWT's `--allow-pub` grant — so the three cannot drift.
 - **Two modes, one chart.** Bundled mode mints fixture creds at install
   for kind/local use. External mode skips deploying NATS/Redis and consumes
   user-supplied Secrets by name (production workflow: signing keys in Vault,

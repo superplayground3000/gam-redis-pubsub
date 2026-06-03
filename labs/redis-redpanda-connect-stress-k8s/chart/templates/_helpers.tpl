@@ -118,6 +118,28 @@ rrcs.nats.credsSecret.{publisher,subscriber,admin} — Secret name to mount.
 Bundled: the chart-rendered Secret name from values. External: user-supplied
 Secret name (may be empty for admin, in which case purge is skipped).
 */}}
+{{/*
+rrcs.nats.stream.subjects — wildcard pattern the JetStream stream binds to.
+Derived from .Values.nats.stream.subjectPrefix so the bound subjects, the
+publish subject, and the publisher's --allow-pub grant cannot drift.
+Usage: {{ include "rrcs.nats.stream.subjects" . }}
+*/}}
+{{- define "rrcs.nats.stream.subjects" -}}
+{{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
+{{- printf "%s.>" $p -}}
+{{- end -}}
+
+{{/*
+rrcs.nats.stream.publishSubject — the subject connect-source publishes each
+message to. The per-message ".${! meta(\"pattern\") }" suffix is a Redpanda
+Connect interpolation, evaluated at publish time, not by Helm.
+Usage: {{ include "rrcs.nats.stream.publishSubject" . }}
+*/}}
+{{- define "rrcs.nats.stream.publishSubject" -}}
+{{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
+{{- printf "%s.${! meta(\"pattern\") }" $p -}}
+{{- end -}}
+
 {{- define "rrcs.nats.credsSecret.publisher" -}}
 {{- if .Values.nats.external.enabled -}}
 {{- required "nats.external.auth.publisherSecret is required when external" .Values.nats.external.auth.publisherSecret -}}

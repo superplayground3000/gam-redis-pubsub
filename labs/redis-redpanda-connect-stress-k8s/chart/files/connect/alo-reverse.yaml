@@ -13,7 +13,7 @@ input:
   nats_jetstream:
     urls: ["{{ include "rrcs.nats.url" . }}"]
     auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
-    subject: {{ .Values.nats.stream.subjects | quote }}
+    subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
     durable: {{ .Values.nats.stream.consumer.durable | quote }}
     deliver: all

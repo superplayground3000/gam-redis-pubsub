@@ -90,6 +90,7 @@ kubectl apply -n rrcs-k8s -f out/manifests.yaml
 | `nats.persistence.mode` | `emptyDir` | `emptyDir` (portable) or `pvc` (durable) |
 | `nats.persistence.storageClassName` | `""` | Only for `pvc`; blank → cluster default |
 | `nats.stream.maxBytes` | `256MB` | JetStream `APP_EVENTS` byte cap |
+| `nats.stream.subjectPrefix` | `app.events` | NATS subject prefix. Stream binds `<prefix>.>`; connect-source publishes `<prefix>.${! meta("pattern") }`; publisher JWT grants `<prefix>.>`. Changing after install (bundled mode): (1) `scripts/gen-nats-auth.sh --force` (rotate creds), (2) `helm upgrade` (init Job reconciles stream subjects via `nats stream edit`), (3) `kubectl rollout restart deployment/connect-source deployment/connect-sink` (ConfigMaps don't auto-reload). External mode: reconcile stream + rotate creds out-of-band. |
 | `scheduling.{nodeSelector,tolerations,affinity}` | empty | Applied to every pod |
 | `chaos.downSeconds` | `8` | Chaos outage length |
 

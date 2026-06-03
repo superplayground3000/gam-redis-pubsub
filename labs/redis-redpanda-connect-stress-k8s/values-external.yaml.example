@@ -4,8 +4,9 @@
 #
 # Prerequisites you must satisfy in your external NATS account:
 #   - The stream named by nats.stream.name (default APP_EVENTS) must exist
-#     with subjects nats.stream.subjects (default app.events.>).
-#   - The publisher user JWT must allow: pub app.events.> and
+#     and bind subjects "<nats.stream.subjectPrefix>.>"
+#     (default "app.events.>").
+#   - The publisher user JWT must allow: pub <subjectPrefix>.> and
 #     pub $JS.API.STREAM.INFO.<stream-name>; sub _INBOX.>
 #   - The subscriber user JWT must allow: pub $JS.ACK.<stream>.<durable>.>,
 #     pub $JS.API.STREAM.INFO.<stream>, and the four narrow consumer subjects
@@ -27,6 +28,14 @@ nats:
       publisherSecret: prod-publisher-creds
       subscriberSecret: prod-subscriber-creds
       adminSecret: prod-admin-creds                          # optional; "" skips harness purge
+  # stream.subjectPrefix must match the prefix bound into your stream and the
+  # one your publisher creds are authorized to publish on. Default "app.events"
+  # works only if your external NATS uses that exact prefix. In external mode
+  # the chart does NOT reconcile your stream — changing subjectPrefix here
+  # without first updating your stream's bound subjects (and your publisher
+  # creds) will cause every published message to be rejected.
+  # stream:
+  #   subjectPrefix: "tenantA.events"
 
 redis:
   # NOTE: external Redis TLS (rediss://) is NOT supported in v1. Connect can

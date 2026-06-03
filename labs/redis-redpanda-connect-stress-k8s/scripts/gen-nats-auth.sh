@@ -5,6 +5,7 @@
 #
 # Env overrides (defaults match chart/values.yaml):
 #   STREAM_NAME=APP_EVENTS        DURABLE_NAME=region-writer
+#   SUBJECT_PREFIX=app.events     (publisher --allow-pub is "<prefix>.>")
 #   OPERATOR_NAME=RRCS-OP         ACCOUNT_NAME=APP
 set -euo pipefail
 
@@ -31,7 +32,8 @@ parse_values() {
   local key="$1" default="$2"
   if [[ -f chart/values.yaml ]]; then
     # awk walks the YAML hierarchy under `nats:` to find the requested key.
-    # `key` is one of: nats.stream.name, nats.stream.consumer.durable
+    # `key` is one of: nats.stream.name, nats.stream.subjectPrefix,
+    # nats.stream.consumer.durable
     local val
     case "$key" in
       nats.stream.name)
@@ -45,6 +47,21 @@ parse_values() {
           in_nats && /^  [a-zA-Z]/{in_stream=0}
           in_stream && /^    name:/{
             gsub(/^    name:[[:space:]]*/,"")
+            gsub(/^"|"$/,"")
+            print
+            exit
+          }
+        ' chart/values.yaml)"
+        ;;
+      nats.stream.subjectPrefix)
+        # shellcheck disable=SC2016
+        val="$(awk '
+          /^nats:/{in_nats=1; next}
+          /^[a-zA-Z]/{in_nats=0}
+          in_nats && /^  stream:/{in_stream=1; next}
+          in_nats && /^  [a-zA-Z]/{in_stream=0}
+          in_stream && /^    subjectPrefix:/{
+            gsub(/^    subjectPrefix:[[:space:]]*/,"")
             gsub(/^"|"$/,"")
             print
             exit
@@ -77,6 +94,7 @@ parse_values() {
 }
 
 STREAM_NAME="${STREAM_NAME:-$(parse_values nats.stream.name APP_EVENTS)}"
+SUBJECT_PREFIX="${SUBJECT_PREFIX:-$(parse_values nats.stream.subjectPrefix app.events)}"
 DURABLE_NAME="${DURABLE_NAME:-$(parse_values nats.stream.consumer.durable region-writer)}"
 OPERATOR_NAME="${OPERATOR_NAME:-RRCS-OP}"
 ACCOUNT_NAME="${ACCOUNT_NAME:-APP}"
@@ -118,9 +136,9 @@ nsc edit account --name "${ACCOUNT_NAME}" \
   --js-streams -1 --js-consumer -1 \
   --js-mem-storage -1 --js-disk-storage -1 >/dev/null
 
-echo "[gen] user publisher"
+echo "[gen] user publisher (allow-pub ${SUBJECT_PREFIX}.>)"
 nsc add user --account "${ACCOUNT_NAME}" --name publisher \
-  --allow-pub 'app.events.>' \
+  --allow-pub "${SUBJECT_PREFIX}.>" \
   --allow-pub '$JS.API.STREAM.INFO.'"${STREAM_NAME}" \
   --allow-sub '_INBOX.>' >/dev/null
 
@@ -163,11 +181,12 @@ Hierarchy:
 - Account:  ${ACCOUNT_NAME} (JetStream enabled, unlimited)
 - Users:    publisher, subscriber, admin
 
-Stream/durable bound into the user JWT permissions:
-- Stream:  ${STREAM_NAME}
-- Durable: ${DURABLE_NAME}
+Stream/durable/subject prefix bound into the user JWT permissions:
+- Stream:         ${STREAM_NAME}
+- Durable:        ${DURABLE_NAME}
+- Subject prefix: ${SUBJECT_PREFIX}  (publisher --allow-pub ${SUBJECT_PREFIX}.>)
 
-To rotate or change stream/durable names: rerun with --force.
+To rotate or change stream/durable/prefix: rerun with --force.
 
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets
