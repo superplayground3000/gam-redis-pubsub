@@ -20,7 +20,7 @@ spec:
         - name: admin-creds
           secret:
             secretName: {{ include "rrcs.nats.credsSecret.admin" . }}
-            defaultMode: 0400
+            defaultMode: 0444    # Secret is in a per-pod tmpfs; non-root nats-box user needs read access
       initContainers:
         - name: wait-nats
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}

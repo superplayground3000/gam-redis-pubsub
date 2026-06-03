@@ -30,9 +30,9 @@ spec:
             - --slo-p99-ms={{ .Values.collector.sloP99Ms }}
             - --slo-allow-missing={{ .Values.collector.sloAllowMissing }}
             - --nats-stream={{ .Values.nats.stream.name }}
-            - --nats={{ include "rrcs.nats.monitorUrl" . | quote }}
-            - --redis-central={{ include "rrcs.redis.central.hostPort" . | quote }}
-            - --redis-region={{ include "rrcs.redis.region.hostPort" . | quote }}
+            - --nats={{ include "rrcs.nats.monitorUrl" . }}
+            - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
+            - --redis-region={{ include "rrcs.redis.region.hostPort" . }}
             {{- if eq .Values.collector.mode "chaos" }}
             - --chaos-at-s={{ .Values.collector.chaosAtS }}
             - --chaos-duration={{ .Values.collector.chaosDurationS }}

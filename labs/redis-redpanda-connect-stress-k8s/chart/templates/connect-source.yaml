@@ -63,7 +63,7 @@ spec:
         - name: nats-creds
           secret:
             secretName: {{ include "rrcs.nats.credsSecret.publisher" . }}
-            defaultMode: 0400
+            defaultMode: 0444    # Secret is in a per-pod tmpfs; non-root connect user needs read access
 ---
 apiVersion: v1
 kind: Service

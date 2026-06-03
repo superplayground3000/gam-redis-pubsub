@@ -225,7 +225,7 @@ run_one() {
     --arg stream "$STREAM_NAME" \
     '{
       spec: {
-        volumes: [{name: "creds", secret: {secretName: $secret, defaultMode: 256}}],
+        volumes: [{name: "creds", secret: {secretName: $secret, defaultMode: 292}}],
         containers: [{
           name: $name,
           image: $image,

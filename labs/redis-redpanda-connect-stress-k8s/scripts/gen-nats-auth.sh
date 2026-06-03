@@ -104,6 +104,14 @@ fi
 echo "[gen] operator ${OPERATOR_NAME}"
 nsc add operator --name "${OPERATOR_NAME}" >/dev/null
 
+# A NATS server running with operator-trust + JetStream REQUIRES a system
+# account for its internal JS subscriptions. Add SYS and designate it on
+# the operator JWT; `nsc generate config --mem-resolver` then includes SYS
+# in the resolver_preload automatically.
+echo "[gen] system account SYS"
+nsc add account --name SYS >/dev/null
+nsc edit operator --system-account SYS >/dev/null
+
 echo "[gen] account ${ACCOUNT_NAME} (JetStream enabled, unlimited)"
 nsc add account --name "${ACCOUNT_NAME}" >/dev/null
 nsc edit account --name "${ACCOUNT_NAME}" \
