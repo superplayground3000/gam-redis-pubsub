@@ -1,0 +1,44 @@
+# Example overlay for running the rrcs-k8s lab against pre-existing external
+# NATS JetStream and Redis. Copy to a real values file (NOT committed), fill
+# in your URLs, and pre-create the K8s Secrets referenced below.
+#
+# Prerequisites you must satisfy in your external NATS account:
+#   - The stream named by nats.stream.name (default APP_EVENTS) must exist
+#     with subjects nats.stream.subjects (default app.events.>).
+#   - The publisher user JWT must allow: pub app.events.> and
+#     pub $JS.API.STREAM.INFO.<stream-name>; sub _INBOX.>
+#   - The subscriber user JWT must allow: pub $JS.ACK.<stream>.<durable>.>,
+#     pub $JS.API.STREAM.INFO.<stream>, and the four narrow consumer subjects
+#     (DURABLE.CREATE, CREATE, CREATE.>, INFO) for stream.durable;
+#     sub _INBOX.>.
+#   - (Optional) admin user JWT with pub $JS.API.> for the harness purge.
+#
+# Pre-create the Secrets (keys: user.creds):
+#   kubectl create secret generic prod-publisher-creds  --from-file=user.creds=publisher.creds  -n rrcs-k8s
+#   kubectl create secret generic prod-subscriber-creds --from-file=user.creds=subscriber.creds -n rrcs-k8s
+#   kubectl create secret generic prod-admin-creds      --from-file=user.creds=admin.creds      -n rrcs-k8s   # optional
+
+nats:
+  external:
+    enabled: true
+    url: "nats://nats.prod.example.com:4222"
+    monitorUrl: "http://nats-monitor.prod.example.com:8222"   # required for chaos mode
+    auth:
+      publisherSecret: prod-publisher-creds
+      subscriberSecret: prod-subscriber-creds
+      adminSecret: prod-admin-creds                          # optional; "" skips harness purge
+
+redis:
+  central:
+    external:
+      enabled: true
+      url: "redis://redis-central.prod.example.com:6379"
+  region:
+    external:
+      enabled: true
+      url: "redis://redis-region.prod.example.com:6379"
+
+# Writer/collector still locally built; load into your cluster's registry or kind:
+#   scripts/build-images.sh --registry=corp.example.com/team --push
+images:
+  registry: corp.example.com/team/   # if you pushed; or "" if loaded into kind

@@ -1,3 +1,25 @@
+# RESEARCH — credential auth + external backend support
+
+This iteration adds production-shape NATS credential auth (operator → account
+→ user JWTs + .creds files) and independent bundled-vs-external toggles for
+NATS and each Redis. Two design decisions worth remembering:
+
+- **Permission narrowness.** Publisher and subscriber don't share admin
+  creds; each gets exactly the JetStream API subjects it needs (publisher:
+  `app.events.>` + read on `$JS.API.STREAM.INFO.<stream>`; subscriber:
+  ack on `$JS.ACK.<stream>.<durable>.>` + the four narrow CONSUMER subjects
+  scoped to its own durable + the same stream-info read). A compromised
+  source can't drain the stream; a compromised sink can't inspect other
+  consumers. This is the production pattern; lab demonstrates the format.
+- **Two modes, one chart.** Bundled mode mints fixture creds at install
+  for kind/local use. External mode skips deploying NATS/Redis and consumes
+  user-supplied Secrets by name (production workflow: signing keys in Vault,
+  creds materialized into K8s Secrets via External Secrets / SealedSecrets).
+  Lab is a teaching artifact: bundled shows the FORMAT, external shows the
+  WORKFLOW.
+
+---
+
 # RESEARCH — Kubernetes fork
 
 This lab forks the Docker Compose stress lab to a Kubernetes substrate without

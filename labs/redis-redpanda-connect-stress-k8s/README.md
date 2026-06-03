@@ -10,9 +10,37 @@ host `kubectl` harness.
 `helm`, `kubectl`, `kind` (for local), `docker`, `go`, `python3`. A reachable
 cluster context (`kubectl config current-context`).
 
+## Authentication
+
+The chart runs in two modes (independently per backend):
+
+- **Bundled mode (default).** The chart deploys NATS + Redis and mints
+  credential auth at install time from lab-fixture JWTs under
+  `chart/files/nats-auth/`. Run `scripts/gen-nats-auth.sh` once on a fresh
+  checkout if those fixtures are missing.
+- **External mode.** Point the chart at your own NATS/Redis. Pre-create
+  K8s Secrets containing user .creds files; reference them in
+  `values-external.yaml`. The chart never mints, never touches your
+  stream. See `values-external.yaml.example` for the full shape and the
+  exact NATS permissions you must grant.
+
+## Running against external NATS + Redis
+
+```bash
+# user pre-creates Secrets in their cluster (NOT done by the chart)
+kubectl create secret generic prod-publisher-creds  --from-file=user.creds=publisher.creds  -n rrcs-k8s
+kubectl create secret generic prod-subscriber-creds --from-file=user.creds=subscriber.creds -n rrcs-k8s
+kubectl create secret generic prod-admin-creds      --from-file=user.creds=admin.creds      -n rrcs-k8s   # optional
+
+cp values-external.yaml.example values-prod.yaml     # edit URLs + secret names
+helm install rrcs ./chart -n rrcs-k8s --create-namespace -f values-prod.yaml
+RRCS_VALUES=values-prod.yaml scripts/stress-run.sh --tiers=10 --modes=throughput
+```
+
 ## Quick start (kind / local)
 
 ```bash
+scripts/gen-nats-auth.sh                    # once, for fresh checkouts
 # 1. Create a local cluster
 kind create cluster --name rrcs
 
