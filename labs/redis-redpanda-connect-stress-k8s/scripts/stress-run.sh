@@ -89,11 +89,12 @@ for m in "${MODES[@]}"; do [[ "$m" == "chaos" ]] && needs_pf=1; done
 if (( needs_pf )); then
   if [[ "$NATS_EXTERNAL" == "true" ]]; then
     if [[ -z "$NATS_MONITOR_URL" ]]; then
-      echo "[chaos-preflight] WARN: nats.external.monitorUrl unset; skipping JetStream bytes pre-flight" >&2
-      JSZ_URL=""
-    else
-      JSZ_URL="${NATS_MONITOR_URL%/}/jsz"
+      echo "[chaos-preflight] ERROR: chaos mode requires nats.external.monitorUrl to be set" >&2
+      echo "                  (so the >200 MB JetStream backlog safety check can run)." >&2
+      echo "                  Either set nats.external.monitorUrl, or remove chaos from --modes." >&2
+      exit 2
     fi
+    JSZ_URL="${NATS_MONITOR_URL%/}/jsz"
   else
     kubectl -n "${NS}" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
     PF_PID=$!
@@ -109,11 +110,13 @@ fi
 
 mkdir -p reports
 
-# Resolve the nats-box image (with images.registry prefix) ONCE, by rendering the
-# nats-init Job template with the same values. Captured as a string so it survives
-# the nats-init Job being TTL-garbage-collected partway through a long matrix run.
-PURGE_IMG="$(helm template "${RELEASE}" ./chart -n "${NS}" -f "${VALUES_FILE}" \
-  --set "profile=${PROFILE}" -s templates/nats-init-job.yaml | awk '/image:/{print $2; exit}')"
+# Resolve the nats-box image (with images.registry prefix) ONCE, from the
+# merged effective values — works in BOTH bundled and external modes since
+# nats-init-job.yaml is gated off in external mode and unavailable to `-s`.
+HELM_VALUES_ALL_JSON="$(helm get values "${RELEASE}" -n "${NS}" -a -o json)"
+PURGE_REG="$(echo "$HELM_VALUES_ALL_JSON" | jq -r '.images.registry // ""')"
+PURGE_NATSBOX="$(echo "$HELM_VALUES_ALL_JSON" | jq -r '.natsBox.image // "natsio/nats-box:0.14.5"')"
+PURGE_IMG="${PURGE_REG}${PURGE_NATSBOX}"
 
 jetstream_bytes() {
   [[ -z "${JSZ_URL:-}" ]] && { echo 0; return; }
@@ -152,7 +155,7 @@ run_one() {
   if [[ "${mode}" == "chaos" ]]; then
     local bytes; bytes="$(jetstream_bytes)"
     if (( bytes > 200*1024*1024 )); then
-      echo "[abort] APP_EVENTS already ${bytes} bytes (>200MB). helm uninstall and retry." >&2
+      echo "[abort] ${STREAM_NAME} already ${bytes} bytes (>200MB). helm uninstall and retry." >&2
       exit 3
     fi
     chaos_sets=(--set "collector.chaosAtS=$(chaos_at_s)" --set "collector.chaosDurationS=${CHAOS_DOWN_S}")
@@ -213,18 +216,26 @@ run_one() {
   fi
   local purge_name
   purge_name="nats-purge-$(date +%s)"
-  kubectl -n "${NS}" run "${purge_name}" --rm -i --restart=Never --image="${PURGE_IMG}" \
-    --overrides='{
-      "spec": {
-        "volumes": [{"name": "creds", "secret": {"secretName": "'"${ADMIN_SECRET}"'", "defaultMode": 256}}],
-        "containers": [{
-          "name": "'"${purge_name}"'",
-          "image": "'"${PURGE_IMG}"'",
-          "volumeMounts": [{"name": "creds", "mountPath": "/tmp/creds", "readOnly": true}],
-          "command": ["nats", "--server", "'"${NATS_URL}"'", "--creds", "/tmp/creds/user.creds", "stream", "purge", "'"${STREAM_NAME}"'", "-f"]
+  local overrides
+  overrides="$(jq -n \
+    --arg name "$purge_name" \
+    --arg image "$PURGE_IMG" \
+    --arg secret "$ADMIN_SECRET" \
+    --arg server "$NATS_URL" \
+    --arg stream "$STREAM_NAME" \
+    '{
+      spec: {
+        volumes: [{name: "creds", secret: {secretName: $secret, defaultMode: 256}}],
+        containers: [{
+          name: $name,
+          image: $image,
+          volumeMounts: [{name: "creds", mountPath: "/tmp/creds", readOnly: true}],
+          command: ["nats", "--server", $server, "--creds", "/tmp/creds/user.creds", "stream", "purge", $stream, "-f"]
         }]
       }
-    }' >/dev/null 2>&1 \
+    }')"
+  kubectl -n "${NS}" run "${purge_name}" --rm -i --restart=Never --image="${PURGE_IMG}" \
+    --overrides="${overrides}" >/dev/null 2>&1 \
     || echo "[purge] WARN: stream purge failed (continuing)" >&2
 }
 
