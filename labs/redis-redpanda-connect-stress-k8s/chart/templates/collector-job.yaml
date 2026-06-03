@@ -1,8 +1,13 @@
 {{- if .Values.collector.run }}
+{{- $base := .Values.collector.jobName | default (printf "collector-%v-%s-%s" .Values.collector.tier .Values.collector.mode .Values.profile) -}}
+{{- $name := include "rrcs.name" (dict "root" $ "base" $base) -}}
+{{- if gt (len $name) 57 -}}
+{{- fail (printf "collector Job name %q (%d chars) exceeds the 57-char budget (63 DNS-1123 limit minus the 6-char Pod random suffix). Shorten resourcePrefix (currently %q) or collector.jobName." $name (len $name) .Values.resourcePrefix) -}}
+{{- end -}}
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ .Values.collector.jobName | default (printf "collector-%v-%s-%s" .Values.collector.tier .Values.collector.mode .Values.profile) }}
+  name: {{ $name }}
   labels: { app: collector }
 spec:
   backoffLimit: 0
