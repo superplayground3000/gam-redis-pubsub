@@ -1,0 +1,16 @@
+{{- if not .Values.nats.external.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nats-config
+  labels: { app: nats }
+data:
+  nats-server.conf: |-
+    server_name: rrcs-nats
+    port: {{ .Values.nats.clientPort }}
+    http_port: {{ .Values.nats.monitorPort }}
+    jetstream {
+      store_dir: /data
+    }
+{{ .Files.Get "files/nats-auth/nats-server.conf" | indent 4 }}
+{{- end }}
