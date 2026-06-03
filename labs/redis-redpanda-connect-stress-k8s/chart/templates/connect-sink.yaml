@@ -1,7 +1,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: connect-sink
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink") }}
   labels: { app: connect-sink }
 spec:
   replicas: 1
@@ -59,7 +59,7 @@ spec:
       volumes:
         - name: config
           configMap:
-            name: connect-sink-config
+            name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink-config") }}
         - name: nats-creds
           secret:
             secretName: {{ include "rrcs.nats.credsSecret.subscriber" . }}
@@ -68,7 +68,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: connect-sink
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink") }}
   labels: { app: connect-sink }
 spec:
   selector: { app: connect-sink }
