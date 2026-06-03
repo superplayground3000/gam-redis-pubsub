@@ -2,7 +2,7 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: redis-region
+  name: {{ include "rrcs.name" (dict "root" $ "base" "redis-region") }}
   labels: { app: redis-region }
 spec:
   replicas: 1
@@ -44,7 +44,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis-region
+  name: {{ include "rrcs.name" (dict "root" $ "base" "redis-region") }}
   labels: { app: redis-region }
 spec:
   selector: { app: redis-region }
