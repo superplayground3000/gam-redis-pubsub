@@ -29,6 +29,10 @@ spec:
             - --slo-rate-pct={{ .Values.collector.sloRatePct }}
             - --slo-p99-ms={{ .Values.collector.sloP99Ms }}
             - --slo-allow-missing={{ .Values.collector.sloAllowMissing }}
+            - --nats-stream={{ .Values.nats.stream.name }}
+            - --nats={{ include "rrcs.nats.monitorUrl" . | quote }}
+            - --redis-central={{ include "rrcs.redis.central.hostPort" . | quote }}
+            - --redis-region={{ include "rrcs.redis.region.hostPort" . | quote }}
             {{- if eq .Values.collector.mode "chaos" }}
             - --chaos-at-s={{ .Values.collector.chaosAtS }}
             - --chaos-duration={{ .Values.collector.chaosDurationS }}
