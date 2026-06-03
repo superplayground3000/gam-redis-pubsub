@@ -72,14 +72,17 @@ helm upgrade --install "${RELEASE}" ./chart -n "${NS}" --create-namespace \
 # Resolve runtime config from the installed release (external-mode-aware).
 HELM_VALUES_JSON="$(helm get values "${RELEASE}" -n "${NS}" -o json)"
 STREAM_NAME="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.stream.name // "APP_EVENTS"')"
+RESOURCE_PREFIX="$(echo "$HELM_VALUES_JSON" | jq -r '.resourcePrefix // "lab-"')"
+export RESOURCE_PREFIX
 NATS_EXTERNAL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.enabled // false')"
 NATS_MONITOR_URL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.monitorUrl // empty')"
 NATS_URL="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.url // empty')"
-[[ -z "$NATS_URL" ]] && NATS_URL="nats://nats:4222"
+[[ -z "$NATS_URL" ]] && NATS_URL="nats://${RESOURCE_PREFIX}nats:4222"
 if [[ "$NATS_EXTERNAL" == "true" ]]; then
   ADMIN_SECRET="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.external.auth.adminSecret // empty')"
 else
-  ADMIN_SECRET="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.auth.secrets.admin // "admin-creds"')"
+  ADMIN_SECRET_BASE="$(echo "$HELM_VALUES_JSON" | jq -r '.nats.auth.secrets.admin // "admin-creds"')"
+  ADMIN_SECRET="${RESOURCE_PREFIX}${ADMIN_SECRET_BASE}"
 fi
 echo "[config] stream=${STREAM_NAME} ext=${NATS_EXTERNAL} url=${NATS_URL} mon=${NATS_MONITOR_URL:-<unset>} admin=${ADMIN_SECRET:-<unset>}"
 
@@ -96,7 +99,7 @@ if (( needs_pf )); then
     fi
     JSZ_URL="${NATS_MONITOR_URL%/}/jsz"
   else
-    kubectl -n "${NS}" port-forward svc/nats 18222:8222 >/dev/null 2>&1 &
+    kubectl -n "${NS}" port-forward "svc/${RESOURCE_PREFIX}nats" 18222:8222 >/dev/null 2>&1 &
     PF_PID=$!
     pf_ok=0
     for _ in $(seq 1 15); do
@@ -136,8 +139,8 @@ wait_job_terminal() {
   deadline=$(( $(date +%s) + timeout_s ))
   while (( $(date +%s) < deadline )); do
     local complete failed
-    complete=$(kubectl -n "${NS}" get "job/${job}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
-    failed=$(kubectl -n "${NS}" get "job/${job}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+    complete=$(kubectl -n "${NS}" get "job/${job_full}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+    failed=$(kubectl -n "${NS}" get "job/${job_full}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
     [[ "${complete}" == "True" ]] && return 0
     [[ "${failed}" == "True" ]] && return 1
     sleep 2
@@ -165,6 +168,7 @@ run_one() {
 
   local job
   job="collector-${tier}-${mode}-${PROFILE}-$(date +%s)"
+  job_full="${RESOURCE_PREFIX}${job}"
   echo "[run] tier=${tier} mode=${mode} profile=${PROFILE} job=${job}"
 
   helm template "${RELEASE}" ./chart -n "${NS}" -s templates/collector-job.yaml \
@@ -189,16 +193,16 @@ run_one() {
   local term_rc=0
   wait_job_terminal "${job}" "${timeout_s}" || term_rc=$?
   if (( term_rc == 0 )) \
-     && kubectl -n "${NS}" logs "job/${job}" | sed -n "s/^${RESULT_SENTINEL}//p" | tail -n 1 > "reports/${tier}-${mode}-${PROFILE}.json" \
+     && kubectl -n "${NS}" logs "job/${job_full}" | sed -n "s/^${RESULT_SENTINEL}//p" | tail -n 1 > "reports/${tier}-${mode}-${PROFILE}.json" \
      && [[ -s "reports/${tier}-${mode}-${PROFILE}.json" ]]; then
     echo "[ok] report saved"
   else
     echo "[ERROR] collector ${job} did not produce a verdict (term_rc=${term_rc})" >&2
-    kubectl -n "${NS}" logs "job/${job}" --tail=20 >&2 || true
+    kubectl -n "${NS}" logs "job/${job_full}" --tail=20 >&2 || true
     rm -f "reports/${tier}-${mode}-${PROFILE}.json"
   fi
 
-  kubectl -n "${NS}" delete "job/${job}" --wait=true >/dev/null 2>&1 || true
+  kubectl -n "${NS}" delete "job/${job_full}" --wait=true >/dev/null 2>&1 || true
 
   if [[ -n "${CHAOS_PID}" ]]; then
     local rc
@@ -215,7 +219,7 @@ run_one() {
     return 0
   fi
   local purge_name
-  purge_name="nats-purge-$(date +%s)"
+  purge_name="${RESOURCE_PREFIX}nats-purge-$(date +%s)"
   local overrides
   overrides="$(jq -n \
     --arg name "$purge_name" \

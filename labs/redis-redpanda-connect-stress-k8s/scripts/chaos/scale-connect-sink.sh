@@ -8,7 +8,7 @@ set -euo pipefail
 NS="${RRCS_NS:-rrcs-k8s}"
 DOWN_S="${1:-8}"
 READY_TIMEOUT_S="${READY_TIMEOUT_S:-60}"
-DEPLOY=connect-sink
+DEPLOY="${RESOURCE_PREFIX-lab-}connect-sink"
 
 echo "[chaos] scaling ${DEPLOY} to 0 for ${DOWN_S}s"
 kubectl -n "${NS}" scale deploy/"${DEPLOY}" --replicas=0
