@@ -85,6 +85,7 @@ kubectl apply -n rrcs-k8s -f out/manifests.yaml
 |---|---|---|
 | `profile` | `alo` | QoS profile: `alo` / `amo` / `eoe` |
 | `images.registry` | `""` | Prefix for every image (custom registry) |
+| `resourcePrefix` | `lab-` | Prepended to every chart-rendered K8s resource name. Empty string opts out (back-compat with the unprefixed pre-v3 names). Pod names must fit the K8s 63-char DNS-1123 label limit; the collector Job is the binding case (~16 chars of headroom for a custom prefix). `helm template` fails loud at render time if you exceed this. |
 | `images.pullPolicy` | `IfNotPresent` | Global pull policy (public images) |
 | `writer.pullPolicy` / `collector.pullPolicy` | `""` (inherit) | Per-image override; dev sets `Never` |
 | `nats.persistence.mode` | `emptyDir` | `emptyDir` (portable) or `pvc` (durable) |

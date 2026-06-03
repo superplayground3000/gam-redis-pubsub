@@ -57,3 +57,8 @@ redis:
 #   scripts/build-images.sh --registry=corp.example.com/team --push
 images:
   registry: corp.example.com/team/   # if you pushed; or "" if loaded into kind
+
+# Optional: pick a different prefix for the bundled chart-rendered resources.
+# Has no effect on user-supplied external Secret/URL names — those pass
+# through verbatim. Default "lab-".
+# resourcePrefix: "tenant-a-"

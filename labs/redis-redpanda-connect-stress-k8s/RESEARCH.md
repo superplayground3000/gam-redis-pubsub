@@ -21,6 +21,12 @@ NATS and each Redis. Two design decisions worth remembering:
   creds materialized into K8s Secrets via External Secrets / SealedSecrets).
   Lab is a teaching artifact: bundled shows the FORMAT, external shows the
   WORKFLOW.
+- **Resource-name prefix.** Every chart-rendered K8s resource (Deployments,
+  Services, ConfigMaps, Secrets, Jobs, the optional PVC) takes a configurable
+  prefix from `resourcePrefix` (default `lab-`). Single source of truth via
+  the `rrcs.name` helper means URL helpers, Secret-name helpers, and the
+  harness scripts all track the same value. External-mode user-supplied
+  names pass through unchanged.
 
 ---
 

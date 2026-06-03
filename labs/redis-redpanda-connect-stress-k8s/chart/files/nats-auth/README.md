@@ -18,3 +18,8 @@ To rotate or change stream/durable/prefix: rerun with --force.
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets
 out-of-band — that's exactly what the chart's external-mode consumes.
+
+When the chart is installed with a non-default `resourcePrefix`, the
+deployed Secrets reflect that prefix (e.g. `tenant-a-publisher-creds`),
+but the fixture `.creds` files themselves are operator-controlled
+content and stay un-prefixed in this directory.
