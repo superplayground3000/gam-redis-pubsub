@@ -1,3 +1,4 @@
+{{- if not .Values.nats.external.enabled }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -15,6 +16,11 @@ spec:
       restartPolicy: OnFailure
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
       {{- include "rrcs.scheduling" . | nindent 6 }}
+      volumes:
+        - name: admin-creds
+          secret:
+            secretName: {{ include "rrcs.nats.credsSecret.admin" . }}
+            defaultMode: 0400
       initContainers:
         - name: wait-nats
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
@@ -22,9 +28,13 @@ spec:
           command: ["/bin/sh", "-c"]
           args:
             - |
-              until nats --server nats://nats:{{ .Values.nats.clientPort }} rtt >/dev/null 2>&1; do
+              until nats --server nats://nats:{{ .Values.nats.clientPort }} --creds /etc/nats-creds/admin/user.creds rtt >/dev/null 2>&1; do
                 echo "waiting for nats..."; sleep 1;
               done
+          volumeMounts:
+            - name: admin-creds
+              mountPath: /etc/nats-creds/admin
+              readOnly: true
       containers:
         - name: create-stream
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
@@ -34,10 +44,11 @@ spec:
             - |
               set -e
               SERVER="nats://nats:{{ .Values.nats.clientPort }}"
-              if nats --server "$SERVER" stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; then
+              CREDS="/etc/nats-creds/admin/user.creds"
+              if nats --server "$SERVER" --creds "$CREDS" stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; then
                 echo "{{ .Values.nats.stream.name }} already exists"
               else
-                nats --server "$SERVER" stream add {{ .Values.nats.stream.name }} \
+                nats --server "$SERVER" --creds "$CREDS" stream add {{ .Values.nats.stream.name }} \
                   --subjects '{{ .Values.nats.stream.subjects }}' \
                   --storage file \
                   --replicas 1 \
@@ -50,6 +61,11 @@ spec:
                   --dupe-window {{ .Values.nats.stream.dupeWindow }} \
                   --defaults
               fi
-              nats --server "$SERVER" stream info {{ .Values.nats.stream.name }}
+              nats --server "$SERVER" --creds "$CREDS" stream info {{ .Values.nats.stream.name }}
+          volumeMounts:
+            - name: admin-creds
+              mountPath: /etc/nats-creds/admin
+              readOnly: true
           resources:
             {{- toYaml .Values.resources.collector | nindent 12 }}
+{{- end }}
