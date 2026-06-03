@@ -1,3 +1,4 @@
+{{- if not .Values.redis.region.external.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -51,3 +52,4 @@ spec:
     - name: redis
       port: 6379
       targetPort: 6379
+{{- end }}
