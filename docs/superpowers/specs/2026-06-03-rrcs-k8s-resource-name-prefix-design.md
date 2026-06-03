@@ -25,10 +25,11 @@ New top-level values key:
 ```yaml
 # chart/values.yaml
 resourcePrefix: "lab-"  # prepended to every chart-rendered Kubernetes resource
-                        # name (Deployments, StatefulSets, Services, ConfigMaps,
-                        # Secrets, Jobs, PVCs). Empty string disables prefixing
-                        # for back-compat with any existing values overrides
-                        # that reference the unprefixed names.
+                        # name (this chart renders: Deployments, Services,
+                        # ConfigMaps, Secrets, Jobs, and one optional PVC).
+                        # Empty string disables prefixing for back-compat with
+                        # any existing values overrides that reference the
+                        # unprefixed names.
 ```
 
 Semantics:
@@ -39,20 +40,39 @@ Semantics:
 
 ### 2.1 Length budget (corrected)
 
-Three classes of rendered name have different effective budgets against the K8s DNS-1123 label limit (63 chars):
+K8s applies two different DNS-1123 limits depending on what the name *becomes*:
 
-| Class | Longest base seen today | Pod suffix overhead | Effective budget for `prefix + base` |
-|---|---|---|---|
-| ConfigMap / Secret / Service / Deployment | `connect-source-config` (20) | — | 63 |
-| StatefulSet (`nats` → pod `nats-0`) | `nats` (4) | `-0` (2) | 61 |
-| Static Job (`nats-init-<8hex>`) | `nats-init-<8>` (18) | `-<5>` (6) | 57 |
-| **Harness-generated collector Job** | **`collector-10000-throughput-alo-1234567890` (41)** | `-<5>` (6) | **57** |
+- **DNS label (63 chars):** anything that ends up as a DNS hostname — Service names, every Pod name (regardless of what controller owns it).
+- **DNS subdomain (253 chars):** the resource name itself for everything else — Deployments, ConfigMaps, Secrets, Jobs, PVCs.
 
-The collector Job is the binding constraint, not `connect-source-config`. The harness builds its name as `collector-${tier}-${mode}-${PROFILE}-$(date +%s)` (`scripts/stress-run.sh:167`), so the Job-name base can be 41 chars under current tiers/modes/profiles.
+The binding limit is almost always the 63-char Pod-name budget, because controllers append a generated suffix to their owner's name to form the Pod. Different controllers use different suffix formats:
 
-**Default `lab-` (4 chars):** `lab-` + 41 = 45; pod 51 — comfortable headroom.
+| Resource class (in this chart) | Pod-name overhead | Effective budget for `prefix + base` |
+|---|---|---|
+| Service | none — name itself must fit DNS label | 63 |
+| Deployment → ReplicaSet → Pod (`<deploy>-<10char-rs-hash>-<5char>`) | ~17 chars | 46 |
+| Job → Pod (`<job>-<5char>`) | 6 chars | 57 |
+| ConfigMap / Secret / PVC (no Pods) | none — DNS subdomain (253 chars) | 253 |
 
-**Custom prefix headroom for the collector Job:** 57 − 41 = 16 chars. A prefix longer than 16 chars combined with the longest harness-generated Job name will produce a pod name that exceeds the 63-char DNS-1123 limit. The K8s Job controller surfaces this as `Failed create pod: name length must be no more than 63 characters`, which is the right failure to inherit — but the chart should *also* fail-loud at `helm template` time so the operator catches it before applying.
+**Chart shape note.** All workload-owning resources in this chart are `kind: Deployment` — including `nats` (`chart/templates/nats.yaml` line 19). There is no StatefulSet; the optional `nats-data` PVC is rendered as a standalone PVC and bound via `volumes.persistentVolumeClaim.claimName`, not via `volumeClaimTemplates`. The Deployment row above applies to `nats`, `writer`, `connect-source`, `connect-sink`, `redis-central`, `redis-region`.
+
+**Longest base names today, per class:**
+
+| Class | Longest base | `lab-` + base | + pod overhead | Verdict for default prefix |
+|---|---|---|---|---|
+| Deployment | `connect-source` (14) | 18 | ≈ 35 | ✓ (46-char effective budget) |
+| Service | `connect-source` (14) | 18 | 18 (no Pod) | ✓ (63-char effective budget) |
+| ConfigMap | `connect-source-config` (20) | 24 | 24 (no Pod) | ✓ (253-char effective budget) |
+| Static Job | `nats-init-<8hex>` (18) | 22 | 28 | ✓ (57-char effective budget) |
+| **Harness collector Job** | **`collector-10000-throughput-alo-1234567890` (41)** | **45** | **≈ 51** | **✓ — but the binding constraint for custom prefixes** |
+
+The harness builds the collector Job name as `collector-${tier}-${mode}-${PROFILE}-$(date +%s)` (`scripts/stress-run.sh:167`). With current tiers (`10000`), modes (`throughput`), profiles (`alo`/`amo`/`eoe`), and a 10-digit Unix timestamp, the base is at most 41 chars.
+
+**Custom-prefix headroom for the collector Job:** 57 − 41 = **16 chars**.
+
+**Custom-prefix headroom for Deployments:** 46 − 14 (`connect-source`) = 32 chars — strictly more permissive than the collector Job. Note: 46 is conservative; modern K8s ReplicaSet hashes are 10 chars + 5-char Pod suffix + 2 separators = 17. Older versions / future ReplicaSet hash changes could shift this slightly, so 46 is the safe number to plan against, not the only valid one.
+
+Conclusion: a prefix ≤ 16 chars (including `lab-`) fits every name class with margin. The render-time guard below enforces the binding case explicitly so the failure point is `helm template`, not Kubernetes Pod admission an hour into a test run.
 
 ### 2.2 Render-time fail-loud guard
 
@@ -71,7 +91,7 @@ Equivalent guards are not needed on the other Job (`nats-init`) — its name is 
 
 The README knob row for `resourcePrefix` states:
 
-> Default `lab-`. Total rendered name + Pod suffix must stay under the K8s DNS-1123 64-char label limit. The collector Job is the binding case: a custom prefix combined with the harness-generated `collector-<tier>-<mode>-<profile>-<unix-ts>` Job base (up to 41 chars today) leaves ~16 chars for the prefix. `helm template` fails loud if you exceed this.
+> Default `lab-`. Pod names must fit the K8s 63-char DNS-1123 label limit. The collector Job is the binding case: a custom prefix combined with the harness-generated `collector-<tier>-<mode>-<profile>-<unix-ts>` Job base (up to 41 chars today) leaves ~16 chars for the prefix. `helm template` fails loud at render time if you exceed this. Deployments have a tighter raw budget (~46 chars after the ReplicaSet hash + Pod random suffix) but a more permissive headroom (32 chars) because their base names are short.
 
 ## 3. The `rrcs.name` helper
 
@@ -102,7 +122,7 @@ The helper is the only place the prefix concatenation lives. Templates, URL help
 | `chart/templates/connect-sink.yaml` | Deployment `connect-sink`, Service `connect-sink` |
 | `chart/templates/redis-central.yaml` | Deployment `redis-central`, Service `redis-central` |
 | `chart/templates/redis-region.yaml` | Deployment `redis-region`, Service `redis-region` |
-| `chart/templates/nats.yaml` | StatefulSet `nats`, Service `nats`, optional PVC base `nats-data` |
+| `chart/templates/nats.yaml` | Deployment `nats`, Service `nats`, optional PVC `nats-data` (only rendered when `nats.persistence.mode=pvc`, with its `volumes.persistentVolumeClaim.claimName` reference also routed through `rrcs.name`) |
 | `chart/templates/nats-config-cm.yaml` | ConfigMap `nats-config` |
 | `chart/templates/connect-configmaps.yaml` | ConfigMaps `connect-source-config`, `connect-sink-config` |
 | `chart/templates/nats-auth-secrets.yaml` | Three Secrets (via `rrcs.nats.credsSecret.*` — see §5) |
