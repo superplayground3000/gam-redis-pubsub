@@ -19,7 +19,7 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           command: ["/bin/sh", "-c"]
           args:
-            - until redis-cli -h redis-central ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
+            - HP="{{ include "rrcs.redis.central.hostPort" . }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
         - name: wait-connect-source
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.redis.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
@@ -31,7 +31,7 @@ spec:
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.writer.image) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.writer.pullPolicy) }}
           env:
-            - { name: REDIS_ADDR,    value: "redis-central:6379" }
+            - { name: REDIS_ADDR,    value: {{ include "rrcs.redis.central.hostPort" . | quote }} }
             - { name: STREAM_KEY,    value: "app.events" }
             - { name: INITIAL_RATE,  value: "0" }
             - { name: HEALTH_ADDR,   value: ":8081" }
