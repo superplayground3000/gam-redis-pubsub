@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strconv"
 	"strings"
 
 	"github.com/redis/go-redis/v9"
@@ -63,4 +64,20 @@ func (s *StreamClient) XRangeSinceID(ctx context.Context, key, lastID string, co
 		newLast = msgs[len(msgs)-1].ID
 	}
 	return msgs, newLast, nil
+}
+
+// HGetVer returns the stored version for a KV hash key, ok=false if the key/field is absent.
+func (s *StreamClient) HGetVer(ctx context.Context, key string) (int64, bool, error) {
+	v, err := s.rdb.HGet(ctx, key, "ver").Result()
+	if err == redis.Nil {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	n, perr := strconv.ParseInt(v, 10, 64)
+	if perr != nil {
+		return 0, false, perr
+	}
+	return n, true, nil
 }

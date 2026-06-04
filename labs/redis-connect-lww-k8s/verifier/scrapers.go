@@ -76,6 +76,66 @@ func PostRate(ctx context.Context, writerURL string, n int) error {
 	return nil
 }
 
+// decodeJSON decodes a JSON HTTP response body into v.
+func decodeJSON(resp *http.Response, v any) error { return json.NewDecoder(resp.Body).Decode(v) }
+
+// stringsReader wraps a string as an io.Reader (request body helper).
+func stringsReader(s string) io.Reader { return strings.NewReader(s) }
+
+// parseTrailingFloat returns the last whitespace-delimited token of a metric line as a float.
+func parseTrailingFloat(line string) float64 {
+	f := strings.Fields(line)
+	if len(f) == 0 {
+		return 0
+	}
+	v, _ := strconv.ParseFloat(f[len(f)-1], 64)
+	return v
+}
+
+// ScrapeLWW fetches connect-sink /metrics and returns applied, stale, duplicate counters.
+// Tolerates label order/spacing variations in the Prometheus text exposition.
+func ScrapeLWW(ctx context.Context, sinkURL string) (applied, stale, duplicate int64, err error) {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, sinkURL+"/metrics", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	for _, line := range strings.Split(string(body), "\n") {
+		if !strings.HasPrefix(line, "lww_apply") {
+			continue
+		}
+		val := parseTrailingFloat(line)
+		switch {
+		case strings.Contains(line, `result="applied"`):
+			applied = int64(val)
+		case strings.Contains(line, `result="stale"`):
+			stale = int64(val)
+		case strings.Contains(line, `result="duplicate"`):
+			duplicate = int64(val)
+		}
+	}
+	return applied, stale, duplicate, nil
+}
+
+// scrapeWriterSent reads the writer's total sent counter from /metrics.
+func scrapeWriterSent(ctx context.Context, writerURL string) int64 {
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, writerURL+"/metrics", nil)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "stress_writer_sent_total") {
+			return int64(parseTrailingFloat(line))
+		}
+	}
+	return 0
+}
+
 // PostReset zeros writer counters.
 func PostReset(ctx context.Context, writerURL string) error {
 	req, _ := http.NewRequestWithContext(ctx, "POST", writerURL+"/reset", nil)
