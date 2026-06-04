@@ -107,7 +107,7 @@ Expect the CAS to return <code>1 0 0 -1</code> (applied / stale / stale / duplic
 stored value to be the version-3 write.</p>
 <table><tr><th>arrival</th><th>v3</th><th>v1</th><th>v2</th><th>v3 (replay)</th><th>final ver</th><th>final val</th></tr>
 <tr class=${PA_CLS}><td>returns →</td><td>$(echo "$PROOFA_RESULT" | awk '{print $1}')</td><td>$(echo "$PROOFA_RESULT" | awk '{print $2}')</td><td>$(echo "$PROOFA_RESULT" | awk '{print $3}')</td><td>$(echo "$PROOFA_RESULT" | awk '{print $4}')</td><td>$(echo "$PROOFA_RESULT" | awk '{print $5}')</td><td>$(echo "$PROOFA_RESULT" | awk '{print $6}')</td></tr></table>
-<p>Expected: <code>1 &nbsp; 0 &nbsp; 0 &nbsp; -1 &nbsp; 3 &nbsp; v3</code>. The stale (lower-version) writes are rejected; the duplicate (equal-version) is rejected; version 3 wins regardless of arrival order.</p>
+<p><b>Pass criterion:</b> a correct fence returns <code>1 &nbsp; 0 &nbsp; 0 &nbsp; -1</code> and leaves <code>ver=3, val=v3</code> — rejecting the two lower-version (stale) writes and the equal-version (duplicate) replay so that the highest version would win irrespective of arrival order. The row above is the <i>observed</i> result; the overall banner reflects whether it matched.</p>
 
 <h2>Proof B — end-to-end under real reordering</h2>
 <p>Drive the writer through the full parallel pipeline (connect-source <code>max_in_flight=256</code>,
@@ -118,9 +118,9 @@ stored version is compared to the writer's source max.</p>
 $(printf '%s\n' "${ROWS[@]}")
 </table>
 <ul>
-<li><b>stale &gt; 0</b> is the proof: a strictly-older version arriving after a higher one was stored can only happen under genuine same-key reordering — and the fence rejected it.</li>
-<li><b>mismatches = 0</b>: despite the reordering, every key's final stored version equals the highest the writer ever sent. No stale write won.</li>
-<li>The verdict also asserts the §3.4.1 preconditions held (fresh per-run key namespace ⇒ empty store, single non-restarting writer, windowed counter deltas) so <code>stale&gt;0</code> is unambiguous.</li>
+<li><b>Why <code>stale &gt; 0</code> is required:</b> a strictly-older version can only arrive after a higher one was stored under genuine same-key reordering, so a non-zero <code>stale</code> count is what proves reordering was exercised and the fence rejected the loser. A run with <code>stale = 0</code> is ruled <i>inconclusive</i>, not a pass.</li>
+<li><b>Why <code>mismatches = 0</code> is required:</b> a pass demands that every key's final stored version equal the highest the writer sent — no stale write won. The per-rate table above carries the <i>observed</i> mismatch count; any non-zero value fails the verdict loudly.</li>
+<li>The verdict additionally requires the §3.4.1 preconditions (fresh per-run key namespace ⇒ empty store, single non-restarting writer, windowed counter deltas) so that <code>stale&gt;0</code> is unambiguous.</li>
 </ul>
 
 <h2>Conclusion</h2>
