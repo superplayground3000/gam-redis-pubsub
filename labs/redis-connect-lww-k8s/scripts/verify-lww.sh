@@ -27,14 +27,18 @@ RESOURCE_PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.res
 REGION_POD() { kubectl -n "${NS}" get pod -l app=redis-region -o jsonpath='{.items[0].metadata.name}'; }
 
 echo "[proofA] deterministic 3->1->2 + duplicate, direct to redis-region"
-LUA="$(cat chart/files/connect/lww_set.lua)"
-PROOFA="$(kubectl -n "${NS}" exec "$(REGION_POD)" -- sh -c '
-  S="'"$(printf '%s' "$LUA" | sed "s/'/'\\\\''/g")"'"
+# Deliver the Lua via `kubectl cp` + `redis-cli --eval` (reads the script from a
+# file) rather than string-escaping it into a nested `sh -c` — the script contains
+# single quotes and multiple lines, which shell-escaping mangles. `--eval FILE KEY ,
+# ARGV...` is the robust path: the comma separates the single key from the ARGV list.
+POD="$(REGION_POD)"
+kubectl -n "${NS}" cp chart/files/connect/lww_set.lua "${POD}:/tmp/lww_set.lua"
+PROOFA="$(kubectl -n "${NS}" exec "${POD}" -- sh -c '
   redis-cli DEL lwwproof:1 >/dev/null
-  a=$(redis-cli EVAL "$S" 1 lwwproof:1 v3 3)
-  b=$(redis-cli EVAL "$S" 1 lwwproof:1 v1 1)
-  c=$(redis-cli EVAL "$S" 1 lwwproof:1 v2 2)
-  d=$(redis-cli EVAL "$S" 1 lwwproof:1 v3 3)
+  a=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3)
+  b=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v1 1)
+  c=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v2 2)
+  d=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3)
   ver=$(redis-cli HGET lwwproof:1 ver); val=$(redis-cli HGET lwwproof:1 val)
   echo "$a $b $c $d $ver $val"
 ')"
