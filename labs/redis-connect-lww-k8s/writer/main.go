@@ -35,11 +35,12 @@ func main() {
 	lim := NewLimiter()
 	lim.Set(initialRate)
 	counters := &Counters{}
+	versions := NewVersions(workers)
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
 		w := &Worker{
-			ID: i, RDB: rdb,
+			ID: i, Workers: workers, RDB: rdb,
 			StreamKey:     streamKey,
 			StreamMaxLen:  int64(streamMaxLen),
 			PipelineDepth: pipelineDepth,
@@ -47,6 +48,7 @@ func main() {
 			KeySpaceSize:  int64(keySpaceSize),
 			Lim:           lim,
 			Counters:      counters,
+			Versions:      versions,
 		}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.Run(ctx) }()
@@ -54,6 +56,7 @@ func main() {
 
 	srv := &Server{
 		Lim: lim, Counters: counters, MaxRate: maxRate,
+		Versions: versions,
 		HealthCheck: func() bool {
 			c, cf := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cf()
