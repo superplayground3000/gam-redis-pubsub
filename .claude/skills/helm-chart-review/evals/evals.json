@@ -1,0 +1,23 @@
+{
+  "skill_name": "helm-chart-review",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "review the helm chart in labs/redis-redpanda-connect-stress-k8s and tell me whether the parameters are any good",
+      "expected_output": "Asks for purpose/target-env/config before analyzing; renders the chart with helm template; produces a prioritized, severity-rated per-parameter report grounded in the rendered manifests.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "I'm about to take this rrcs chart to a real production cluster. Go over values.yaml and flag anything that's wrong or risky for prod, with how to fix it.",
+      "expected_output": "Treats purpose as production (still confirms env/config briefly); renders with helm template; severity is judged relative to prod (e.g. emptyDir persistence, single replica, :dev image tags, throttling limits become High/Critical); gives concrete fixes and a priority summary.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "can you sanity check what this chart actually deploys and whether the resource requests and limits make sense?",
+      "expected_output": "Pauses to ask the deployment purpose/target environment before judging (resource sizing is purpose-relative); renders with helm template and lists the deployed workloads; assesses each component's requests/limits against the stated workload with concrete recommendations.",
+      "files": []
+    }
+  ]
+}
