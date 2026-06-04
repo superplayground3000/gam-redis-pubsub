@@ -35,6 +35,15 @@ func main() {
 	lim := NewLimiter()
 	lim.Set(initialRate)
 	counters := &Counters{}
+
+	// Single-owner-per-key invariant: worker i owns keys where keyID % workers == i.
+	// If the keyspace is smaller than the worker count, some workers would own zero
+	// keys and the ownership math has no safe assignment — refuse to run rather than
+	// let two workers share a key (which would silently break per-key version
+	// monotonicity, the reorder-proof precondition).
+	if keySpaceSize < workers {
+		log.Fatalf("KEY_SPACE_SIZE (%d) must be >= WORKERS (%d): single-owner-per-key requires at least one key per worker", keySpaceSize, workers)
+	}
 	versions := NewVersions(workers)
 
 	var wg sync.WaitGroup

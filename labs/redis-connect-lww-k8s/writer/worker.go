@@ -61,7 +61,13 @@ func (w *Worker) Run(ctx context.Context) {
 
 		epoch := w.Versions.Epoch()
 		if epoch == "" {
-			// No run started yet; nothing to number against. Idle briefly.
+			// No run started yet (no /reset received). Sleep before retrying so we
+			// don't hot-spin discarding granted tokens if a rate was set pre-reset.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
 			continue
 		}
 
