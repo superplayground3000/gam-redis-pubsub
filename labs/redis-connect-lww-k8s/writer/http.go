@@ -11,6 +11,7 @@ type Server struct {
 	Counters    *Counters
 	MaxRate     int
 	HealthCheck func() bool
+	Versions    *Versions
 }
 
 type rateReq struct {
@@ -22,6 +23,7 @@ func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", s.metrics)
 	mux.HandleFunc("/rate", s.rate)
 	mux.HandleFunc("/reset", s.reset)
+	mux.HandleFunc("/state", s.state)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -64,11 +66,30 @@ func (s *Server) rate(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "rate set to %d\n", rq.Rate)
 }
 
+type resetReq struct {
+	Epoch string `json:"epoch"`
+}
+
 func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "POST only", http.StatusMethodNotAllowed)
 		return
 	}
+	var rq resetReq
+	if err := json.NewDecoder(r.Body).Decode(&rq); err != nil {
+		http.Error(w, "bad json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if rq.Epoch == "" {
+		http.Error(w, "epoch required", http.StatusBadRequest)
+		return
+	}
 	s.Counters.Reset()
-	fmt.Fprintln(w, "counters reset")
+	s.Versions.SetEpoch(rq.Epoch)
+	fmt.Fprintf(w, "reset; epoch=%s\n", rq.Epoch)
+}
+
+func (s *Server) state(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(s.Versions.State())
 }
