@@ -60,6 +60,11 @@ func main() {
 	if err != nil {
 		log.Fatalf("state0: %v", err)
 	}
+	// The writer must have ADOPTED our epoch — otherwise a silent no-op reset
+	// would let us certify a verdict for the wrong key namespace.
+	if st0.Epoch != epoch {
+		log.Fatalf("writer did not adopt epoch %q (reports %q): reset was a no-op?", epoch, st0.Epoch)
+	}
 	boot0 := st0.BootID
 
 	// 2. Empty-store precondition (region must have no ver for the epoch's keys).
@@ -72,28 +77,35 @@ func main() {
 	_ = PostRate(ctx, *writerURL, *rate/2)
 	sleep(ctx, *warmup)
 
-	// 4. Baseline counters at sustain start.
+	// 4. Baseline the cumulative sink counters at SUSTAIN START (after warmup). The
+	// connect-sink counters are cumulative since the pod started, so all proof
+	// signals are deltas against this baseline. A failed baseline scrape would make
+	// the deltas garbage (full lifetime counters), so it is a hard precondition fail.
 	a0, s0, d0, err := ScrapeLWW(ctx, *connectSink)
 	if err != nil {
-		log.Printf("WARN baseline scrape: %v", err)
+		log.Fatalf("baseline scrape (connect-sink /metrics): %v", err)
 	}
-	sentBase := scrapeWriterSent(ctx, *writerURL)
 
-	// 5. Sustain at full rate, sampling throughput each second.
+	// 5. Sustain at full rate, sampling throughput each second. lastSent is seeded
+	// from a FRESH scrape at the start of each window (not a shared closure var) so
+	// the extend-once call doesn't divide a whole window's cumulative delta by ~1s.
 	_ = PostRate(ctx, *writerURL, *rate)
 	runStale := func(window time.Duration) (int64, int64, int64, float64) {
 		end := time.Now().Add(window)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
-		var lastSent int64 = sentBase
-		var lastAt = time.Now()
+		lastSent, _ := scrapeWriterSent(ctx, *writerURL)
+		lastAt := time.Now()
 		var sumRate, n float64
 		for time.Now().Before(end) {
 			select {
 			case <-ctx.Done():
 				return 0, 0, 0, 0
 			case <-ticker.C:
-				sent := scrapeWriterSent(ctx, *writerURL)
+				sent, ok := scrapeWriterSent(ctx, *writerURL)
+				if !ok {
+					continue // skip this sample; don't corrupt lastSent with a 0
+				}
 				dt := time.Since(lastAt).Seconds()
 				if dt > 0 && sent >= lastSent {
 					sumRate += float64(sent-lastSent) / dt
@@ -102,7 +114,10 @@ func main() {
 				lastSent, lastAt = sent, time.Now()
 			}
 		}
-		a, s, d, _ := ScrapeLWW(ctx, *connectSink)
+		a, s, d, serr := ScrapeLWW(ctx, *connectSink)
+		if serr != nil {
+			log.Printf("WARN end-of-window scrape: %v", serr)
+		}
 		rateAvg := 0.0
 		if n > 0 {
 			rateAvg = sumRate / n
@@ -112,13 +127,14 @@ func main() {
 	applied, stale, duplicate, rateAvg := runStale(*duration)
 
 	// 6. Drain + quiescence so all in-flight messages settle before we compare.
+	// quiesceOK tracks whether the pipeline actually drained; a timeout makes the
+	// comparison premature, so it fails the verdict (see ComputeLWWVerdict).
 	_ = PostRate(ctx, *writerURL, 0)
 	sleep(ctx, *drain)
-	waitForPipelineQuiescence(ctx, "lww", centralC, *natsURL, *natsStream, 10*time.Second)
+	quiesceOK := !waitForPipelineQuiescence(ctx, "lww", centralC, *natsURL, *natsStream, 10*time.Second)
 	sleep(ctx, 1500*time.Millisecond)
 
-	// 6b. If no reordering was observed, extend once (still pre-quiescence semantics:
-	// re-open traffic briefly) before declaring inconclusive.
+	// 6b. If no reordering was observed, extend once before declaring inconclusive.
 	if stale == 0 && *extendOnce {
 		log.Printf("stale==0 after first window; extending once")
 		_ = PostRate(ctx, *writerURL, *rate)
@@ -129,7 +145,7 @@ func main() {
 		}
 		_ = PostRate(ctx, *writerURL, 0)
 		sleep(ctx, *drain)
-		waitForPipelineQuiescence(ctx, "lww", centralC, *natsURL, *natsStream, 10*time.Second)
+		quiesceOK = !waitForPipelineQuiescence(ctx, "lww", centralC, *natsURL, *natsStream, 10*time.Second)
 		sleep(ctx, 1500*time.Millisecond)
 	}
 
@@ -137,6 +153,9 @@ func main() {
 	stFinal, err := FetchState(ctx, *writerURL)
 	if err != nil {
 		log.Fatalf("stateFinal: %v", err)
+	}
+	if stFinal.Epoch != epoch {
+		log.Fatalf("writer epoch changed mid-run to %q (expected %q)", stFinal.Epoch, epoch)
 	}
 	bootOK := stFinal.BootID == boot0
 
@@ -155,7 +174,7 @@ func main() {
 		Epoch: epoch, KeysChecked: checked, Mismatches: mismatches, Regressions: regressions,
 		Applied: applied, Stale: stale, Duplicate: duplicate,
 		WritesPerKeyAvg: wpk, RateTarget: *rate, RateAchievedAvg: rateAvg,
-		BootOK: bootOK, StoreEmptyAtStart: storeEmpty,
+		BootOK: bootOK, StoreEmptyAtStart: storeEmpty, QuiescenceOK: quiesceOK,
 	}
 	emit(res)
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // State mirrors the writer's GET /state response.
@@ -29,6 +30,7 @@ type LWWResult struct {
 	RateAchievedAvg   float64 `json:"rate_achieved_avg"`
 	BootOK            bool    `json:"boot_ok"`
 	StoreEmptyAtStart bool    `json:"store_empty_at_start"`
+	QuiescenceOK      bool    `json:"quiescence_ok"`
 }
 
 type LWWVerdict struct {
@@ -45,6 +47,8 @@ func ComputeLWWVerdict(r LWWResult) LWWVerdict {
 		return LWWVerdict{false, "precondition violated: region not empty for run epoch at start"}
 	case !r.BootOK:
 		return LWWVerdict{false, "precondition violated: writer restarted mid-run (boot_id changed)"}
+	case !r.QuiescenceOK:
+		return LWWVerdict{false, "pipeline did not quiesce before comparison; result is premature (raise the quiescence timeout or lower the rate)"}
 	case r.Regressions > 0:
 		return LWWVerdict{false, fmt.Sprintf("IMPOSSIBLE: %d keys have region_ver > source_ver (fence bug)", r.Regressions)}
 	case r.Mismatches > 0:
@@ -61,8 +65,10 @@ func ComputeLWWVerdict(r LWWResult) LWWVerdict {
 // FetchState GETs the writer /state.
 func FetchState(ctx context.Context, writerURL string) (State, error) {
 	var st State
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, writerURL+"/state", nil)
-	resp, err := http.DefaultClient.Do(req)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(cctx, http.MethodGet, writerURL+"/state", nil)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return st, err
 	}
@@ -76,8 +82,11 @@ func FetchState(ctx context.Context, writerURL string) (State, error) {
 // PostResetEpoch POSTs /reset {"epoch":...}.
 func PostResetEpoch(ctx context.Context, writerURL, epoch string) error {
 	body := fmt.Sprintf(`{"epoch":%q}`, epoch)
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, writerURL+"/reset", stringsReader(body))
-	resp, err := http.DefaultClient.Do(req)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(cctx, http.MethodPost, writerURL+"/reset", stringsReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -92,7 +101,9 @@ func PostResetEpoch(ctx context.Context, writerURL, epoch string) error {
 // mismatches (region != source max) and regressions (region > source max).
 func CompareVersions(ctx context.Context, region *StreamClient, st State) (checked, mismatches, regressions int, err error) {
 	for key, srcMax := range st.Keys {
-		regionVer, ok, e := region.HGetVer(ctx, key)
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		regionVer, ok, e := region.HGetVer(cctx, key)
+		cancel()
 		if e != nil {
 			return checked, mismatches, regressions, e
 		}
@@ -114,7 +125,10 @@ func CompareVersions(ctx context.Context, region *StreamClient, st State) (check
 func StoreEmptyForEpoch(ctx context.Context, region *StreamClient, epoch string, n int) (bool, error) {
 	for i := 0; i < n; i++ {
 		key := fmt.Sprintf("lww:%s:%d", epoch, i)
-		if _, ok, err := region.HGetVer(ctx, key); err != nil {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		_, ok, err := region.HGetVer(cctx, key)
+		cancel()
+		if err != nil {
 			return false, err
 		} else if ok {
 			return false, nil

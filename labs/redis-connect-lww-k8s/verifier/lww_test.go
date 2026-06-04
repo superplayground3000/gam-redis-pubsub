@@ -7,10 +7,17 @@ func TestLWWVerdictPassRequiresAllConditions(t *testing.T) {
 		KeysChecked: 1000, Mismatches: 0, Regressions: 0,
 		Applied: 50000, Stale: 1200, Duplicate: 30,
 		RateAchievedAvg: 4800, RateTarget: 5000,
-		BootOK: true, StoreEmptyAtStart: true,
+		BootOK: true, StoreEmptyAtStart: true, QuiescenceOK: true,
 	}
 	if v := ComputeLWWVerdict(base); !v.Pass {
 		t.Fatalf("expected pass, got %+v", v)
+	}
+
+	// pipeline did not quiesce → comparison premature → fail
+	noq := base
+	noq.QuiescenceOK = false
+	if v := ComputeLWWVerdict(noq); v.Pass {
+		t.Fatal("quiescence_ok=false must fail (premature comparison)")
 	}
 
 	// stale==0 → inconclusive (no reordering exercised)
@@ -52,7 +59,7 @@ func TestLWWVerdictPassRequiresAllConditions(t *testing.T) {
 func TestLWWVerdictReasonIsSpecific(t *testing.T) {
 	r := LWWResult{KeysChecked: 10, Mismatches: 0, Regressions: 0,
 		Applied: 10, Stale: 0, Duplicate: 0, RateAchievedAvg: 100,
-		BootOK: true, StoreEmptyAtStart: true}
+		BootOK: true, StoreEmptyAtStart: true, QuiescenceOK: true}
 	v := ComputeLWWVerdict(r)
 	if v.Pass || v.Reason == "" {
 		t.Fatalf("want fail with reason, got %+v", v)

@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 2 * time.Second}
+var httpClient = &http.Client{Timeout: 5 * time.Second}
 
 // scrapePromMetrics fetches a Prometheus text-format endpoint and returns
 // a flat map of metric name -> first sample value seen. Histograms/summaries
@@ -92,18 +92,31 @@ func parseTrailingFloat(line string) float64 {
 	return v
 }
 
-// ScrapeLWW fetches connect-sink /metrics and returns applied, stale, duplicate counters.
-// Tolerates label order/spacing variations in the Prometheus text exposition.
+// ScrapeLWW fetches connect-sink /metrics and returns the applied/stale/duplicate
+// counters. It matches ONLY the counter value series (`lww_apply{...}` or
+// `lww_apply_total{...}`) and explicitly skips the OpenMetrics `lww_apply_created`
+// timestamp series — a `_created` line carries a huge unix-seconds float and, if
+// matched, would clobber the stale counter and manufacture a false `stale > 0`
+// (a false PASS). Returns an error on a failed/non-200 scrape so the caller can
+// treat a missing baseline as a hard precondition failure rather than a silent 0.
 func ScrapeLWW(ctx context.Context, sinkURL string) (applied, stale, duplicate int64, err error) {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, sinkURL+"/metrics", nil)
-	resp, err := http.DefaultClient.Do(req)
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(cctx, http.MethodGet, sinkURL+"/metrics", nil)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return 0, 0, 0, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	for _, line := range strings.Split(string(body), "\n") {
-		if !strings.HasPrefix(line, "lww_apply") {
+	if resp.StatusCode != http.StatusOK {
+		return 0, 0, 0, fmt.Errorf("scrape %s/metrics: HTTP %d", sinkURL, resp.StatusCode)
+	}
+	scn := bufio.NewScanner(resp.Body)
+	scn.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scn.Scan() {
+		line := strings.TrimSpace(scn.Text())
+		// Value series only; excludes `lww_apply_created{...}` (neither prefix matches it).
+		if !strings.HasPrefix(line, "lww_apply{") && !strings.HasPrefix(line, "lww_apply_total{") {
 			continue
 		}
 		val := parseTrailingFloat(line)
@@ -116,36 +129,36 @@ func ScrapeLWW(ctx context.Context, sinkURL string) (applied, stale, duplicate i
 			duplicate = int64(val)
 		}
 	}
+	if err := scn.Err(); err != nil {
+		return 0, 0, 0, err
+	}
+	// A fresh sink with no traffic yet legitimately has no lww_apply series → (0,0,0,nil).
 	return applied, stale, duplicate, nil
 }
 
-// scrapeWriterSent reads the writer's total sent counter from /metrics.
-func scrapeWriterSent(ctx context.Context, writerURL string) int64 {
-	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, writerURL+"/metrics", nil)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		return 0
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	for _, line := range strings.Split(string(body), "\n") {
-		if strings.HasPrefix(line, "stress_writer_sent_total") {
-			return int64(parseTrailingFloat(line))
-		}
-	}
-	return 0
-}
-
-// PostReset zeros writer counters.
-func PostReset(ctx context.Context, writerURL string) error {
-	req, _ := http.NewRequestWithContext(ctx, "POST", writerURL+"/reset", nil)
+// scrapeWriterSent reads the writer's total sent counter from /metrics. The bool
+// is false on any scrape failure so the caller can skip the sample rather than
+// treat a transient error as a counter of 0 (which would inflate the next delta).
+func scrapeWriterSent(ctx context.Context, writerURL string) (int64, bool) {
+	cctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(cctx, http.MethodGet, writerURL+"/metrics", nil)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return err
+		return 0, false
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return fmt.Errorf("reset: %s", resp.Status)
+	if resp.StatusCode != http.StatusOK {
+		return 0, false
 	}
-	return nil
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, false
+	}
+	for _, line := range strings.Split(string(body), "\n") {
+		if strings.HasPrefix(line, "stress_writer_sent_total ") {
+			return int64(parseTrailingFloat(line)), true
+		}
+	}
+	return 0, false
 }
