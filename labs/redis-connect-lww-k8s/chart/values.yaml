@@ -40,7 +40,7 @@ nats:
   external:
     enabled: false                # bundled (default) → chart deploys NATS + mints creds
     url: ""                       # required when enabled, e.g. "nats://nats.prod.example.com:4222"
-    monitorUrl: ""                # optional; "" → collector skips /jsz queries, harness skips chaos pre-flight
+    monitorUrl: ""                # optional; "" → verifier skips JetStream pending checks during quiescence
     auth:
       publisherSecret: ""         # pre-created Secret name, key: user.creds
       subscriberSecret: ""

@@ -83,5 +83,5 @@ spec:
               mountPath: /etc/nats-creds/admin
               readOnly: true
           resources:
-            {{- toYaml .Values.resources.collector | nindent 12 }}
+            {{- toYaml .Values.resources.verifier | nindent 12 }}
 {{- end }}

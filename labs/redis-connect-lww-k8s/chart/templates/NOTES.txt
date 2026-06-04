@@ -1,10 +1,15 @@
-redis-redpanda-connect-stress (Kubernetes fork) installed in namespace {{ .Release.Namespace }}.
+redis-connect-lww-k8s (last-write-wins) installed in namespace {{ .Release.Namespace }}.
 
-Active QoS profile: {{ .Values.profile }}
-NATS persistence : {{ .Values.nats.persistence.mode }}
+Active profile    : {{ .Values.profile }}   (last-write-wins CAS fence at connect-sink)
+NATS persistence  : {{ .Values.nats.persistence.mode }}
+Writer keyspace   : {{ .Values.writer.env.KEY_SPACE_SIZE }}   (small on purpose — forces same-key reordering)
 
-Run the stress matrix from the host:
-  bash scripts/stress-run.sh --tiers=10 --modes=throughput --profile={{ .Values.profile }}
+Verify the fence + measure throughput from the host:
+  scripts/verify-lww.sh                      # Proof A (deterministic) + Proof B (end-to-end)
+  RATE=20000 DURATION_S=30 scripts/verify-lww.sh   # push toward the single-instance ceiling
+
+Watch it live:
+  scripts/dashboard-forward.sh               # binds 0.0.0.0; open http://<host>:8080
 
 Tear down:
   helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
