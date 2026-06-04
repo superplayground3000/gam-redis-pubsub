@@ -1,0 +1,48 @@
+{{- if .Values.collector.run }}
+{{- $base := .Values.collector.jobName | default (printf "collector-%v-%s-%s" .Values.collector.tier .Values.collector.mode .Values.profile) -}}
+{{- $name := include "rrcs.name" (dict "root" $ "base" $base) -}}
+{{- if gt (len $name) 57 -}}
+{{- fail (printf "collector Job name %q (%d chars) exceeds the 57-char budget (63 DNS-1123 limit minus the 6-char Pod random suffix). Shorten resourcePrefix (currently %q) or collector.jobName." $name (len $name) .Values.resourcePrefix) -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels: { app: collector }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: collector }
+    spec:
+      restartPolicy: Never
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      containers:
+        - name: collector
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.collector.image) }}
+          imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.collector.pullPolicy) }}
+          args:
+            - --tier={{ .Values.collector.tier }}
+            - --mode={{ .Values.collector.mode }}
+            - --profile={{ .Values.profile }}
+            - --duration={{ .Values.collector.durationS }}s
+            - --warmup={{ .Values.collector.warmupS }}s
+            - --drain={{ .Values.collector.drainS }}s
+            - --out=-
+            - --slo-rate-pct={{ .Values.collector.sloRatePct }}
+            - --slo-p99-ms={{ .Values.collector.sloP99Ms }}
+            - --slo-allow-missing={{ .Values.collector.sloAllowMissing }}
+            - --writer=http://{{ include "rrcs.name" (dict "root" $ "base" "writer") }}:8081
+            - --nats-stream={{ .Values.nats.stream.name }}
+            - --nats={{ include "rrcs.nats.monitorUrl" . }}
+            - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
+            - --redis-region={{ include "rrcs.redis.region.hostPort" . }}
+            {{- if eq .Values.collector.mode "chaos" }}
+            - --chaos-at-s={{ .Values.collector.chaosAtS }}
+            - --chaos-duration={{ .Values.collector.chaosDurationS }}
+            {{- end }}
+          resources:
+            {{- toYaml .Values.resources.collector | nindent 12 }}
+{{- end }}

@@ -1,0 +1,11 @@
+# kind / local overlay. Images for writer+collector are built locally and
+# side-loaded via `kind load docker-image`, so pin THOSE to Never (fail fast if
+# not loaded, never attempt a registry pull). Public images stay at the global
+# IfNotPresent so a fresh kind node can pull them.
+writer:
+  pullPolicy: Never
+collector:
+  pullPolicy: Never
+nats:
+  persistence:
+    mode: emptyDir

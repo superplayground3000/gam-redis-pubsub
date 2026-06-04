@@ -1,0 +1,146 @@
+# Active QoS profile: alo | amo | eoe. Selects which connect config pair is mounted.
+profile: alo
+
+# Prefix that the rrcs.name helper prepends to every chart-rendered
+# Kubernetes resource name (this chart renders: Deployments, Services,
+# ConfigMaps, Secrets, Jobs, and one optional PVC). Empty string
+# disables prefixing for back-compat with any existing values overrides
+# that reference the unprefixed names.
+#
+# Length budget: see docs/superpowers/specs/2026-06-03-rrcs-k8s-resource-name-prefix-design.md §2.1.
+# Binding case is the harness-generated collector Job
+# (collector-<tier>-<mode>-<profile>-<unix-ts>, up to 41 chars): default
+# "lab-" leaves ~16 chars of headroom for any custom prefix. The
+# collector-Job template fails loud at render time if you exceed this.
+resourcePrefix: "lab-"
+
+# The chart does NOT template a Namespace (design fix #3). Install with:
+#   helm install rrcs ./chart -n rrcs-k8s --create-namespace
+
+images:
+  registry: ""              # prepended to every image ref. "" => use ref as-is.
+  pullPolicy: IfNotPresent  # global default; public images need this on kind.
+  pullSecrets: []           # list of { name: <secret-name> }
+
+redis:
+  image: redis:7.4-alpine          # used only in bundled mode
+  central:
+    external:
+      enabled: false
+      url: ""                      # required when enabled, e.g. "redis://redis.prod:6379"
+      authSecret: ""               # RESERVED — v1 does NOT consume it (see spec §2 non-goals)
+  region:
+    external:
+      enabled: false
+      url: ""
+      authSecret: ""               # RESERVED — v1 does NOT consume it
+
+nats:
+  external:
+    enabled: false                # bundled (default) → chart deploys NATS + mints creds
+    url: ""                       # required when enabled, e.g. "nats://nats.prod.example.com:4222"
+    monitorUrl: ""                # optional; "" → collector skips /jsz queries, harness skips chaos pre-flight
+    auth:
+      publisherSecret: ""         # pre-created Secret name, key: user.creds
+      subscriberSecret: ""
+      adminSecret: ""             # optional; "" → harness purge is skipped with warning
+  # ── bundled-mode config below; ignored when external.enabled=true ──
+  image: nats:2.10-alpine
+  clientPort: 4222
+  monitorPort: 8222
+  stream:
+    name: APP_EVENTS
+    # Single source of truth for the NATS subject namespace. The stream binds
+    # to "<subjectPrefix>.>" and connect-source publishes to
+    # "<subjectPrefix>.${! meta(\"pattern\") }". The publisher user JWT minted
+    # by scripts/gen-nats-auth.sh also grants --allow-pub on "<subjectPrefix>.>".
+    #
+    # Changing this after first install:
+    #   1. scripts/gen-nats-auth.sh --force         # rotates publisher creds
+    #                                               # (the JWT pins the old prefix)
+    #   2. helm upgrade rrcs ./chart ...            # init Job re-runs (its name is
+    #                                               # hash-derived from .Values.nats.stream)
+    #                                               # and reconciles the stream's
+    #                                               # bound subjects via
+    #                                               # `nats stream edit --subjects=...`
+    #   3. kubectl rollout restart \                # ConfigMaps update but Connect
+    #        deployment/connect-source \            # pods do not auto-reload; bounce
+    #        deployment/connect-sink                # them so the new subject is in use
+    # Bundled mode automates step 2 via the init Job; external mode requires
+    # the operator to reconcile the stream out-of-band.
+    subjectPrefix: "app.events"
+    consumer:
+      durable: "region-writer"
+    maxAge: "1h"
+    maxBytes: "256MB"
+    maxMsgSize: "1MB"
+    dupeWindow: "5m"
+  persistence:
+    mode: emptyDir
+    size: 4Gi
+    storageClassName: ""
+  auth:                            # bundled-mode rendered creds Secrets + in-pod mount paths
+    secrets:
+      publisher: publisher-creds
+      subscriber: subscriber-creds
+      admin: admin-creds
+    creds:
+      publisher: /etc/nats-creds/publisher/user.creds
+      subscriber: /etc/nats-creds/subscriber/user.creds
+      admin: /etc/nats-creds/admin/user.creds
+
+natsBox:
+  image: natsio/nats-box:0.14.5
+
+connect:
+  image: hpdevelop/connect:4.92.0-claudefix
+
+writer:
+  image: redis-rrcs/writer:dev
+  pullPolicy: ""            # "" => inherit images.pullPolicy
+  env:
+    STREAM_MAXLEN: "100000"
+    WORKERS: "8"
+    PIPELINE_DEPTH: "50"
+    KEY_SPACE_SIZE: "100000"
+    PAYLOAD_BYTES: "200"
+    MAX_RATE: "20000"
+
+collector:
+  image: redis-rrcs/collector:dev
+  pullPolicy: ""            # "" => inherit images.pullPolicy
+  # The harness sets the fields below per-run via `helm template -s ... --set`.
+  run: false               # gate: only the harness renders the collector Job
+  jobName: ""              # unique per-run name; defaults to a derived name if empty
+  tier: 0
+  mode: throughput
+  durationS: 30
+  warmupS: 5
+  drainS: 10
+  sloRatePct: "0.95"
+  sloP99Ms: "1000"
+  sloAllowMissing: false
+  chaosAtS: 0
+  chaosDurationS: 8
+
+scheduling:
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+resources:
+  redis:
+    requests: { cpu: 250m, memory: 128Mi }
+    limits:   { cpu: "2",  memory: 512Mi }
+  nats:
+    requests: { cpu: 250m, memory: 256Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  connect:
+    requests: { cpu: 500m, memory: 256Mi }
+    limits:   { cpu: "2",  memory: 1Gi }
+  writer:
+    requests: { cpu: 250m, memory: 64Mi }
+    limits:   { cpu: "2",  memory: 256Mi }
+  collector:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 128Mi }
