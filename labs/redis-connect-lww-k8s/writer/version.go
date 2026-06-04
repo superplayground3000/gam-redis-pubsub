@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"sync"
 	"sync/atomic"
 )
@@ -62,6 +63,27 @@ func (v *Versions) Next(w int, key string) int64 {
 	n := s.m[key]
 	s.mu.Unlock()
 	return n
+}
+
+// NextForCurrent atomically derives the per-run key for keyID and its next version
+// from a SINGLE epoch snapshot. This is the hot-path API: deriving the key string
+// and incrementing its counter from the same epochState makes it impossible for a
+// concurrent SetEpoch to pair an old-epoch key with a new-epoch counter (or vice
+// versa) — a mix that would otherwise pollute the new run's /state with an
+// old-epoch key and trip a false mismatch in the verifier. Returns ok=false if no
+// epoch is set yet. Worker w owns keyID; w selects the shard.
+func (v *Versions) NextForCurrent(w int, keyID int64) (key string, ver int64, ok bool) {
+	es := v.cur.Load()
+	if es == nil {
+		return "", 0, false
+	}
+	key = fmt.Sprintf("lww:%s:%d", es.name, keyID)
+	s := es.shards[w%v.nshards]
+	s.mu.Lock()
+	s.m[key]++
+	ver = s.m[key]
+	s.mu.Unlock()
+	return key, ver, true
 }
 
 // Epoch returns the active epoch name ("" before SetEpoch).

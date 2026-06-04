@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"time"
 
@@ -29,7 +28,10 @@ func (w *Worker) ownedKeyID(n int64) int64 {
 	stride := int64(w.Workers)
 	count := (w.KeySpaceSize - int64(w.ID) + stride - 1) / stride // # owned ids
 	if count <= 0 {
-		return int64(w.ID) % w.KeySpaceSize
+		// Unreachable: main.go guards KEY_SPACE_SIZE >= WORKERS, so every worker
+		// (ID < Workers <= KeySpaceSize) owns >= 1 id. Clamp defensively to avoid a
+		// divide-by-zero; the result (ID) is still in-stride and collision-free.
+		count = 1
 	}
 	return int64(w.ID) + (n%count)*stride
 }
@@ -59,8 +61,7 @@ func (w *Worker) Run(ctx context.Context) {
 			continue
 		}
 
-		epoch := w.Versions.Epoch()
-		if epoch == "" {
+		if w.Versions.Epoch() == "" {
 			// No run started yet (no /reset received). Sleep before retrying so we
 			// don't hot-spin discarding granted tokens if a rate was set pre-reset.
 			select {
@@ -73,11 +74,16 @@ func (w *Worker) Run(ctx context.Context) {
 
 		w.Counters.Inflight.Add(1)
 		pipe := w.RDB.Pipeline()
+		var n int
 		for i := 0; i < depth; i++ {
 			id := w.ownedKeyID(emitted)
+			// Derive key + version from ONE epoch snapshot so a concurrent /reset
+			// can't pair an old-epoch key with a new-epoch counter.
+			key, ver, ok := w.Versions.NextForCurrent(w.ID, id)
+			if !ok {
+				break // epoch cleared mid-batch (not expected); flush what we have
+			}
 			emitted++
-			key := fmt.Sprintf("lww:%s:%d", epoch, id)
-			ver := w.Versions.Next(w.ID, key)
 			p := NewPayload(ver, w.PayloadBytes)
 			body, _ := p.JSON()
 			pipe.XAdd(ctx, &redis.XAddArgs{
@@ -93,16 +99,21 @@ func (w *Worker) Run(ctx context.Context) {
 					"version":   ver,
 				},
 			})
+			n++
+		}
+		if n == 0 {
+			w.Counters.Inflight.Add(-1)
+			continue
 		}
 		_, err = pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
 		if err != nil {
-			w.Counters.Errors.Add(int64(depth))
+			w.Counters.Errors.Add(int64(n))
 			if ctx.Err() == nil {
 				log.Printf("worker %d: pipeline error: %v", w.ID, err)
 			}
 		} else {
-			w.Counters.Sent.Add(int64(depth))
+			w.Counters.Sent.Add(int64(n))
 		}
 	}
 }

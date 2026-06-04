@@ -1,10 +1,56 @@
 package main
 
 import (
+	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
+
+// TestNextForCurrentEpochSwapPurity races SetEpoch against NextForCurrent and
+// asserts the final epoch's /state contains ONLY final-epoch keys — i.e. a key
+// string and its counter are always derived from the same epoch snapshot, never
+// mixed across a reset boundary (the bug a two-load Epoch()+Next() would have).
+func TestNextForCurrentEpochSwapPurity(t *testing.T) {
+	v := NewVersions(4)
+	v.SetEpoch("e1")
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					v.NextForCurrent(w, int64(w))
+				}
+			}
+		}(w)
+	}
+	for i := 0; i < 200; i++ {
+		v.SetEpoch(fmt.Sprintf("e%d", i+2))
+	}
+	final := v.Epoch()
+	close(stop)
+	wg.Wait()
+
+	// Populate the final epoch deterministically, then assert state purity.
+	for w := 0; w < 4; w++ {
+		key, _, ok := v.NextForCurrent(w, int64(w))
+		if !ok || !strings.HasPrefix(key, "lww:"+final+":") {
+			t.Fatalf("NextForCurrent key=%q ok=%v for final epoch %q", key, ok, final)
+		}
+	}
+	for k := range v.State().Keys {
+		if !strings.HasPrefix(k, "lww:"+final+":") {
+			t.Fatalf("state has non-final-epoch key %q (final=%q)", k, final)
+		}
+	}
+}
 
 func TestVersionsMonotonicPerKeyWithinEpoch(t *testing.T) {
 	v := NewVersions(2) // 2 shards (workers)

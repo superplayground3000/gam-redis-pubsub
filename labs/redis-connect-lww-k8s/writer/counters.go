@@ -8,8 +8,11 @@ type Counters struct {
 	Inflight atomic.Int64
 }
 
+// Reset zeroes the measured totals. Inflight is a LIVE gauge of in-progress
+// pipelines owned solely by worker Add(+1)/Add(-1) pairs — zeroing it here would
+// let a concurrent in-flight batch's Add(-1) drive it negative, so it is left
+// untouched.
 func (c *Counters) Reset() {
 	c.Sent.Store(0)
 	c.Errors.Store(0)
-	c.Inflight.Store(0)
 }
