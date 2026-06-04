@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Renders the chart to plain YAML at out/manifests.yaml.
-# Usage: scripts/render.sh [--profile=alo] [--values=path] [extra helm args...]
+# Usage: scripts/render.sh [--profile=lww] [--values=path] [extra helm args...]
 # Env: RRCS_NS (default rrcs-k8s)
 set -euo pipefail
 
@@ -9,7 +9,7 @@ LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${LAB_DIR}"
 
 NS="${RRCS_NS:-rrcs-k8s}"
-PROFILE=""
+PROFILE="lww"
 VALUES=""
 EXTRA=()
 for arg in "$@"; do
