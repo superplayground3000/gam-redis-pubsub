@@ -1,122 +1,110 @@
-# RESEARCH — credential auth + external backend support
+# Redis → Connect Last-Write-Wins (Kubernetes) — RESEARCH
 
-This iteration adds production-shape NATS credential auth (operator → account
-→ user JWTs + .creds files) and independent bundled-vs-external toggles for
-NATS and each Redis. Two design decisions worth remembering:
+## Property demonstrated
 
-- **Permission narrowness.** Publisher and subscriber don't share admin
-  creds; each gets exactly the JetStream API subjects it needs (publisher:
-  `<subjectPrefix>.>` + read on `$JS.API.STREAM.INFO.<stream>`; subscriber:
-  ack on `$JS.ACK.<stream>.<durable>.>` + the four narrow CONSUMER subjects
-  scoped to its own durable + the same stream-info read). A compromised
-  source can't drain the stream; a compromised sink can't inspect other
-  consumers. This is the production pattern; lab demonstrates the format.
-  `<subjectPrefix>` defaults to `app.events` and is set via
-  `nats.stream.subjectPrefix` in `chart/values.yaml`; that single key feeds
-  the JetStream `--subjects` bind, the connect-source `publishSubject`, and
-  the publisher JWT's `--allow-pub` grant — so the three cannot drift.
-- **Two modes, one chart.** Bundled mode mints fixture creds at install
-  for kind/local use. External mode skips deploying NATS/Redis and consumes
-  user-supplied Secrets by name (production workflow: signing keys in Vault,
-  creds materialized into K8s Secrets via External Secrets / SealedSecrets).
-  Lab is a teaching artifact: bundled shows the FORMAT, external shows the
-  WORKFLOW.
-- **Resource-name prefix.** Every chart-rendered K8s resource (Deployments,
-  Services, ConfigMaps, Secrets, Jobs, the optional PVC) takes a configurable
-  prefix from `resourcePrefix` (default `lab-`). Single source of truth via
-  the `rrcs.name` helper means URL helpers, Secret-name helpers, and the
-  harness scripts all track the same value. External-mode user-supplied
-  names pass through unchanged.
+A stale change (lower version) can never overwrite a newer change at the Redis KV
+sink, regardless of arrival order across a parallel pipeline — and we measure the
+sustained applied-write throughput of a single-instance sink that relies on this
+fence instead of strict ordering.
 
----
+This lab is a Kubernetes/Helm fork of `../redis-redpanda-connect-stress-k8s`. The
+mechanism it verifies comes from `../../last-write-wins-lab/research.md` (the upstream
+design answer): a **last-write-wins compare-and-set (CAS) fence at the sink**.
 
-# RESEARCH — Kubernetes fork
+## Essentials (what is load-bearing)
 
-This lab forks the Docker Compose stress lab to a Kubernetes substrate without
-changing the pipeline or its measurement. Key substrate decisions:
+Pipeline: `writer → redis-central stream → connect-source → NATS JetStream →
+connect-sink → redis-region`. Same as the parent, with exactly one change in the data
+path: the sink's blind `SET` becomes a version-gated CAS.
 
-- **Compose `depends_on` → initContainers + readiness probes.** Ordering that
-  compose expressed declaratively becomes initContainer poll-loops (Redis ping,
-  `APP_EVENTS` existence) plus real readiness probes (`/ready`, `/healthz`,
-  `redis-cli ping`). The probes also make chaos recovery a true gate.
-- **Stream init is a plain Job, not a Helm hook.** A `post-install` hook would
-  deadlock against `helm --wait` (the Connect Deployments wait on the stream,
-  the hook runs after wait). A plain Job gated by an initContainer avoids the
-  circular wait.
-- **Report extraction via stdout sentinel.** There is no portable shared mount
-  in K8s (hostPath is non-portable), so the collector emits one compact
-  `RESULT_JSON:` line and the harness reads it from `kubectl logs`. The exit
-  code means "did it run", not "did it pass" — so an expected FAIL verdict
-  doesn't trip Job failure/retry.
-- **NATS persistence defaults to emptyDir.** Durability isn't load-bearing for a
-  stress lab; emptyDir keeps the chart runnable on a bare cluster with no
-  StorageClass. `pvc` mode is opt-in.
+- **Per-key monotonic version.** The writer owns each key with a single goroutine
+  (`keyID % workers == i`) and stamps a strictly-increasing `version`. No clock
+  dependence; no two writers ever touch the same key.
+- **The CAS fence (`chart/files/connect/lww_set.lua`).** A Redis Lua `EVAL` applied
+  at connect-sink: `HSET val/ver` only if the incoming version is strictly greater
+  than the stored one. Returns `1` applied / `0` stale (strictly older) / `-1`
+  duplicate (equal). Order-independent and idempotent by construction; Redis
+  serializes per key, so it is correct without any pipeline ordering guarantees.
+- **The relaxation is the point.** Because correctness lives at the sink, the sink
+  runs `pipeline.threads: 4` and the source publishes with `max_in_flight: 256` —
+  which *causes* same-key reordering. The lab proves the fence survives it.
 
----
+### Wire contract (enough to re-implement a client)
 
-(Original compose-lab research follows.)
+- Writer XADD fields on `app.events`: `value` (JSON body), `event_id`, `key`
+  (`lww:<epoch>:<id>`), `pattern`, `t_send_ms`, `version` (int).
+- connect-sink CAS call: `EVAL lww_set.lua 1 <key> <value> <version>`.
+- Sink metric: `lww_apply_total{result=applied|stale|duplicate}` at `:4195/metrics`.
+- Writer control plane: `POST /reset {"epoch":"<id>"}`, `GET /state` →
+  `{boot_id, epoch, keys{<key>:<maxVer>}, distinct_keys, total_versions}`,
+  `POST /rate {"rate":n}`, `GET /metrics`.
 
-# RESEARCH — redis-redpanda-connect-stress
+## How the proof is made unambiguous (spec §3.4.1)
 
-## What stress proves
+`stale > 0` only proves reordering-was-fenced under a precondition the verifier
+*asserts*, not assumes:
 
-This lab demonstrates two things about Redpanda Connect that the parent `redis-redpanda-qos-resilience` lab cannot:
+> the run's keys begin with no stored version, numbered by a single non-restarting
+> monotonic writer.
 
-1. **Connect sustains real throughput.** The parent lab runs at 1 msg/s — enough to observe QoS semantics in human time, but not enough to surface throughput, batching, or backpressure behavior. This lab pushes 10 / 1 000 / 10 000 msg/s and verifies the pipeline keeps up.
-2. **QoS guarantees hold under load.** The same chaos drill the parent uses (kill `connect-sink` for ~8 s) is run at every tier — including 10 k msg/s. At that rate, ~80 000 messages back up in JetStream during the outage. The lab verifies they all reach `region-events` after recovery (under ALO/EOE) within a bounded latency.
+Guards: a **fresh per-run epoch key namespace** (`lww:<epoch>:<id>`) so the store is
+provably empty for the run; a **writer `boot_id`** checked unchanged across the window
+(no mid-run restart); **windowed counter deltas** (baseline at sustain start) so a
+prior run / warmup / the deterministic Proof A cannot satisfy the signal; and the
+**3-way Lua** so equal-version duplicates (routine at-least-once redelivery) are
+counted separately and excluded from the proof. A no-op fence fails two independent
+ways (`stale==0` and, under reorder, `mismatches>0`).
 
-## Why a fork, not an extension
+## Validated result (kind, single instance)
 
-- The parent's WebSocket dashboard, per-key keyspace notifications, and last-value-per-key model all break at high throughput. Stripping them would gut the parent lab; forking lets each lab stay true to its purpose.
-- The parent runs unbounded; this lab caps Redis streams, JetStream bytes, and every container's CPU+memory so a stress run cannot stutter the host.
+`scripts/verify-lww.sh` on a local `kind` cluster:
 
-## Why a wide key space + monotonic seq
+- **Proof A** (deterministic): apply versions 3,1,2 then replay 3 to one key →
+  returns `1 0 0 -1`, final `ver=3 val=v3`. The fence works in isolation.
+- **Proof B** (end-to-end): drive the writer through the real parallel pipeline,
+  wait for quiescence, compare every key's region version to the writer's source max.
+  - @ 5,000 msg/s: `rate_achieved≈4999.96`, `stale=2726`, `mismatches=0`,
+    `regressions=0`, `writes_per_key≈5091`, **pass**.
+  - @ 20,000 msg/s (writer cap): `rate_achieved≈19999.6`, `stale=7014`,
+    `mismatches=0`, **pass**.
 
-At 10 k msg/s, the parent's 9-cycling-keys model results in ~1 111 writes/s per key — pure last-write-wins churn at Redis with no observability value. Wide key space (100 000 distinct keys) ensures no key is hammered; verification shifts from per-key last-value to **count match + sampled e2e latency**.
+**Throughput estimate:** a single connect-sink pod sustains **≥20,000 applied
+writes/s** with zero LWW violations (the writer's `MAX_RATE` cap, not an observed
+ceiling — the sink kept up with no backlog, so the true ceiling is higher). The
+non-zero `stale` count is the system working: thousands of strictly-older arrivals
+were reordered and fenced while the final per-key state stayed exactly correct.
 
-## Why live `POST /rate` instead of writer recreate
+## Design decisions
 
-Recreating the writer container between tiers takes ~5 s × 9 = ~45 s of wasted wall-clock per matrix run, and the reconnect storm can interfere with the previous tier's drain (which would corrupt counts). A live HTTP rate endpoint lets the harness flip targets in <100 ms with zero connection churn.
+- **Version token = per-key logical counter, single writer per key** (research's
+  "best" option) — clean integer compare, no clock skew, makes the reorder proof
+  deterministic.
+- **Single instance** — one pod per service; the parallelism (and thus reordering)
+  is intra-pod (`threads`/`max_in_flight`). Demonstrates the fence without HA noise.
+- **Small keyspace (32)** — same-key messages must land inside the pipeline's
+  in-flight windows to reorder; a large keyspace spaces them out and yields
+  inconclusive (`stale=0`) runs. Empirically tuned (see `chart/values.yaml`).
+- **Lua embedded at Helm render time** (`toJson`) rather than a mounted file —
+  single source of truth, no per-message file read. (The image's `redis` processor
+  has no `result_map`; the eval result is captured by a trailing `mapping`.)
 
-## Why a one-shot collector instead of a live dashboard
+### Rejected alternatives (from upstream research)
 
-Two reasons:
+- **NATS-side timestamp/discard** — JetStream discard is limit-triggered, never
+  "apply only if newer"; `DiscardNewPerSubject` is first-write-wins (the opposite).
+- **Source-side `now()` timestamp** — stamps processing time; redelivery/reclaim
+  makes a stale event look newer. The version must come from the source of truth.
 
-1. **Sampling rate**: at 10 k msg/s, a WebSocket-driven UI would either drop frames or flood the browser. The collector samples at 1 Hz — fast enough to catch backpressure, slow enough to never become the bottleneck.
-2. **Reproducibility**: post-run JSON reports are diffable and storable. A live dashboard is a moment in time; a JSON file is a permanent artifact.
+## Deliberately excluded
 
-## Why `MAXLEN ~` and `--max-bytes`
+- HA / multi-pod sink and Redis Cluster (single instance only here).
+- Chaos/crash-replay, the tier × mode × QoS matrix, latency SLOs (carried by the
+  parent lab; dropped to keep one concern).
+- Event-time / wall-clock LWW and its skew hazard (we use a logical counter).
+- Deletes / tombstones (keys are never deleted).
 
-A 30 s run at 10 k msg/s produces ~300 k messages × ~300 bytes = ~90 MB in Redis and ~120 MB in NATS. Across 9 runs that compounds. `XADD ... MAXLEN ~ 100000` and JetStream `--max-bytes=256MB` bound the storage so a runaway run can't fill the disk or push the host into swap.
+## Further reading
 
-## Verdict logic in one sentence
-
-A run passes iff: achieved rate ≥ `slo.rate_min_pct × target`, missing messages = 0 (unless profile = AMO), and (for latency/chaos modes) p99 latency ≤ tier SLO.
-
-## Pointers
-
-- Design spec: [`../../docs/superpowers/specs/2026-05-24-redis-redpanda-connect-stress-design.md`](../../docs/superpowers/specs/2026-05-24-redis-redpanda-connect-stress-design.md)
-- Implementation plan: [`../../docs/superpowers/plans/2026-05-24-redis-redpanda-connect-stress.md`](../../docs/superpowers/plans/2026-05-24-redis-redpanda-connect-stress.md)
-- Parent lab RESEARCH: [`../redis-redpanda-qos-resilience/RESEARCH.md`](../redis-redpanda-qos-resilience/RESEARCH.md)
-- Production architecture deep-dive that informed both labs: [`../../redis-redpanda-design-ptr/research.md`](../../redis-redpanda-design-ptr/research.md)
-- Redpanda Connect docs: <https://docs.redpanda.com/redpanda-connect/about/>
-- NATS JetStream concepts: <https://docs.nats.io/nats-concepts/jetstream>
-- HDR Histogram: <https://github.com/HdrHistogram/hdrhistogram-go>
-
-## v2 measurement-vs-pipeline distinction
-
-The first v1 full-matrix run on 2026-05-25 revealed that three of the lab's "failures" were measurement artifacts, not pipeline failures:
-
-1. **Latency P99 was polling-window-biased.** v1 sampled 200 messages/s from `XRANGE`; at 10 k msg/s that captured ~2 % of messages and the reported `now − ts_ns` was inflated by up to one polling window (~1 s). v2's streaming `XREAD BLOCK` consumer reads every message at line rate, so `latency_ms.p99` now reflects true e2e propagation.
-2. **`missing` confused MAXLEN trim with loss.** v1 computed `missing = sent − XLEN(region-events)`. The region stream has `MAXLEN ~ 100000`; at 10 k × 30 s, 200 k older entries were trimmed by design. v1 reported them as "missing" and failed the verdict. v2 sources `received` from the streaming consumer (untainted) and surfaces `trimmed` separately so operators can see the storage decision didn't lose messages.
-3. **NATS state survived across matrix runs.** v1 ran 9 tier×mode combinations against the same persistent `nats-data` volume; the 256 MB JetStream cap accumulated bytes until the 10 k chaos run aborted on the 200 MB pre-flight. v2's harness purges `APP_EVENTS` after every run so each tier starts hermetic.
-
-The pipeline under test (writer → connect-source → JetStream → connect-sink → region Redis) is byte-identical between v1 and v2. The only changes are in the measurement layer (collector) and the harness's between-run hygiene.
-
-### Why a streaming consumer (not just a bigger XRANGE)
-
-A poll that samples 1 000 messages/s instead of 200 would still miss 90 % of messages at 10 k msg/s, and its reported "latency" would still include polling-window bias. The streaming model is the only one that observes *every* message at arrival time, which is both the right metric and a side benefit: the same consumer that records latency also provides the trim-free `received` count.
-
-### Why profile-aware quiescence
-
-The amo-reverse leg uses an ephemeral, deliver-new, `ack_wait: 2s`, `auto_replay_nacks: false` consumer. `num_pending` is meaningless for that consumer (it's recreated each connect-sink restart and ignores backlog by design — that's how AMO loses messages). v2's pipeline-quiescence wait checks `XLEN(app.events) == 0` for all profiles plus `NATS num_pending == 0` only for ALO/EOE; AMO falls through to `slo.allow_missing=true` so any unconsumed backlog at end-of-run is accepted as the modeled loss.
+- `../../last-write-wins-lab/research.md` — the upstream mechanism design.
+- `../../docs/superpowers/specs/2026-06-04-redis-connect-lww-k8s-design.md` — this lab's spec (§3.4.1 precondition).
+- `../redis-redpanda-connect-stress-k8s/` — the parent stress lab this forks.

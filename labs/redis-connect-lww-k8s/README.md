@@ -1,117 +1,83 @@
-# Redis → Redpanda Connect Stress Lab (Kubernetes fork)
+# redis-connect-lww-k8s
 
-Kubernetes-native fork of `../redis-redpanda-connect-stress/`. Same pipeline
-(Redis → Redpanda Connect → NATS JetStream → Redpanda Connect → Redis), same
-tier × mode × QoS verdict matrix — packaged as a Helm chart and driven by a
-host `kubectl` harness.
+## What this demonstrates
 
-## Prerequisites
+A stale change (lower version) can never overwrite a newer change at the Redis KV
+sink, regardless of arrival order across a parallel pipeline — proven end-to-end on
+Kubernetes, plus the single-instance sustained applied-write throughput.
 
-`helm`, `kubectl`, `kind` (for local), `docker`, `go`, `python3`. A reachable
-cluster context (`kubectl config current-context`).
+Kubernetes/Helm fork of `../redis-redpanda-connect-stress-k8s`. The only data-path
+change is at the sink: a blind `SET` becomes a version-gated **last-write-wins
+compare-and-set** (a Redis Lua `EVAL`). The sink deliberately runs parallel
+(`threads: 4`, source `max_in_flight: 256`) so same-key messages reorder — and the
+fence makes the final per-key state correct anyway. Mechanism is from
+`../../last-write-wins-lab/research.md`.
 
-## Authentication
-
-The chart runs in two modes (independently per backend):
-
-- **Bundled mode (default).** The chart deploys NATS + Redis and mints
-  credential auth at install time from lab-fixture JWTs under
-  `chart/files/nats-auth/`. Run `scripts/gen-nats-auth.sh` once on a fresh
-  checkout if those fixtures are missing.
-- **External mode.** Point the chart at your own NATS/Redis. Pre-create
-  K8s Secrets containing user .creds files; reference them in
-  `values-external.yaml`. The chart never mints, never touches your
-  stream. See `values-external.yaml.example` for the full shape and the
-  exact NATS permissions you must grant.
-
-## Running against external NATS + Redis
+## Run it (kind)
 
 ```bash
-# user pre-creates Secrets in their cluster (NOT done by the chart)
-kubectl create secret generic prod-publisher-creds  --from-file=user.creds=publisher.creds  -n rrcs-k8s
-kubectl create secret generic prod-subscriber-creds --from-file=user.creds=subscriber.creds -n rrcs-k8s
-kubectl create secret generic prod-admin-creds      --from-file=user.creds=admin.creds      -n rrcs-k8s   # optional
-
-cp values-external.yaml.example values-prod.yaml     # edit URLs + secret names
-helm install rrcs ./chart -n rrcs-k8s --create-namespace -f values-prod.yaml
-RRCS_VALUES=values-prod.yaml scripts/stress-run.sh --tiers=10 --modes=throughput
+# (NATS auth fixtures are committed under chart/files/nats-auth/; regenerate only
+#  on a fresh checkout if missing: scripts/gen-nats-auth.sh)
+kind create cluster --name lww
+scripts/build-images.sh --kind --kind-name=lww     # build writer/verifier/dashboard, load into kind
+scripts/verify-lww.sh                              # Proof A + Proof B; prints throughput + verdict
 ```
 
-## Quick start (kind / local)
+Tune the run with env vars: `RATE=20000 DURATION_S=30 scripts/verify-lww.sh`
+(defaults: RATE=5000, DURATION_S=30, WARMUP_S=5, DRAIN_S=10 — see `scripts/lib/run-defaults.sh`).
+
+Watch it live in a browser:
 
 ```bash
-scripts/gen-nats-auth.sh                    # once, for fresh checkouts
-# 1. Create a local cluster
-kind create cluster --name rrcs
-
-# 2. Build the writer + collector images and side-load them into kind
-scripts/build-images.sh --kind --kind-name=rrcs
-
-# 3. Run a small matrix (boots the chart, runs, tears down on no-arg full run)
-scripts/stress-run.sh --tiers=10 --modes=throughput --profile=alo
+scripts/dashboard-forward.sh        # binds --address 0.0.0.0; prints LAN URLs
+# open http://<host>:8080  → live key/version/value stream + applied/stale-fenced/duplicate counters
 ```
 
-`stress-run.sh` installs the chart with `chart/values-dev.yaml` (writer/collector
-`pullPolicy: Never`, NATS on `emptyDir`), runs each tier × mode cell as a
-collector Job, extracts the verdict JSON into `reports/`, and prints a summary.
+## Expected output
 
-## Portable / remote cluster
+`verify-lww.sh` exits 0 only when both proofs pass:
 
-```bash
-# Build, retag, and push to your registry
-scripts/build-images.sh --registry=corp.example.com/team --push
-# Optionally redirect base images to a mirror (airgapped)
-scripts/build-images.sh --base-registry=corp.example.com/mirror/ --registry=corp.example.com/team --push
-
-# Install with your registry prefix and default (portable) values
-helm install rrcs ./chart -n rrcs-k8s --create-namespace \
-  --set images.registry=corp.example.com/team/
-
-# Then run against that namespace
-RRCS_VALUES=chart/values.yaml scripts/stress-run.sh --tiers=10 --modes=throughput
+```
+[proofA] results (want: 1 0 0 -1 3 v3): 1 0 0 -1 3 v3
+[proofA] PASS
+[proofB] {"lww":{"keys_checked":32,"mismatches":0,"regressions":0,"applied":147296,
+          "stale":2726,"duplicate":0,"writes_per_key_avg":5090.6,"rate_target":5000,
+          "rate_achieved_avg":4999.96,"boot_ok":true,"store_empty_at_start":true,
+          "quiescence_ok":true},"verdict":{"pass":true}}
+[verify-lww] PASS — both proofs green
 ```
 
-## Plain YAML (no Helm in-cluster)
+- **Proof A** is the deterministic mechanism test (apply versions 3,1,2 + replay 3 to
+  one key, direct to redis-region): `1 0 0 -1`, final `ver=3 val=v3`.
+- **Proof B** is end-to-end: `stale > 0` proves same-key reordering was actually
+  exercised *and* fenced; `mismatches == 0` proves the final state is exactly correct
+  despite it. Measured single instance: **~5,000 msg/s** at the default rate and
+  **~20,000 msg/s** at the writer's cap — both with `mismatches=0` and thousands of
+  stale writes correctly rejected. The sink kept up with no backlog, so the true
+  ceiling is higher than 20k.
 
-```bash
-scripts/render.sh --profile=alo            # writes out/manifests.yaml
-kubectl create namespace rrcs-k8s
-kubectl apply -n rrcs-k8s -f out/manifests.yaml
-```
+If a run prints `verdict.pass=false reason="inconclusive — no strictly-older arrival
+observed"`, the keyspace was too large to force reordering for that rate/duration —
+lower `KEY_SPACE_SIZE` or raise `RATE`/`DURATION_S` (the default keyspace of 32 is
+tuned to reorder reliably; see the comment in `chart/values.yaml`).
 
-## Knobs (`chart/values.yaml`)
+## Validation note
 
-| Key | Default | Purpose |
-|---|---|---|
-| `profile` | `alo` | QoS profile: `alo` / `amo` / `eoe` |
-| `images.registry` | `""` | Prefix for every image (custom registry) |
-| `resourcePrefix` | `lab-` | Prepended to every chart-rendered K8s resource name. Empty string opts out (back-compat with the unprefixed pre-v3 names). Pod names must fit the K8s 63-char DNS-1123 label limit; the collector Job is the binding case (~16 chars of headroom for a custom prefix). `helm template` fails loud at render time if you exceed this. |
-| `images.pullPolicy` | `IfNotPresent` | Global pull policy (public images) |
-| `writer.pullPolicy` / `collector.pullPolicy` | `""` (inherit) | Per-image override; dev sets `Never` |
-| `nats.persistence.mode` | `emptyDir` | `emptyDir` (portable) or `pvc` (durable) |
-| `nats.persistence.storageClassName` | `""` | Only for `pvc`; blank → cluster default |
-| `nats.stream.maxBytes` | `256MB` | JetStream `APP_EVENTS` byte cap |
-| `nats.stream.subjectPrefix` | `app.events` | NATS subject prefix. Stream binds `<prefix>.>`; connect-source publishes `<prefix>.${! meta("pattern") }`; publisher JWT grants `<prefix>.>`. Changing after install (bundled mode): (1) `scripts/gen-nats-auth.sh --force` (rotate creds), (2) `helm upgrade` (init Job reconciles stream subjects via `nats stream edit`), (3) `kubectl rollout restart deployment/lab-connect-source deployment/lab-connect-sink` (adjust the `lab-` prefix to match your `resourcePrefix`) (ConfigMaps don't auto-reload). External mode: reconcile stream + rotate creds out-of-band. |
-| `scheduling.{nodeSelector,tolerations,affinity}` | empty | Applied to every pod |
-| `chaos.downSeconds` | `8` | Chaos outage length |
-
-Run-window knobs (`DURATION_S`, `WARMUP_S`, `DRAIN_S`, `CHAOS_DOWN_S`) and tier
-SLOs live in `scripts/lib/tier-defs.sh` (env-overridable), identical to the
-compose lab.
-
-## How the matrix runs
-
-For each tier × mode the harness renders a uniquely-named collector Job
-(`helm template -s templates/collector-job.yaml`), applies it, waits for it to
-complete, and reads the single `RESULT_JSON:` line from `kubectl logs`. A
-failing verdict is an expected outcome (the collector exits 0 and the verdict
-lives in the JSON); only a genuine collector error fails the Job and surfaces as
-an `ERROR`/missing cell. Chaos mode scales `connect-sink` to 0 and back, gated by
-its `/ready` readiness probe.
+This is a Kubernetes lab, so the research-lab skill's `validate_lab.sh` (docker-compose
+only) does **not** apply. `scripts/verify-lww.sh` is the validation: it exits 0 only
+when Proof A passes **and** Proof B's verdict is `pass:true` (which requires the
+§3.4.1 precondition guards to hold and `stale > 0`).
 
 ## Teardown
 
 ```bash
-helm uninstall rrcs -n rrcs-k8s
-kind delete cluster --name rrcs   # if using kind
+helm uninstall lww -n lww-k8s
+kind delete cluster --name lww
 ```
+
+## Further reading
+
+- `RESEARCH.md` — the mechanism, the unambiguous-proof precondition, validated numbers.
+- `../../last-write-wins-lab/research.md` — upstream design (why NATS/source-timestamp don't work).
+- `../../docs/superpowers/specs/2026-06-04-redis-connect-lww-k8s-design.md` — the spec.
+- `../redis-redpanda-connect-stress-k8s/` — the parent stress lab.
