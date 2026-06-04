@@ -78,7 +78,6 @@ func main() {
 		log.Printf("WARN baseline scrape: %v", err)
 	}
 	sentBase := scrapeWriterSent(ctx, *writerURL)
-	startedAt := time.Now()
 
 	// 5. Sustain at full rate, sampling throughput each second.
 	_ = PostRate(ctx, *writerURL, *rate)
@@ -158,7 +157,6 @@ func main() {
 		WritesPerKeyAvg: wpk, RateTarget: *rate, RateAchievedAvg: rateAvg,
 		BootOK: bootOK, StoreEmptyAtStart: storeEmpty,
 	}
-	_ = startedAt
 	emit(res)
 }
 
