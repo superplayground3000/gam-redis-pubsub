@@ -10,6 +10,7 @@ cd "${LAB_DIR}"
 
 RATES="${REPORT_RATES:-5000 20000}"
 OUT="${OUT:-reports/lww-report.html}"
+VERIFY_CMD="${VERIFY_CMD:-${SCRIPT_DIR}/verify-lww.sh}"   # overridable for testing the report renderer
 mkdir -p "$(dirname "$OUT")"
 TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
 CONNECT_IMG="$(awk '/^connect:/{f=1} f&&/image:/{print $2; exit}' chart/values.yaml)"
@@ -18,10 +19,12 @@ PROOFA_LINE=""
 declare -a ROWS=()
 OVERALL="PASS"
 PEAK=0
+MAXMM=0          # worst (max) mismatches observed across runs
+declare -a FAILS=()
 
 for rate in $RATES; do
   echo "[report] running proofs at rate=${rate}…" >&2
-  out="$(RATE="${rate}" "${SCRIPT_DIR}/verify-lww.sh" 2>&1 || true)"
+  out="$(RATE="${rate}" "${VERIFY_CMD}" 2>&1 || true)"
   # Proof A line (same each run; capture once).
   if [[ -z "$PROOFA_LINE" ]]; then
     PROOFA_LINE="$(printf '%s\n' "$out" | grep -m1 'results (want' || true)"
@@ -29,12 +32,16 @@ for rate in $RATES; do
   pa_pass=$(printf '%s\n' "$out" | grep -qm1 '\[proofA\] PASS' && echo yes || echo no)
   json="$(printf '%s\n' "$out" | sed -n 's/^\[proofB\] //p' | grep '^{' | tail -n1 || true)"
   if [[ -z "$json" ]]; then
-    ROWS+=("<tr class=fail><td>${rate}</td><td colspan=8>NO RESULT (proofB produced no verdict)</td></tr>")
-    OVERALL="FAIL"; continue
+    ROWS+=("<tr class=fail><td>${rate}</td><td colspan=7>NO RESULT (proofB produced no verdict)</td></tr>")
+    OVERALL="FAIL"; FAILS+=("rate ${rate}: Proof B produced no verdict"); continue
   fi
   read -r ra st du mm rg wpk pass reason <<<"$(printf '%s' "$json" | jq -r '[.lww.rate_achieved_avg, .lww.stale, .lww.duplicate, .lww.mismatches, .lww.regressions, .lww.writes_per_key_avg, .verdict.pass, (.verdict.reason//"")] | @tsv')"
+  (( mm > MAXMM )) && MAXMM=$mm
   cls=$([[ "$pass" == "true" && "$pa_pass" == "yes" ]] && echo ok || echo fail)
-  [[ "$cls" == "ok" ]] || OVERALL="FAIL"
+  if [[ "$cls" != "ok" ]]; then
+    OVERALL="FAIL"
+    FAILS+=("rate ${rate}: ${reason:-verdict failed}")
+  fi
   ra_fmt=$(printf '%.0f' "$ra")
   wpk_fmt=$(printf '%.0f' "$wpk")
   [[ "$cls" == "ok" ]] && (( ra_fmt > PEAK )) && PEAK=$ra_fmt
@@ -45,8 +52,24 @@ done
 # The line is "[proofA] results (want: 1 0 0 -1 3 v3): <actual>"; take after the LAST "): ".
 PROOFA_RESULT="${PROOFA_LINE##*): }"
 PA_CLS=$([[ "$PROOFA_RESULT" == "1 0 0 -1 3 v3" ]] && echo ok || echo fail)
-[[ "$PA_CLS" == "ok" ]] || OVERALL="FAIL"
+if [[ "$PA_CLS" != "ok" ]]; then
+  OVERALL="FAIL"
+  FAILS+=("Proof A mechanism check returned '${PROOFA_RESULT:-<none>}' (expected '1 0 0 -1 3 v3')")
+fi
 BANNER_CLS=$([[ "$OVERALL" == "PASS" ]] && echo bpass || echo bfail)
+
+# Status-driven (never hard-coded) cards + conclusion, so a FAILING run can never
+# emit a success claim.
+MM_CLS=$([[ "$MAXMM" == 0 ]] && echo good || echo bad)
+PEAK_TXT=$([[ "$PEAK" -gt 0 ]] && echo "${PEAK}/s" || echo "—")
+if [[ "$OVERALL" == "PASS" ]]; then
+  CONCLUSION="<p>The sink-side last-write-wins compare-and-set fence is <b>verified</b>: stale writes can never overwrite newer ones at the Redis KV sink, regardless of arrival order, while a single connect-sink pod sustains the rates above with zero LWW violations. The achieved rate tracking the target with thousands of fenced stale writes and no backlog indicates the true single-instance ceiling is higher than the writer's cap.</p>"
+else
+  items=""
+  for f in "${FAILS[@]}"; do items+="<li>$(printf '%s' "$f" | sed 's/&/\&amp;/g; s/</\&lt;/g')</li>"; done
+  [[ -z "$items" ]] && items="<li>see the tables above</li>"
+  CONCLUSION="<p class=bad>Verification FAILED — these results do NOT confirm the last-write-wins fence. Do not rely on them. Failing checks:</p><ul>${items}</ul>"
+fi
 
 cat > "$OUT" <<HTML
 <!doctype html><html lang=en><head><meta charset=utf-8>
@@ -74,8 +97,8 @@ cat > "$OUT" <<HTML
 
 <div class=cards>
  <div class=card><div class=k>Mechanism (Proof A)</div><div class=v>${PA_CLS^^}</div></div>
- <div class=card><div class=k>Peak sustained</div><div class=v>${PEAK}/s</div></div>
- <div class=card><div class=k>Correctness</div><div class=v>mismatches 0</div></div>
+ <div class=card><div class=k>Peak passing rate</div><div class=v>${PEAK_TXT}</div></div>
+ <div class=card><div class=k>Correctness</div><div class="v ${MM_CLS}">mismatches ${MAXMM}</div></div>
 </div>
 
 <h2>Proof A — deterministic mechanism (direct to redis-region)</h2>
@@ -101,10 +124,7 @@ $(printf '%s\n' "${ROWS[@]}")
 </ul>
 
 <h2>Conclusion</h2>
-<p>The sink-side last-write-wins compare-and-set fence is verified: stale writes can never overwrite newer
-ones at the Redis KV sink, regardless of arrival order, while a single connect-sink pod sustains the rates
-above with zero LWW violations. The achieved rate tracking the target with thousands of fenced stale writes
-and no backlog indicates the true single-instance ceiling is higher than the writer's cap.</p>
+${CONCLUSION}
 </div></body></html>
 HTML
 

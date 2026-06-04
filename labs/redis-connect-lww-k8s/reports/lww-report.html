@@ -18,13 +18,13 @@
  p{font-size:13px;color:#c5ccd3} li{font-size:13px;color:#c5ccd3}
 </style></head><body><div class=wrap>
 <h1>Redis → Connect — Last-Write-Wins verification</h1>
-<div class=sub>Single-instance Kubernetes lab · generated 2026-06-04T12:22:51Z · connect image <code>hpdevelop/connect:4.92.0-claudefix</code></div>
+<div class=sub>Single-instance Kubernetes lab · generated 2026-06-04T12:29:04Z · connect image <code>hpdevelop/connect:4.92.0-claudefix</code></div>
 <div class="banner bpass">Overall: PASS</div>
 
 <div class=cards>
  <div class=card><div class=k>Mechanism (Proof A)</div><div class=v>OK</div></div>
- <div class=card><div class=k>Peak sustained</div><div class=v>20000/s</div></div>
- <div class=card><div class=k>Correctness</div><div class=v>mismatches 0</div></div>
+ <div class=card><div class=k>Peak passing rate</div><div class=v>20000/s</div></div>
+ <div class=card><div class=k>Correctness</div><div class="v good">mismatches 0</div></div>
 </div>
 
 <h2>Proof A — deterministic mechanism (direct to redis-region)</h2>
@@ -41,8 +41,8 @@ connect-sink <code>threads=4</code>), which reorders same-key messages. After qu
 stored version is compared to the writer's source max.</p>
 <table>
 <tr><th>target msg/s</th><th>achieved/s</th><th>stale (reorder fenced)</th><th>duplicate</th><th>mismatches</th><th>regressions</th><th>writes/key</th><th>verdict</th></tr>
-<tr class=ok><td>5000</td><td>5000</td><td class=good>2613</td><td>0</td><td class=good>0</td><td>0</td><td>5080</td><td>PASS</td></tr>
-<tr class=ok><td>20000</td><td>20000</td><td class=good>6493</td><td>0</td><td class=good>0</td><td>0</td><td>20314</td><td>PASS</td></tr>
+<tr class=ok><td>5000</td><td>5000</td><td class=good>2709</td><td>0</td><td class=good>0</td><td>0</td><td>5080</td><td>PASS</td></tr>
+<tr class=ok><td>20000</td><td>20000</td><td class=good>6681</td><td>0</td><td class=good>0</td><td>0</td><td>20316</td><td>PASS</td></tr>
 </table>
 <ul>
 <li><b>stale &gt; 0</b> is the proof: a strictly-older version arriving after a higher one was stored can only happen under genuine same-key reordering — and the fence rejected it.</li>
@@ -51,8 +51,5 @@ stored version is compared to the writer's source max.</p>
 </ul>
 
 <h2>Conclusion</h2>
-<p>The sink-side last-write-wins compare-and-set fence is verified: stale writes can never overwrite newer
-ones at the Redis KV sink, regardless of arrival order, while a single connect-sink pod sustains the rates
-above with zero LWW violations. The achieved rate tracking the target with thousands of fenced stale writes
-and no backlog indicates the true single-instance ceiling is higher than the writer's cap.</p>
+<p>The sink-side last-write-wins compare-and-set fence is <b>verified</b>: stale writes can never overwrite newer ones at the Redis KV sink, regardless of arrival order, while a single connect-sink pod sustains the rates above with zero LWW violations. The achieved rate tracking the target with thousands of fenced stale writes and no backlog indicates the true single-instance ceiling is higher than the writer's cap.</p>
 </div></body></html>
