@@ -10,6 +10,11 @@
 
 **Spec:** `docs/superpowers/specs/2026-06-04-redis-connect-lww-k8s-design.md` (sections referenced as §N below).
 
+> **De-risk deltas (T1.1 findings — supersede the original spec where noted):**
+> 1. HSET keyspace channel is `__keyevent@0__:hset` (DB 0) — as the spec assumed.
+> 2. Connect entrypoint is `redpanda-connect run <file>` (binary `/redpanda-connect`); the parent's `args: ["run","/connect.yaml"]` is correct.
+> 3. The `redis` processor in `hpdevelop/connect:4.92.0-claudefix` has **no `result_map` field** (using it is a hard lint failure). The eval result **replaces message content**; capture it with a *standalone* trailing `- mapping: 'meta lww_applied = this.string()'` (combining capture with a `root` reassignment yields null). The Lua is **embedded into the connect config at Helm render time** via `{{ .Files.Get "files/connect/lww_set.lua" | toJson }}` (the `connect-configmaps.yaml` template already `tpl`-processes these files) — single source of truth, no per-message `file()` read. **This removes the need for a separate Lua ConfigMap + volume mount (the original T2.4); T2.4 is repurposed to a render-verify.** `files/connect/lww_set.lua` remains the canonical script (Proof A reads it directly).
+
 ---
 
 ## File Structure
@@ -368,30 +373,35 @@ pipeline:
         meta key       = this.key
         meta version   = this.version.string()
         meta event_id  = this.event_id
+        meta value     = this.value
         meta applied_ms = (timestamp_unix_nano() / 1000000).string()
         root = this.value
     # The last-write-wins compare-and-set. result: 1 applied, 0 stale, -1 duplicate.
+    # NOTE (de-risk T1.1): this image's `redis` processor has NO result_map field,
+    # and the eval result REPLACES message content. The Lua is embedded at Helm
+    # render time via toJson (single source: files/connect/lww_set.lua) — bound to a
+    # `let` so its newlines/`;` don't break the array literal; no per-message file().
     - redis:
         url: {{ include "rrcs.redis.region.url" . }}
         kind: simple
         command: eval
         args_mapping: |
-          root = [
-            file("/etc/rpconnect/lww_set.lua"),
-            1,
-            meta("key"),
-            content().string(),
-            meta("version")
-          ]
-        result_map: 'meta lww_applied = this.string()'
-    # Export applied/stale/duplicate as a labelled counter for the verifier + dashboard.
+          let script = {{ .Files.Get "files/connect/lww_set.lua" | toJson }}
+          root = [ $script, 1, meta("key"), meta("value"), meta("version") ]
+    # Capture the eval result. MUST be its own mapping (combining with a root
+    # reassignment yields null — de-risk T1.1).
+    - mapping: 'meta lww_applied = this.string()'
     - mapping: |
         meta lww_result = if meta("lww_applied") == "1" { "applied" } else if meta("lww_applied") == "0" { "stale" } else { "duplicate" }
+    # Export applied/stale/duplicate as a labelled counter for the verifier + dashboard.
     - metric:
         type: counter
         name: lww_apply
         labels:
           result: ${! meta("lww_result") }
+    # Restore the original value as the body for the observability ledger
+    # (content() currently holds the eval result number).
+    - mapping: 'root = meta("value")'
 
 output:
   label: region_ledger
@@ -404,16 +414,13 @@ output:
     metadata:
       exclude_prefixes: ["nats_"]
 
-metrics:
-  prometheus: {}
-
 logger:
   level: INFO
   format: json
   add_timestamp: true
 ```
 
-> If `metrics.prometheus` is already implied by the connect image defaults (the parent scrapes `/metrics` without declaring it), drop the `metrics:` block — Task 4 verifies the counter shows at `:4195/metrics`.
+> The parent scrapes connect `/metrics` without declaring a `metrics:` block, so the image exposes Prometheus by default — no `metrics:` block needed. T2.4 (render) and T7.3 (kind) verify `lww_apply_total{result=...}` actually appears at `:4195/metrics`. If it does not, add `metrics: { prometheus: {} }` to this config.
 
 - [ ] **Step 2: Commit**
 
@@ -422,58 +429,44 @@ git add labs/redis-connect-lww-k8s/chart/files/connect/lww-reverse.yaml
 git commit -m "lww-k8s: reverse connect config applies version-gated CAS + lww_apply metric"
 ```
 
-### Task 2.4: Mount the Lua script into connect-sink
+### Task 2.4: Verify the Lua embeds into the rendered connect-sink config
 
-**Files:**
-- Create: `labs/redis-connect-lww-k8s/chart/templates/connect-lua-cm.yaml`
-- Modify: `labs/redis-connect-lww-k8s/chart/templates/connect-sink.yaml`
+> **No separate ConfigMap/mount needed (de-risk T1.1):** the Lua is embedded into
+> `lww-reverse.yaml` at render time via `{{ .Files.Get "files/connect/lww_set.lua" | toJson }}`,
+> and `connect-configmaps.yaml` (inherited from the parent) already renders the reverse
+> config into the `connect-sink-config` ConfigMap that connect-sink mounts as
+> `/connect.yaml`. So this task only verifies the rendering; `connect-sink.yaml` is left
+> as-is and no `connect-lua-cm.yaml` is created.
 
-- [ ] **Step 1: Create the ConfigMap template**
+**Files:** none created/modified (verification only).
 
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-lua") }}
-  labels: { app: connect-sink }
-data:
-  lww_set.lua: |-
-{{ .Files.Get "files/connect/lww_set.lua" | indent 4 }}
-```
-
-- [ ] **Step 2: Mount it in `connect-sink.yaml`** — add to the `connect` container `volumeMounts` (after the existing `nats-creds` mount, before `resources:`):
-
-```yaml
-            - name: lua
-              mountPath: /etc/rpconnect/lww_set.lua
-              subPath: lww_set.lua
-              readOnly: true
-```
-
-and add to the pod `volumes:` list (after the `nats-creds` secret volume):
-
-```yaml
-        - name: lua
-          configMap:
-            name: {{ include "rrcs.name" (dict "root" $ "base" "connect-lua") }}
-```
-
-- [ ] **Step 3: Render to verify templating (set profile=lww; chart still has parent values — override profile)**
+- [ ] **Step 1: Render the sink config and confirm the Lua + capture are present**
 
 ```bash
 cd labs/redis-connect-lww-k8s
-helm template lww ./chart --set profile=lww -s templates/connect-lua-cm.yaml
-helm template lww ./chart --set profile=lww -s templates/connect-sink.yaml | grep -A2 'lww_set.lua'
-helm template lww ./chart --set profile=lww -s templates/connect-configmaps.yaml | head -20
+helm template lww ./chart --set profile=lww -s templates/connect-configmaps.yaml > /tmp/lww-cm.yaml
+echo "exit=$?"
+grep -q "HGET" /tmp/lww-cm.yaml && echo "lua embedded OK"            # the CAS script body
+grep -q "meta lww_applied = this.string()" /tmp/lww-cm.yaml && echo "capture OK"
+grep -q "name: lww_apply" /tmp/lww-cm.yaml && echo "metric OK"
+grep -q 'let script =' /tmp/lww-cm.yaml && echo "script-let OK"
 ```
-Expected: the ConfigMap renders the Lua body; the sink Deployment shows the `lua` mount; connect-configmaps renders `lww-forward.yaml`/`lww-reverse.yaml` (because `connect-configmaps.yaml` reads `files/connect/%s-forward.yaml` with `%s=lww`).
+Expected: render exits 0 and all four `OK` lines print. The `let script = "..."` line should be a single JSON-escaped string (newlines as `\n`) — confirm it is one line:
+```bash
+grep -n 'let script =' /tmp/lww-cm.yaml   # should be a single long line, no raw newlines mid-string
+```
 
-- [ ] **Step 4: Commit**
+- [ ] **Step 2: Confirm both forward and reverse configs render under profile=lww**
 
 ```bash
+grep -c 'connect.yaml: |-' /tmp/lww-cm.yaml   # expect 2 (source + sink ConfigMaps)
+```
+
+- [ ] **Step 3: No code change → no commit.** If the render fails (e.g. `toJson` indentation breaks the YAML block scalar), fix `lww-reverse.yaml` (Task 2.3) — likely the `args_mapping: |` block needs the templated line to stay within the block's indentation. Re-run Step 1 until green, then amend the Task 2.3 commit:
+```bash
 cd /media/hp/secondary/projects/gam-redis-pubsub
-git add labs/redis-connect-lww-k8s/chart/templates/connect-lua-cm.yaml labs/redis-connect-lww-k8s/chart/templates/connect-sink.yaml
-git commit -m "lww-k8s: mount lww_set.lua into connect-sink via ConfigMap"
+git add labs/redis-connect-lww-k8s/chart/files/connect/lww-reverse.yaml
+git commit --amend --no-edit
 ```
 
 ---
