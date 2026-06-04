@@ -1,5 +1,6 @@
-# Active QoS profile: alo | amo | eoe. Selects which connect config pair is mounted.
-profile: alo
+# Active QoS profile. Selects which connect config pair is mounted
+# (files/connect/<profile>-forward.yaml + <profile>-reverse.yaml).
+profile: lww
 
 # Prefix that the rrcs.name helper prepends to every chart-rendered
 # Kubernetes resource name (this chart renders: Deployments, Services,
@@ -8,10 +9,10 @@ profile: alo
 # that reference the unprefixed names.
 #
 # Length budget: see docs/superpowers/specs/2026-06-03-rrcs-k8s-resource-name-prefix-design.md §2.1.
-# Binding case is the harness-generated collector Job
-# (collector-<tier>-<mode>-<profile>-<unix-ts>, up to 41 chars): default
-# "lab-" leaves ~16 chars of headroom for any custom prefix. The
-# collector-Job template fails loud at render time if you exceed this.
+# Binding case is the harness-generated verifier Job
+# (verifier-<epoch>): default "lab-" leaves ample headroom for a custom
+# prefix. The verifier-Job template fails loud at render time if you exceed
+# the 57-char name budget.
 resourcePrefix: "lab-"
 
 # The chart does NOT template a Namespace (design fix #3). Install with:
@@ -102,26 +103,24 @@ writer:
     STREAM_MAXLEN: "100000"
     WORKERS: "8"
     PIPELINE_DEPTH: "50"
-    KEY_SPACE_SIZE: "100000"
+    KEY_SPACE_SIZE: "1000"
     PAYLOAD_BYTES: "200"
     MAX_RATE: "20000"
 
-collector:
-  image: redis-rrcs/collector:dev
+dashboard:
+  image: redis-rrcs/dashboard:dev
   pullPolicy: ""            # "" => inherit images.pullPolicy
-  # The harness sets the fields below per-run via `helm template -s ... --set`.
-  run: false               # gate: only the harness renders the collector Job
-  jobName: ""              # unique per-run name; defaults to a derived name if empty
-  tier: 0
-  mode: throughput
+
+verifier:
+  image: redis-rrcs/verifier:dev
+  pullPolicy: ""
+  run: false           # harness renders the Job
+  jobName: ""
+  epoch: "run"         # harness sets a unique value per run
+  rate: 5000
   durationS: 30
   warmupS: 5
   drainS: 10
-  sloRatePct: "0.95"
-  sloP99Ms: "1000"
-  sloAllowMissing: false
-  chaosAtS: 0
-  chaosDurationS: 8
 
 scheduling:
   nodeSelector: {}
@@ -141,6 +140,9 @@ resources:
   writer:
     requests: { cpu: 250m, memory: 64Mi }
     limits:   { cpu: "2",  memory: 256Mi }
-  collector:
+  verifier:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 128Mi }
+  dashboard:
     requests: { cpu: 100m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 128Mi }
