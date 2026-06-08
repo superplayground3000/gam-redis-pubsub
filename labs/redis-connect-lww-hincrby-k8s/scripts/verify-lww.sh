@@ -1,12 +1,17 @@
 #!/usr/bin/env bash
 # LWW (multi-instance) verification harness. Boots the chart (profile=lww) with
 # N>1 connect-source + connect-sink pods, then runs:
-#   Proof A  — deterministic fence mechanism (3->1->2 + duplicate, direct to region)
-#   Proof C  — NEGATIVE: multi-writer same-version lost update, invisible to the
-#              version-only check (proves the single-writer-per-key precondition)
-#   Proof B' — end-to-end positive: fence holds (mismatches=0, stale>0) under
-#              INTER-pod reordering, with lww_apply summed across all sink pods.
-# Exits 0 iff all three pass.
+#   Proof A   — deterministic fence mechanism (3->1->2 + duplicate, direct to region)
+#   Proof MW+ — POSITIVE: shared HINCRBY makes multi-writer-same-key safe (no loss)
+#   Proof MW- — NEGATIVE control (proof-c.sh): local same-version counters DO lose
+#               an update, invisible to the version-only check. PASSES when it
+#               confirms the lost update (proves single-writer-per-key precondition)
+#   Proof delete — tombstone semantics + no stale resurrection
+#   Proof rename — atomic standby->active pairing + stale rename rejection
+# Then a RATE SWEEP over SWEEP_TIERS: runs the verifier Job at each tier, records
+# the per-tier verdict, finds the highest passing tier, assembles reports/sweep.json
+# and renders reports/report.html.
+# Exits 0 iff ALL proofs pass AND max_passing_tier >= the lowest swept tier.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -18,7 +23,6 @@ NS="${RRCS_NS:-lww-k8s}"
 RELEASE="${RRCS_RELEASE:-lww}"
 VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
 RESOURCE_PREFIX="lab-"
-EPOCH="run-$(date +%s)-$$"
 
 cleanup() { :; }
 trap cleanup EXIT
@@ -54,38 +58,131 @@ if [[ "$A" != "1" || "$B" != "0" || "$C" != "0" || "$D" != "-1" || "$VER" != "3"
 fi
 echo "[proofA] PASS"
 
-echo "[proofC] negative: multi-writer (two owners of one key) breaks LWW invisibly"
-bash "${SCRIPT_DIR}/proof-c.sh" "${NS}" "$(REGION_POD)" 5
-echo "[proofC] PASS"
+# --- Deterministic proofs against the region pod -----------------------------
+# Collect each proof's outcome as "name:pass" pairs. A proof script that exits
+# non-zero records pass=false but does NOT abort the run, so the report still
+# generates and the sweep still runs; allproofs tracks the overall gate.
+PROOF_RESULTS=()
+allproofs=true
+run_proof() {
+  local name="$1"; shift
+  echo "[proof] ${name}: $*"
+  if "$@"; then
+    PROOF_RESULTS+=("${name}:true")
+  else
+    echo "[proof] ${name} FAILED (rc=$?)"
+    PROOF_RESULTS+=("${name}:false")
+    allproofs=false
+  fi
+}
 
-echo "[proofB] verifier Job at rate=${RATE} epoch=${EPOCH}"
-JOB="verifier-${EPOCH}"
-helm template "${RELEASE}" ./chart -n "${NS}" -s templates/verifier-job.yaml \
-  -f "${VALUES_FILE}" --set profile=lww \
-  --set verifier.run=true --set "verifier.jobName=${JOB}" --set "verifier.epoch=${EPOCH}" \
-  --set "verifier.rate=${RATE}" --set "verifier.durationS=${DURATION_S}" \
-  --set "verifier.warmupS=${WARMUP_S}" --set "verifier.drainS=${DRAIN_S}" \
-  | kubectl apply -n "${NS}" -f -
+run_proof "MW+"    bash "${SCRIPT_DIR}/proof-mwplus.sh" "${NS}" "$(REGION_POD)"
+# MW- is the NEGATIVE control: proof-c.sh PASSES (exit 0) when it confirms the
+# lost update, so a true here means the negative control behaved as designed.
+run_proof "MW-"    bash "${SCRIPT_DIR}/proof-c.sh"      "${NS}" "$(REGION_POD)" 5
+run_proof "delete" bash "${SCRIPT_DIR}/proof-delete.sh" "${NS}" "$(REGION_POD)"
+run_proof "rename" bash "${SCRIPT_DIR}/proof-rename.sh" "${NS}" "$(REGION_POD)"
 
-JOB_FULL="${RESOURCE_PREFIX}${JOB}"
-timeout_s=$(( DURATION_S*2 + WARMUP_S + DRAIN_S + 180 ))
-deadline=$(( $(date +%s) + timeout_s ))
-while (( $(date +%s) < deadline )); do
-  st=$(kubectl -n "${NS}" get job/"${JOB_FULL}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
-  fa=$(kubectl -n "${NS}" get job/"${JOB_FULL}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
-  [[ "$st" == "True" || "$fa" == "True" ]] && break
-  sleep 3
+# --- Rate sweep --------------------------------------------------------------
+# Parse SWEEP_TIERS (comma-separated). For each tier, render+apply the verifier
+# Job, wait for completion, parse its RESULT_JSON verdict, and accumulate a JSON
+# tier object. Track the highest tier whose verdict.pass==true.
+IFS=',' read -r -a TIERS <<<"${SWEEP_TIERS}"
+LOWEST_TIER="${TIERS[0]}"
+max_passing_tier=0
+TIER_JSON='[]'
+
+run_tier() {
+  local tier="$1"
+  local epoch="run-${tier}-$$"
+  local job="verifier-${epoch}"
+  echo "[sweep] verifier Job at rate=${tier} epoch=${epoch}"
+  helm template "${RELEASE}" ./chart -n "${NS}" -s templates/verifier-job.yaml \
+    -f "${VALUES_FILE}" --set profile=lww \
+    --set verifier.run=true --set "verifier.jobName=${job}" --set "verifier.epoch=${epoch}" \
+    --set "verifier.rate=${tier}" --set "verifier.durationS=${DURATION_S}" \
+    --set "verifier.warmupS=${WARMUP_S}" --set "verifier.drainS=${DRAIN_S}" \
+    | kubectl apply -n "${NS}" -f -
+
+  local job_full="${RESOURCE_PREFIX}${job}"
+  local timeout_s=$(( DURATION_S*2 + WARMUP_S + DRAIN_S + 180 ))
+  local deadline=$(( $(date +%s) + timeout_s ))
+  while (( $(date +%s) < deadline )); do
+    local st fa
+    st=$(kubectl -n "${NS}" get job/"${job_full}" -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null || true)
+    fa=$(kubectl -n "${NS}" get job/"${job_full}" -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null || true)
+    [[ "$st" == "True" || "$fa" == "True" ]] && break
+    sleep 3
+  done
+
+  local result
+  result="$(kubectl -n "${NS}" logs job/"${job_full}" | sed -n 's/^RESULT_JSON://p' | tail -n1)"
+  kubectl -n "${NS}" delete job/"${job_full}" --wait=false >/dev/null 2>&1 || true
+
+  if [[ -z "$result" ]]; then
+    echo "[sweep] tier=${tier} FAIL: no RESULT_JSON"
+    kubectl -n "${NS}" logs job/"${job_full}" --tail=30 2>/dev/null || true
+    # Record a failed tier so the report still reflects the attempt.
+    TIER_JSON="$(jq --argjson rate "${tier}" \
+      '. + [{rate:$rate, pass:false, mismatches:0, stale:0, applied:0, duplicate:0, tombstones:0}]' \
+      <<<"${TIER_JSON}")"
+    allproofs=false
+    return
+  fi
+
+  echo "[sweep] tier=${tier} ${result}"
+  local pass
+  pass=$(jq -r '.verdict.pass' <<<"${result}")
+  TIER_JSON="$(jq --argjson rate "${tier}" --argjson r "${result}" \
+    '. + [{rate:$rate,
+           pass:($r.verdict.pass),
+           mismatches:($r.lww.mismatches),
+           stale:($r.lww.stale),
+           applied:($r.lww.applied),
+           duplicate:($r.lww.duplicate),
+           tombstones:($r.lww.tombstones)}]' \
+    <<<"${TIER_JSON}")"
+  if [[ "$pass" == "true" ]] && (( tier > max_passing_tier )); then
+    max_passing_tier="${tier}"
+  fi
+}
+
+for tier in "${TIERS[@]}"; do
+  run_tier "${tier}"
 done
 
-RESULT="$(kubectl -n "${NS}" logs job/"${JOB_FULL}" | sed -n 's/^RESULT_JSON://p' | tail -n1)"
-echo "[proofB] ${RESULT:-<no result>}"
-kubectl -n "${NS}" delete job/"${JOB_FULL}" --wait=false >/dev/null 2>&1 || true
-[[ -z "$RESULT" ]] && { echo "[proofB] FAIL: no verdict"; kubectl -n "${NS}" logs job/"${JOB_FULL}" --tail=30 || true; exit 1; }
+# --- Assemble sweep.json + render report -------------------------------------
+mkdir -p reports
+PROOF_JSON='[]'
+for pr in "${PROOF_RESULTS[@]}"; do
+  pname="${pr%:*}"; ppass="${pr##*:}"
+  PROOF_JSON="$(jq --arg name "${pname}" --argjson pass "${ppass}" \
+    '. + [{name:$name, pass:$pass}]' <<<"${PROOF_JSON}")"
+done
 
-PASS=$(echo "$RESULT" | jq -r '.verdict.pass')
-echo "$RESULT" | jq '{rate_achieved_avg:.lww.rate_achieved_avg, stale:.lww.stale, duplicate:.lww.duplicate, mismatches:.lww.mismatches, writes_per_key_avg:.lww.writes_per_key_avg, verdict:.verdict}'
-if [[ "$PASS" == "true" ]]; then
-  echo "[verify-lww] PASS — all three proofs green (A mechanism, C negative, B' multi-instance)"; exit 0
+jq -n \
+  --arg lab "redis-connect-lww-hincrby-k8s" \
+  --argjson max "${max_passing_tier}" \
+  --argjson tiers "${TIER_JSON}" \
+  --argjson proofs "${PROOF_JSON}" \
+  '{lab:$lab, max_passing_tier:$max, tiers:$tiers, proofs:$proofs}' \
+  > reports/sweep.json
+echo "[report] wrote reports/sweep.json"
+
+bash "${SCRIPT_DIR}/build-binaries.sh"
+./bin/report-gen -in reports/sweep.json -out reports/report.html
+echo "[report] wrote reports/report.html"
+
+# --- Final verdict -----------------------------------------------------------
+# Pass iff every proof passed AND the sweep cleared at least the lowest tier.
+echo "[verify-lww] proofs: ${PROOF_RESULTS[*]}"
+echo "[verify-lww] max_passing_tier=${max_passing_tier} (lowest swept tier=${LOWEST_TIER})"
+if [[ "${allproofs}" == "true" ]] && (( max_passing_tier >= LOWEST_TIER )); then
+  echo "[verify-lww] PASS — all proofs green; sweep cleared >= ${LOWEST_TIER} (max ${max_passing_tier}). Report: reports/report.html"
+  exit 0
 else
-  echo "[verify-lww] FAIL — $(echo "$RESULT" | jq -r '.verdict.reason')"; exit 1
+  reason="proofs=${allproofs}, max_passing_tier=${max_passing_tier} < lowest ${LOWEST_TIER}"
+  [[ "${allproofs}" == "true" ]] && reason="sweep did not clear the lowest tier (${LOWEST_TIER}); max_passing_tier=${max_passing_tier}"
+  echo "[verify-lww] FAIL — ${reason}. Report: reports/report.html"
+  exit 1
 fi
