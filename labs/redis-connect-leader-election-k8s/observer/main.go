@@ -79,7 +79,12 @@ func main() {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
-				rb.add(sampleOnce(ctx, rdb, hc, connectHost, connectPort))
+				// Drop invalid samples (Redis/DNS error) rather than feed corrupt
+				// data — a counter mis-read as 0 would fabricate false overlap/gap
+				// verdicts. The verdict math only ever sees complete snapshots.
+				if s, ok := sampleOnce(ctx, rdb, hc, connectHost, connectPort); ok {
+					rb.add(s)
+				}
 			}
 		}
 	}()
@@ -106,7 +111,12 @@ func main() {
 }
 
 // sampleOnce reads all consumed:* counters and sums active streams across pods.
-func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, port string) Sample {
+// It returns ok=false if the snapshot is incomplete (Redis SCAN/GET error, or the
+// headless DNS lookup failed) so the caller can discard it: feeding a partial map or
+// a transiently-zero counter into the verdict math would manufacture false
+// overlap/gap windows. A per-pod /streams failure is NOT a sample error — a pod that
+// is down genuinely has zero active streams.
+func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, port string) (Sample, bool) {
 	c, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
 	consumed := map[string]int64{}
@@ -114,10 +124,13 @@ func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, p
 	for {
 		keys, cur, err := rdb.Scan(c, cursor, "consumed:*", 200).Result()
 		if err != nil {
-			break
+			return Sample{}, false
 		}
 		for _, k := range keys {
-			v, _ := rdb.Get(c, k).Int64()
+			v, err := rdb.Get(c, k).Int64()
+			if err != nil {
+				return Sample{}, false
+			}
 			consumed[k[len("consumed:"):]] = v
 		}
 		cursor = cur
@@ -125,12 +138,15 @@ func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, p
 			break
 		}
 	}
+	ips, err := net.LookupHost(host)
+	if err != nil {
+		return Sample{}, false
+	}
 	active := 0
-	ips, _ := net.LookupHost(host)
 	for _, ip := range ips {
 		active += streamCount(hc, ip, port)
 	}
-	return Sample{T: time.Now(), Consumed: consumed, ActiveStreams: active}
+	return Sample{T: time.Now(), Consumed: consumed, ActiveStreams: active}, true
 }
 
 // streamCount GETs /streams on one pod and returns the number of streams (0 or 1 here).
@@ -140,6 +156,9 @@ func streamCount(hc *http.Client, ip, port string) int {
 		return 0
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return 0 // non-200 (error body) must not have its JSON keys counted as streams
+	}
 	body, _ := io.ReadAll(resp.Body)
 	var m map[string]any
 	if json.Unmarshal(body, &m) != nil {

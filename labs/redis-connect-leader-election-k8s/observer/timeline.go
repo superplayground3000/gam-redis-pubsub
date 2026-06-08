@@ -9,11 +9,22 @@ type Sample struct {
 	ActiveStreams int              `json:"active_streams"` // sum of /streams counts across pods
 }
 
-// roseCount returns how many pods strictly increased their counter from a to b.
+// roseCount returns how many pods strictly increased their counter from a to b,
+// over the UNION of pods seen in either sample (a pod absent on one side reads 0
+// there). consumed:* counters are monotonic, so a pod present only in `a` cannot
+// be a rise; iterating the union just makes that explicit and avoids missing a pod
+// that newly appears in `b`.
 func roseCount(a, b Sample) int {
 	n := 0
-	for pod, bv := range b.Consumed {
-		if bv > a.Consumed[pod] {
+	seen := make(map[string]struct{}, len(a.Consumed)+len(b.Consumed))
+	for pod := range a.Consumed {
+		seen[pod] = struct{}{}
+	}
+	for pod := range b.Consumed {
+		seen[pod] = struct{}{}
+	}
+	for pod := range seen {
+		if b.Consumed[pod] > a.Consumed[pod] {
 			n++
 		}
 	}
