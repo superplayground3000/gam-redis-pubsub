@@ -120,13 +120,16 @@ func ScrapeLWW(ctx context.Context, sinkURL string) (applied, stale, duplicate i
 			continue
 		}
 		val := parseTrailingFloat(line)
+		// Accumulate, don't assign: Phase 6 added an `op` label, so each result
+		// now spans multiple series (op=set/delete/rename/...). Summing them gives
+		// the true per-pod total; assignment would keep only the last line's value.
 		switch {
 		case strings.Contains(line, `result="applied"`):
-			applied = int64(val)
+			applied += int64(val)
 		case strings.Contains(line, `result="stale"`):
-			stale = int64(val)
+			stale += int64(val)
 		case strings.Contains(line, `result="duplicate"`):
-			duplicate = int64(val)
+			duplicate += int64(val)
 		}
 	}
 	if err := scn.Err(); err != nil {
