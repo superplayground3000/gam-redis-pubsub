@@ -4,5 +4,5 @@ collector/collector
 bin/
 # Rendered manifests
 out/
-# Local run output
-reports/*.json
+# Local run output (sweep.json + generated report.html)
+reports/
