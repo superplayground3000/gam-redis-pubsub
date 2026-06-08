@@ -7,11 +7,14 @@ LUA="${LAB_DIR}/chart/files/connect"
 CID="$(docker run -d --rm redis:7.4-alpine)"
 cleanup() { docker rm -f "$CID" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
-# wait for ready
-for _ in $(seq 1 30); do docker exec "$CID" redis-cli ping 2>/dev/null | grep -q PONG && break; sleep 0.3; done
+# wait for ready — fail loudly on timeout instead of testing an unready container
+ready=0
+for _ in $(seq 1 30); do if docker exec "$CID" redis-cli ping 2>/dev/null | grep -q PONG; then ready=1; break; fi; sleep 0.3; done
+[ "$ready" = 1 ] || { echo "FAIL: redis did not become ready"; exit 1; }
 
 docker cp "${LUA}/lww_set.lua" "$CID":/tmp/lww_set.lua
 docker cp "${LUA}/lww_rename.lua" "$CID":/tmp/lww_rename.lua
+docker cp "${LUA}/hmax.lua" "$CID":/tmp/hmax.lua
 EV() { docker exec "$CID" redis-cli --eval "$@"; }
 HGET() { docker exec "$CID" redis-cli HGET "$@"; }
 fail=0
@@ -51,5 +54,14 @@ assert "new active live"     "$(HGET "$NEW" deleted)" "0"
 assert "old standby tombstoned" "$(HGET "$OLD" deleted)" "1"
 assert "rename v10 duplicate" "$(docker exec "$CID" redis-cli --eval /tmp/lww_rename.lua "$OLD" "$NEW" , again 10 3002 e10)" "-1"
 assert "stale rename v8 -> stale" "$(docker exec "$CID" redis-cli --eval /tmp/lww_rename.lua "$OLD" "$NEW" , older 8 3003 e11)" "0"
+
+# ---- hmax: max(current, incoming) + corrupt-field self-heal ----
+docker exec "$CID" redis-cli DEL hmaxh >/dev/null
+assert "hmax first=5"  "$(EV /tmp/hmax.lua hmaxh , f 5)" "5"
+assert "hmax keep=5"   "$(EV /tmp/hmax.lua hmaxh , f 3)" "5"
+assert "hmax higher=9" "$(EV /tmp/hmax.lua hmaxh , f 9)" "9"
+docker exec "$CID" redis-cli HSET hmaxh g notanumber >/dev/null
+assert "hmax corrupt-field self-heals to 7" "$(EV /tmp/hmax.lua hmaxh , g 7)" "7"
+assert "hmax corrupt field overwritten to 7" "$(HGET hmaxh g)" "7"
 
 [ "$fail" = 0 ] && echo "ALL LUA TESTS PASS" || { echo "LUA TESTS FAILED"; exit 1; }
