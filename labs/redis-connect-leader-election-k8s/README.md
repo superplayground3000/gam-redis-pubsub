@@ -1,83 +1,77 @@
-# redis-connect-lww-k8s
+# redis-connect-leader-election-k8s
 
 ## What this demonstrates
 
-A stale change (lower version) can never overwrite a newer change at the Redis KV
-sink, regardless of arrival order across a parallel pipeline — proven end-to-end on
-Kubernetes, plus the single-instance sustained applied-write throughput.
+Best-effort **active-gating** in front of Redpanda Connect: a self-written client-go
+leader-election controller (the `elector` sidecar) makes **exactly one** of N=3 connect pods
+consume a Redis stream under steady state, and transfers consumption to a standby on
+failover. Crucially it also **measures the two best-effort failure windows** the upstream
+research warns about — a brief *dual-active overlap* (two pods consume at once) and a
+*zero-active gap* (nobody consumes) — proving this is active-gating, **not** hard fencing.
 
-Kubernetes/Helm fork of `../redis-redpanda-connect-stress-k8s`. The only data-path
-change is at the sink: a blind `SET` becomes a version-gated **last-write-wins
-compare-and-set** (a Redis Lua `EVAL`). The sink deliberately runs parallel
-(`threads: 4`, source `max_in_flight: 256`) so same-key messages reorder — and the
-fence makes the final per-key state correct anyway. Mechanism is from
-`../../last-write-wins-lab/research.md`.
+Kubernetes/Helm fork of `../redis-connect-lww-k8s/`, stripped to the **source leg only**
+(no NATS/JetStream, no sink CAS, no region Redis). Mechanism: `../../active-stanby-mechanism/research.md`
+(Method A). Order and uniqueness must **not** depend on the Lease — see RESEARCH.md.
 
 ## Run it (kind)
 
 ```bash
-# (NATS auth fixtures are committed under chart/files/nats-auth/; regenerate only
-#  on a fresh checkout if missing: scripts/gen-nats-auth.sh)
-kind create cluster --name lww
-scripts/build-images.sh --kind --kind-name=lww     # build writer/verifier/dashboard, load into kind
-scripts/verify-lww.sh                              # Proof A + Proof B; prints throughput + verdict
+kind create cluster --name lel
+scripts/build-images.sh --kind --kind-name=lel    # build writer/elector/observer/dashboard, load into kind
+scripts/verify-election.sh                         # Proof A + B1 + B2; prints verdict
 ```
 
-Tune the run with env vars: `RATE=20000 DURATION_S=30 scripts/verify-lww.sh`
-(defaults: RATE=5000, DURATION_S=30, WARMUP_S=5, DRAIN_S=10 — see `scripts/lib/run-defaults.sh`).
+Tune the run with env vars (defaults in `scripts/lib/run-defaults.sh`):
+`RATE=2000 SETTLE_S=15 OBS_WINDOW_S=6 OVERLAP_WAIT_S=12 GAP_WAIT_S=12 scripts/verify-election.sh`
+(`LEL_NS`, `LEL_RELEASE`, `LEL_VALUES` override namespace/release/values.)
 
 Watch it live in a browser:
 
 ```bash
 scripts/dashboard-forward.sh        # binds --address 0.0.0.0; prints LAN URLs
-# open http://<host>:8080  → live key/version/value stream + applied/stale-fenced/duplicate counters
+# open http://<host>:8080  → per-pod consumed:<pod> bars + active-stream count + verdict banner
 ```
 
 ## Expected output
 
-`verify-lww.sh` exits 0 only when both proofs pass:
+`verify-election.sh` exits 0 only when Proof A passes **and** a best-effort window is
+observed (B1 overlap > 0 OR B2 gap > 0):
 
 ```
-[proofA] results (want: 1 0 0 -1 3 v3): 1 0 0 -1 3 v3
+[proofA] {"samples":..,"single_active":true,"overlap_pairs":0,"gap_pairs":0}
+[proofA] lease holder = lab-connect-xxxxx
 [proofA] PASS
-[proofB] {"lww":{"keys_checked":32,"mismatches":0,"regressions":0,"applied":147296,
-          "stale":2726,"duplicate":0,"writes_per_key_avg":5090.6,"rate_target":5000,
-          "rate_achieved_avg":4999.96,"boot_ok":true,"store_empty_at_start":true,
-          "quiescence_ok":true},"verdict":{"pass":true}}
-[verify-lww] PASS — both proofs green
+[proofB1] {"samples":..,"single_active":false,"overlap_pairs":NN,"gap_pairs":0}
+[proofB2] {"samples":..,"single_active":false,"overlap_pairs":0,"gap_pairs":NN}
+----
+[verdict] single_active=true overlap_pairs=NN gap_pairs=NN
+[verify-election] PASS — active-gating works AND is best-effort (measured window)
 ```
 
-- **Proof A** is the deterministic mechanism test (apply versions 3,1,2 + replay 3 to
-  one key, direct to redis-region): `1 0 0 -1`, final `ver=3 val=v3`.
-- **Proof B** is end-to-end: `stale > 0` proves same-key reordering was actually
-  exercised *and* fenced; `mismatches == 0` proves the final state is exactly correct
-  despite it. Measured single instance: **~5,000 msg/s** at the default rate and
-  **~20,000 msg/s** at the writer's cap — both with `mismatches=0` and thousands of
-  stale writes correctly rejected. The sink kept up with no backlog, so the true
-  ceiling is higher than 20k.
-
-If a run prints `verdict.pass=false reason="inconclusive — no strictly-older arrival
-observed"`, the keyspace was too large to force reordering for that rate/duration —
-lower `KEY_SPACE_SIZE` or raise `RATE`/`DURATION_S` (the default keyspace of 32 is
-tuned to reorder reliably; see the comment in `chart/values.yaml`).
+- **Proof A** — steady state: exactly one connect pod consumes (`single_active=true` over a
+  clean post-settle window) and the Lease has a holder.
+- **Proof B1** — SIGSTOP the leader's elector: it can neither renew the lease nor run its
+  fail-closed DELETE, so its stream keeps consuming while a standby takes over →
+  `overlap_pairs > 0` (≥2 pods consumed at once: best-effort, not fencing).
+- **Proof B2** — force-delete the leader pod (`--force --grace-period=0`): the stream dies
+  with no graceful DELETE and the lease lingers → `gap_pairs > 0` (nobody consumed briefly).
 
 ## Validation note
 
 This is a Kubernetes lab, so the research-lab skill's `validate_lab.sh` (docker-compose
-only) does **not** apply. `scripts/verify-lww.sh` is the validation: it exits 0 only
-when Proof A passes **and** Proof B's verdict is `pass:true` (which requires the
-§3.4.1 precondition guards to hold and `stale > 0`).
+only) does **not** apply. `scripts/verify-election.sh` is the validation: it exits 0 only
+when Proof A passes **and** at least one best-effort window (overlap or gap) is measured.
 
 ## Teardown
 
 ```bash
-helm uninstall lww -n lww-k8s
-kind delete cluster --name lww
+helm uninstall lel -n lel-k8s
+kind delete cluster --name lel
 ```
 
 ## Further reading
 
-- `RESEARCH.md` — the mechanism, the unambiguous-proof precondition, validated numbers.
-- `../../last-write-wins-lab/research.md` — upstream design (why NATS/source-timestamp don't work).
-- `../../docs/superpowers/specs/2026-06-04-redis-connect-lww-k8s-design.md` — the spec.
-- `../redis-redpanda-connect-stress-k8s/` — the parent stress lab.
+- `RESEARCH.md` — the mechanism, the fail-closed lifecycle, how each proof is made unambiguous.
+- `../../active-stanby-mechanism/research.md` — upstream design (Method A; why best-effort, not fencing).
+- `../../docs/superpowers/specs/2026-06-08-redis-connect-leader-election-k8s-design.md` — the design spec.
+- `../redis-connect-lww-k8s/` — the fork this lab strips down.
