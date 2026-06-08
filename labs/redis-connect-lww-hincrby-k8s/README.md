@@ -129,7 +129,7 @@ to clear at least the lowest configured tier.
   newer set does revive it. The fence extends cleanly to delete semantics.
 
 - **Proof rename** (`scripts/proof-rename.sh`) — atomic standby→active: after
-  `EVAL lww_rename.lua`, the active key is live (`deleted=0`, `ver=global`) **and** the
+  `EVAL lww_rename.lua`, the active key is live (`deleted=0`, `ver`=the rename version) **and** the
   standby key is tombstoned (`deleted=1`) — the pairing is atomic with no split. A stale
   (lower-version) rename is rejected.
 
