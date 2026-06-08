@@ -94,9 +94,14 @@ run_proof "rename" bash "${SCRIPT_DIR}/proof-rename.sh" "${NS}" "$(REGION_POD)"
 IFS=',' read -r -a _RAW_TIERS <<<"${SWEEP_TIERS}"
 mapfile -t TIERS < <(printf '%s\n' "${_RAW_TIERS[@]}" | sort -n)
 LOWEST_TIER="${TIERS[0]}"
-max_passing_tier=0
-ceiling_open=true   # once a tier fails, no higher tier counts toward the ceiling
-VIOLATION=false     # set true on any tier with mismatches>0 or regressions>0
+# A tier is SUSTAINED iff it is correct (mismatches=0, regressions=0) AND the
+# pipeline drained (quiescence_ok) — that is the throughput ceiling. Whether
+# reordering was observed (stale>0) is a separate proof-quality signal, NOT a
+# throughput limit: reordering is more likely at HIGHER rates, so a low tier can
+# be correct-but-inconclusive while a higher tier proves the fence under reorder.
+max_sustained_tier=0   # highest tier that was correct AND drained
+VIOLATION=false        # any tier with mismatches>0 or regressions>0 → hard fail
+REORDER_PROVEN=false   # any tier with stale>0 → the fence was exercised end-to-end
 TIER_JSON='[]'
 
 run_tier() {
@@ -138,13 +143,21 @@ run_tier() {
   fi
 
   echo "[sweep] tier=${tier} ${result}"
-  local pass mism regr
-  pass=$(jq -r '.verdict.pass' <<<"${result}")
+  local mism regr stale quies sustained
   mism=$(jq -r '.lww.mismatches' <<<"${result}")
   regr=$(jq -r '.lww.regressions' <<<"${result}")
-  TIER_JSON="$(jq --argjson rate "${tier}" --argjson r "${result}" \
+  stale=$(jq -r '.lww.stale' <<<"${result}")
+  quies=$(jq -r '.lww.quiescence_ok' <<<"${result}")
+  # SUSTAINED = correct AND drained (the throughput-ceiling criterion). Note this
+  # is NOT verdict.pass, which additionally requires stale>0 (reorder observed);
+  # we track that separately as REORDER_PROVEN.
+  sustained=false
+  if (( mism == 0 && regr == 0 )) && [[ "$quies" == "true" ]]; then
+    sustained=true
+  fi
+  TIER_JSON="$(jq --argjson rate "${tier}" --argjson r "${result}" --argjson sustained "${sustained}" \
     '. + [{rate:$rate,
-           pass:($r.verdict.pass),
+           pass:$sustained,
            mismatches:($r.lww.mismatches),
            regressions:($r.lww.regressions),
            stale:($r.lww.stale),
@@ -158,12 +171,12 @@ run_tier() {
     echo "[sweep] tier=${tier} LWW VIOLATION: mismatches=${mism} regressions=${regr}"
     VIOLATION=true
   fi
-  # Monotonic ceiling: advance only while every tier so far has passed; the first
-  # failure closes the ceiling so no higher pass can mask it.
-  if [[ "$pass" == "true" ]] && [[ "$ceiling_open" == "true" ]]; then
-    max_passing_tier="${tier}"
-  else
-    ceiling_open=false
+  (( stale > 0 )) && REORDER_PROVEN=true
+  # Throughput ceiling = highest SUSTAINED tier. A correctness violation fails the
+  # whole run globally (above), so taking the max sustained tier here cannot mask a
+  # correctness problem; it only reflects how fast the pipeline kept up correctly.
+  if [[ "$sustained" == "true" ]] && (( tier > max_sustained_tier )); then
+    max_sustained_tier="${tier}"
   fi
 }
 
@@ -182,7 +195,7 @@ done
 
 jq -n \
   --arg lab "redis-connect-lww-hincrby-k8s" \
-  --argjson max "${max_passing_tier}" \
+  --argjson max "${max_sustained_tier}" \
   --argjson tiers "${TIER_JSON}" \
   --argjson proofs "${PROOF_JSON}" \
   '{lab:$lab, max_passing_tier:$max, tiers:$tiers, proofs:$proofs}' \
@@ -196,18 +209,25 @@ echo "[report] wrote reports/report.html"
 # --- Final verdict -----------------------------------------------------------
 # Pass iff every proof passed AND the sweep cleared at least the lowest tier.
 echo "[verify-lww] proofs: ${PROOF_RESULTS[*]}"
-echo "[verify-lww] max_passing_tier=${max_passing_tier} (monotonic; lowest swept tier=${LOWEST_TIER}); violation=${VIOLATION}"
-# Pass iff: every proof passed, NO tier showed an LWW violation (mismatches/
-# regressions), and the monotonic ceiling cleared at least the lowest tier.
-if [[ "${VIOLATION}" == "true" ]]; then
+echo "[verify-lww] max_sustained_tier=${max_sustained_tier} msg/s (lowest swept tier=${LOWEST_TIER}); violation=${VIOLATION}; reorder_proven=${REORDER_PROVEN}"
+# PASS requires, in order of severity:
+#   1. no proof failed,
+#   2. no LWW violation at any tier (mismatches/regressions == 0 everywhere),
+#   3. the fence was actually exercised under reordering at least once (stale>0),
+#   4. the pipeline sustained (correct + drained) at least the lowest tier.
+if [[ "${allproofs}" != "true" ]]; then
+  echo "[verify-lww] FAIL — a proof failed (${PROOF_RESULTS[*]}). Report: reports/report.html"
+  exit 1
+elif [[ "${VIOLATION}" == "true" ]]; then
   echo "[verify-lww] FAIL — LWW VIOLATION observed in the sweep (a tier had mismatches/regressions > 0); the fence is broken. Report: reports/report.html"
   exit 1
-elif [[ "${allproofs}" == "true" ]] && (( max_passing_tier >= LOWEST_TIER )); then
-  echo "[verify-lww] PASS — all proofs green; no LWW violation; max sustained tier=${max_passing_tier} msg/s. Report: reports/report.html"
+elif [[ "${REORDER_PROVEN}" != "true" ]]; then
+  echo "[verify-lww] FAIL — inconclusive: no tier observed a strictly-older (stale) arrival, so reorder-fencing was never exercised end-to-end. Lower KEY_SPACE_SIZE or raise the rate to force same-key reordering. Report: reports/report.html"
+  exit 1
+elif (( max_sustained_tier >= LOWEST_TIER )); then
+  echo "[verify-lww] PASS — all proofs green; no LWW violation; fence proven under reorder; max sustained throughput=${max_sustained_tier} msg/s. Report: reports/report.html"
   exit 0
 else
-  reason="proofs=${allproofs}; max_passing_tier=${max_passing_tier} < lowest ${LOWEST_TIER} (pipeline could not sustain even the lowest tier)"
-  [[ "${allproofs}" != "true" ]] && reason="a proof failed (${PROOF_RESULTS[*]})"
-  echo "[verify-lww] FAIL — ${reason}. Report: reports/report.html"
+  echo "[verify-lww] FAIL — pipeline could not sustain even the lowest tier (${LOWEST_TIER}); max_sustained_tier=${max_sustained_tier}. Report: reports/report.html"
   exit 1
 fi

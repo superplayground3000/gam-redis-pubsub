@@ -117,7 +117,7 @@ writer:
     # same-key messages are ~32 apart in the stream (<< 256), so reordering is the
     # common case and the verifier reliably observes stale>0. Larger values (e.g. 1000)
     # space same-key messages beyond the in-flight window → no reorder → inconclusive.
-    KEY_SPACE_SIZE: "64"
+    KEY_SPACE_SIZE: "32"
     PAYLOAD_BYTES: "200"
     MAX_RATE: "20000"
     # Op-mix weights for the writer's set/delete/rename selection.
