@@ -31,23 +31,39 @@ pipeline:
   processors:
     - mapping: |
         meta key       = this.key
+        meta op        = this.op.or("set")
+        meta old_key   = this.old_key.or("")
+        meta new_key   = this.new_key.or("")
         meta version   = this.version.string()
         meta event_id  = this.event_id
         meta value     = this.value
-        meta applied_ms = (timestamp_unix_nano() / 1000000).string()
+        meta now_ms    = (timestamp_unix_nano() / 1000000).string()
         root = this.value
     # The last-write-wins compare-and-set. result: 1 applied, 0 stale, -1 duplicate.
     # NOTE (de-risk T1.1): this image's `redis` processor has NO result_map field,
     # and the eval result REPLACES message content. The Lua is embedded at Helm
-    # render time via toJson (single source: files/connect/lww_set.lua) — bound to a
-    # `let` so its newlines/`;` don't break the array literal; no per-message file().
-    - redis:
-        url: {{ include "rrcs.redis.region.url" . }}
-        kind: simple
-        command: eval
-        args_mapping: |
-          let script = {{ .Files.Get "files/connect/lww_set.lua" | toJson }}
-          root = [ $script, 1, meta("key"), meta("value"), meta("version") ]
+    # render time via toJson (single source: files/connect/lww_{set,rename}.lua) —
+    # bound to a `let` so its newlines/`;` don't break the array literal; no
+    # per-message file(). Route rename ops to the 2-key rename Lua; set/delete to
+    # the 1-key set Lua.
+    - switch:
+        - check: meta("op") == "rename"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/lww_rename.lua" | toJson }}
+                  root = [ $script, 2, meta("old_key"), meta("new_key"), meta("value"), meta("version"), meta("now_ms"), meta("event_id") ]
+        - processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/lww_set.lua" | toJson }}
+                  root = [ $script, 1, meta("key"), meta("value"), meta("version"), meta("op"), meta("now_ms"), meta("event_id") ]
     # Capture the eval result. MUST be its own mapping (combining with a root
     # reassignment yields null — de-risk T1.1).
     - mapping: 'meta lww_applied = this.string()'
@@ -59,6 +75,7 @@ pipeline:
         name: lww_apply
         labels:
           result: ${! meta("lww_result") }
+          op: ${! meta("op") }
     # Restore the original value as the body for the observability ledger
     # (content() currently holds the eval result number).
     - mapping: 'root = meta("value")'

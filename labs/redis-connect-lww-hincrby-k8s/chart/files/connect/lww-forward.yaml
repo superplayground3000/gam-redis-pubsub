@@ -31,6 +31,9 @@ pipeline:
           "value":      $original_value,
           "event_id":   meta("event_id").or("unknown"),
           "pattern":    meta("pattern").or("unknown"),
+          "op":         meta("op").or("set"),
+          "old_key":    meta("old_key").or(""),
+          "new_key":    meta("new_key").or(""),
           "t_send_ms":  meta("t_send_ms").or("0").number(),
           "version":    meta("version").or("0").number()
         }
