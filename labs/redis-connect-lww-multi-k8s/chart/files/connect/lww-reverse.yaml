@@ -14,12 +14,12 @@ input:
     auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
     subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
-    durable: {{ .Values.nats.stream.consumer.durable | quote }}
-    # Deliver group: lets all N sink pods share ONE durable push consumer and
-    # load-balance deliveries (each message → exactly one pod). Without this, the
-    # 2nd/3rd pod binding the same durable is rejected by NATS. This is what makes
-    # same-key messages land on DIFFERENT pods concurrently — the inter-pod reorder
-    # vector the LWW fence must survive.
+    # Shared consumer across N sink pods. NOTE: this Redpanda Connect build (4.92.0)
+    # rejects `durable` and `queue` set together ("both 'queue' and 'durable' can't be
+    # set simultaneously"). So we use a `queue` (deliver group) WITHOUT an explicit
+    # durable: all sink pods subscribing with the same queue name bind to ONE shared
+    # push consumer, so each message is delivered to exactly one pod (the inter-pod
+    # reorder vector the LWW fence must survive).
     queue: {{ printf "%s-q" .Values.nats.stream.consumer.durable | quote }}
     deliver: all
     ack_wait: 30s
