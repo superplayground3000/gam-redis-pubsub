@@ -3,8 +3,9 @@
 ## Property demonstrated
 
 Under **multiple uncoordinated writers writing to the same keys**, with versions minted by
-a shared `HINCRBY` counter on central Redis (`kv:ver` for set/delete, `kv:gver` for
-rename), the last-write-wins compare-and-set fence holds exactly (`mismatches=0`, `stale>0`)
+a single per-entity `HINCRBY` counter on central Redis (`kv:ver`, keyed by the immutable
+entity id and used for set, delete, and rename alike), the last-write-wins compare-and-set
+fence holds exactly (`mismatches=0`, `stale>0`)
 across **set**, **delete** (tombstone + GC), and **atomic standby→active rename** — through
 3 connect-source and 3 connect-sink pods. The lab also sweeps a rate ladder and identifies
 the maximum sustained throughput at which this property holds.
@@ -32,11 +33,15 @@ hold the same version for the same key at the same moment.
 
 ### HINCRBY as the version source
 
-`v = HINCRBY kv:ver <kv_key> 1` (source Redis, before `XADD`) mints the version for
-set/delete operations (`writer/version.go: Minter.NextPerKey`). For rename, a separate
-global counter `HINCRBY kv:gver global 1` is used (`Minter.NextGlobal`) because a rename
-must atomically dominate two key sequences (active and standby), and a per-key counter
-cannot guarantee it dominates both simultaneously.
+`v = HINCRBY kv:ver <entity-id> 1` (source Redis, before `XADD`) mints the version for
+EVERY operation — set, delete, and rename alike (`writer/version.go: Minter.NextForEntity`).
+The counter field is the immutable entity id (`Pattern.EntityID` → the hash-tag content
+`<entity>:<epoch>-<id>`) shared by a key's active and standby variants, so a rename and the
+set/delete writes it competes with all draw from the SAME monotonic sequence. A rename
+therefore gets a version strictly greater than every prior write to the entity, and a set
+issued after a rename gets a still-higher version and wins the sink CAS — which is exactly
+what makes LWW hold across the op mix. (See the rename section below for why an earlier
+two-counter design with a separate global `kv:gver` was wrong.)
 
 **Why HINCRBY makes multi-writer-same-key safe:**
 - Redis serializes all `HINCRBY` calls to a given hash field on a single thread. Every

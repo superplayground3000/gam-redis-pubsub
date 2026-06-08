@@ -5,9 +5,11 @@
 Under **multiple uncoordinated writers writing to the same keys**, the last-write-wins
 compare-and-set fence holds exactly (`mismatches=0`) across **set**, **delete**
 (tombstone + GC), and **atomic standby→active rename** — when versions are minted by a
-**shared `HINCRBY` counter** on central Redis (`kv:ver` per key, `kv:gver` for rename).
-Because Redis serializes `HINCRBY` per hash, every writer — regardless of how many run
-concurrently — receives a strictly-increasing, collision-free version for each key. The
+**single per-entity `HINCRBY` counter** on central Redis (`kv:ver`, keyed by the immutable
+entity id that a key's active and standby variants share; used for set, delete, and rename
+alike, so all of an entity's versions form one comparable, monotonic sequence).
+Because Redis serializes `HINCRBY` per hash field, every writer — regardless of how many run
+concurrently — receives a strictly-increasing, collision-free version for each entity. The
 fence at the sink (`EVAL lww_set.lua` / `lww_rename.lua`) then enforces the ordering
 atomically, and `mismatches=0` across 3 connect-source + 3 connect-sink pods proves it
 holds under inter-pod reordering. This **inverts the parent lab's finding**: the parent
@@ -21,8 +23,8 @@ throughput at which this property holds, via a rate sweep reported in `reports/r
 ```
                      ┌──────────────────────────────────────────────────────┐
                      │               redis-central                           │
-                     │   kv:ver  (HINCRBY per key, version mint)            │
-                     │   kv:gver (HINCRBY global, rename version mint)      │
+                     │   kv:ver  (HINCRBY per entity-id —                   │
+                     │            set/delete/rename version mint)           │
                      │   srcmax:<epoch>  (hmax EVAL — HSET-to-max)          │
                      │   app.events  (XADD stream)                          │
                      └────────────────────────┬─────────────────────────────┘
