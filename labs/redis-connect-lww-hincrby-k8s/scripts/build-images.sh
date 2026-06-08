@@ -39,6 +39,8 @@ prefix=""
 WRITER_IMG="${prefix}redis-rrcs/writer:${TAG}"
 VERIFIER_IMG="${prefix}redis-rrcs/verifier:${TAG}"
 DASHBOARD_IMG="${prefix}redis-rrcs/dashboard:${TAG}"
+GC_IMG="${prefix}redis-rrcs/gc-sweeper:${TAG}"
+REPORT_IMG="${prefix}redis-rrcs/report-gen:${TAG}"
 
 build_one() {
   local ctx="$1" img="$2"
@@ -46,15 +48,19 @@ build_one() {
   docker build --build-arg "BASE_REGISTRY=${BASE_REGISTRY}" -t "${img}" "${ctx}"
 }
 
-build_one writer    "${WRITER_IMG}"
-build_one verifier  "${VERIFIER_IMG}"
-build_one dashboard "${DASHBOARD_IMG}"
+build_one writer     "${WRITER_IMG}"
+build_one verifier   "${VERIFIER_IMG}"
+build_one dashboard  "${DASHBOARD_IMG}"
+build_one gc-sweeper "${GC_IMG}"
+build_one report-gen "${REPORT_IMG}"
 
 if (( KIND )); then
   echo "[kind] loading images into cluster '${KIND_NAME}'"
   kind load docker-image "${WRITER_IMG}"    --name "${KIND_NAME}"
   kind load docker-image "${VERIFIER_IMG}"  --name "${KIND_NAME}"
   kind load docker-image "${DASHBOARD_IMG}" --name "${KIND_NAME}"
+  kind load docker-image "${GC_IMG}"        --name "${KIND_NAME}"
+  kind load docker-image "${REPORT_IMG}"    --name "${KIND_NAME}"
 fi
 
 if (( PUSH )); then
@@ -66,9 +72,13 @@ if (( PUSH )); then
   docker push "${WRITER_IMG}"
   docker push "${VERIFIER_IMG}"
   docker push "${DASHBOARD_IMG}"
+  docker push "${GC_IMG}"
+  docker push "${REPORT_IMG}"
 else
   echo "[push] skipped (no --push). Built locally:"
   echo "  ${WRITER_IMG}"
   echo "  ${VERIFIER_IMG}"
   echo "  ${DASHBOARD_IMG}"
+  echo "  ${GC_IMG}"
+  echo "  ${REPORT_IMG}"
 fi
