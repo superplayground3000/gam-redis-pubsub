@@ -12,6 +12,9 @@ local eid = ARGV[4]
 local curNew = redis.call('HGET', KEYS[2], 'ver')
 if curNew ~= false then
   local cn = tonumber(curNew)
+  -- INTENTIONAL self-heal: a non-numeric active ver (cn == nil) skips the compare
+  -- and falls through to apply the promotion — a corrupt ver heals to the next
+  -- write rather than erroring forever (matches the parent fence).
   if cn ~= nil then
     if v < cn then return 0 end
     if v == cn then return -1 end
@@ -23,6 +26,8 @@ local curOld = redis.call('HGET', KEYS[1], 'ver')
 local applyOld = true
 if curOld ~= false then
   local co = tonumber(curOld)
+  -- Equal version (v == co) is skipped: the standby tombstone was already written
+  -- by the first delivery, so a redelivery is idempotent and must not rewrite it.
   if co ~= nil and v <= co then applyOld = false end
 end
 if applyOld then

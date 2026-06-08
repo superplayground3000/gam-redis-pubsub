@@ -14,6 +14,9 @@ local eid = ARGV[5]
 local cur = redis.call('HGET', KEYS[1], 'ver')
 if cur ~= false then
   local c = tonumber(cur)
+  -- INTENTIONAL self-heal: a non-numeric stored ver (c == nil) skips the compare
+  -- and falls through to apply the incoming write — a corrupt ver heals to the
+  -- next write rather than erroring forever (matches the parent fence).
   if c ~= nil then
     if v < c then return 0 end
     if v == c then return -1 end
