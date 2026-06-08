@@ -7,13 +7,13 @@ import (
 	"time"
 )
 
-// State mirrors the writer's GET /state response.
+// State mirrors the writer's GET /state response. The writer no longer returns
+// per-key versions; the authoritative per-key max now lives in srcmax:<epoch> on
+// central. /state is used only for the boot_id and epoch-adoption checks.
 type State struct {
-	BootID        string           `json:"boot_id"`
-	Epoch         string           `json:"epoch"`
-	Keys          map[string]int64 `json:"keys"`
-	DistinctKeys  int              `json:"distinct_keys"`
-	TotalVersions int64            `json:"total_versions"`
+	BootID string `json:"boot_id"`
+	Epoch  string `json:"epoch"`
+	Sent   int64  `json:"sent"`
 }
 
 // LWWResult is the per-run measurement + verdict input.
@@ -98,27 +98,6 @@ func PostResetEpoch(ctx context.Context, writerURL, epoch string) error {
 	return nil
 }
 
-// CompareVersions reads region HGET <key> ver for every key in state and tallies
-// mismatches (region != source max) and regressions (region > source max).
-func CompareVersions(ctx context.Context, region *StreamClient, st State) (checked, mismatches, regressions int, err error) {
-	for key, srcMax := range st.Keys {
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		regionVer, ok, e := region.HGetVer(cctx, key)
-		cancel()
-		if e != nil {
-			return checked, mismatches, regressions, e
-		}
-		checked++
-		if !ok || regionVer != srcMax {
-			mismatches++
-		}
-		if ok && regionVer > srcMax {
-			regressions++
-		}
-	}
-	return checked, mismatches, regressions, nil
-}
-
 // CompareSrcMax compares every key in central's srcmax:<epoch> hash (the
 // authoritative HINCRBY-minted max) against region HGET <key> ver. Tombstoned
 // keys retain ver==max so they still match. mismatches = region != src;
@@ -144,25 +123,6 @@ func CompareSrcMax(ctx context.Context, central, region *StreamClient, epoch str
 		}
 	}
 	return checked, mismatches, regressions, nil
-}
-
-// StoreEmptyForEpoch samples up to n of the epoch's candidate keys and returns
-// true iff none already has a stored version (the §3.4.1 empty-store guard).
-// Called BEFORE traffic; state.Keys is empty then, so it probes the deterministic
-// candidate keys lww:<epoch>:0..n-1.
-func StoreEmptyForEpoch(ctx context.Context, region *StreamClient, epoch string, n int) (bool, error) {
-	for i := 0; i < n; i++ {
-		key := fmt.Sprintf("lww:%s:%d", epoch, i)
-		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		_, ok, err := region.HGetVer(cctx, key)
-		cancel()
-		if err != nil {
-			return false, err
-		} else if ok {
-			return false, nil
-		}
-	}
-	return true, nil
 }
 
 // mintEpoch builds a unique epoch token from a caller-supplied seed (the Job

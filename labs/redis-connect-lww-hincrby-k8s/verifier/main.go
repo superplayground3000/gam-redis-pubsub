@@ -27,7 +27,6 @@ func main() {
 		connectSinkPort = flag.String("connect-sink-port", "4195", "sink pod metrics port")
 		natsURL     = flag.String("nats", "http://nats:8222", "NATS monitoring URL")
 		natsStream  = flag.String("nats-stream", "APP_EVENTS", "")
-		sampleN     = flag.Int("empty-sample", 64, "keys to probe for empty-store precondition")
 	)
 	flag.Parse()
 	if *epochSeed == "" {
@@ -68,11 +67,15 @@ func main() {
 	}
 	boot0 := st0.BootID
 
-	// 2. Empty-store precondition (region must have no ver for the epoch's keys).
-	storeEmpty, err := StoreEmptyForEpoch(ctx, regionC, epoch, *sampleN)
+	// 2. Empty-store precondition. The authoritative per-key max now lives in
+	// srcmax:<epoch> on central, which the writer mints into during the run. A
+	// fresh epoch has an empty srcmax hash; a non-empty one means we're reusing
+	// an epoch that already carries minted versions (would certify a stale state).
+	src0, err := centralC.HGetAllInt(ctx, "srcmax:"+epoch)
 	if err != nil {
-		log.Fatalf("empty-store probe: %v", err)
+		log.Fatalf("empty-store probe (srcmax:%s): %v", epoch, err)
 	}
+	storeEmpty := len(src0) == 0
 
 	// 3. Warmup at half rate.
 	_ = PostRate(ctx, *writerURL, *rate/2)
@@ -169,15 +172,35 @@ func main() {
 	}
 	bootOK := stFinal.BootID == boot0
 
-	// 8. Per-key version comparison.
-	checked, mismatches, regressions, err := CompareVersions(ctx, regionC, stFinal)
+	// 8. Per-key version comparison against the authoritative central srcmax.
+	// srcmax:<epoch> holds the HINCRBY-minted max for every key the writer
+	// touched; the region must match it for each.
+	src, err := centralC.HGetAllInt(ctx, "srcmax:"+epoch)
 	if err != nil {
-		log.Fatalf("compare versions: %v", err)
+		log.Fatalf("read srcmax: %v", err)
+	}
+	checked, mismatches, regressions, err := CompareSrcMax(ctx, centralC, regionC, epoch)
+	if err != nil {
+		log.Fatalf("compare srcmax: %v", err)
 	}
 
+	// writes-per-key derived from srcmax: total minted versions / distinct keys.
+	distinct := len(src)
+	var total int64
+	for _, v := range src {
+		total += v
+	}
 	wpk := 0.0
-	if stFinal.DistinctKeys > 0 {
-		wpk = float64(stFinal.TotalVersions) / float64(stFinal.DistinctKeys)
+	if distinct > 0 {
+		wpk = float64(total) / float64(distinct)
+	}
+
+	// Tombstone stats: how many of the minted keys carry the deleted=1 flag in region.
+	tombstones := 0
+	for key := range src {
+		if del, _ := regionC.HGetDeleted(ctx, key); del == "1" {
+			tombstones++
+		}
 	}
 
 	res := LWWResult{
@@ -185,6 +208,7 @@ func main() {
 		Applied: applied, Stale: stale, Duplicate: duplicate,
 		WritesPerKeyAvg: wpk, RateTarget: *rate, RateAchievedAvg: rateAvg,
 		BootOK: bootOK, StoreEmptyAtStart: storeEmpty, QuiescenceOK: quiesceOK,
+		Tombstones: tombstones,
 	}
 	emit(res)
 }
