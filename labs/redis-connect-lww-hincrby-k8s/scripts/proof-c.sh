@@ -24,8 +24,8 @@ OUT="$(kubectl -n "$NS" exec "$POD" -- sh -c '
   a=""; b=""
   v=1
   while [ "$v" -le "$K" ]; do
-    a=$(redis-cli --eval /tmp/lww_set.lua "$KEY" , "A:v$v" "$v")
-    b=$(redis-cli --eval /tmp/lww_set.lua "$KEY" , "B:v$v" "$v")
+    a=$(redis-cli --eval /tmp/lww_set.lua "$KEY" , "A:v$v" "$v" set 0 e)
+    b=$(redis-cli --eval /tmp/lww_set.lua "$KEY" , "B:v$v" "$v" set 0 e)
     v=$((v+1))
   done
   echo "aK=$a bK=$b ver=$(redis-cli HGET "$KEY" ver) val=$(redis-cli HGET "$KEY" val)"

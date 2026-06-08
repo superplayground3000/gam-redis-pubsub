@@ -1,4 +1,5 @@
-# Run-window defaults for the LWW lab (env-overridable).
+# shellcheck shell=bash
+# Run-window defaults for the LWW lab (env-overridable). Sourced, not executed.
 : "${DURATION_S:=30}"
 : "${WARMUP_S:=5}"
 : "${DRAIN_S:=10}"

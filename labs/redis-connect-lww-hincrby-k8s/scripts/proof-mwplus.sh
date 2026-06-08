@@ -28,7 +28,7 @@ OUT="$(kubectl -n "$NS" exec "$POD" -- sh -c '
 ')"
 echo "[proofMW+] ${OUT}"
 DUP=$(echo "$OUT"|sed -n "s/.*dup=\([0-9]*\).*/\1/p")
-VER=$(echo "$OUT"|sed -n "s/.*ver=\([0-9]*\).*/\1/p")
+VER=$(echo "$OUT"|sed -n "s/.* ver=\([0-9]*\).*/\1/p")
 WANT=$(echo "$OUT"|sed -n "s/.*want_ver=\([0-9]*\).*/\1/p")
 fail=0
 [ "$DUP" = "0" ]    || { echo "[proofMW+] FAIL: expected dup=0 (HINCRBY never collides), got $DUP"; fail=1; }

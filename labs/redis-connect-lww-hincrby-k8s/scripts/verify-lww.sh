@@ -44,10 +44,10 @@ POD="$(REGION_POD)"
 kubectl -n "${NS}" cp chart/files/connect/lww_set.lua "${POD}:/tmp/lww_set.lua"
 PROOFA="$(kubectl -n "${NS}" exec "${POD}" -- sh -c '
   redis-cli DEL lwwproof:1 >/dev/null
-  a=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3)
-  b=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v1 1)
-  c=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v2 2)
-  d=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3)
+  a=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3 set 0 e)
+  b=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v1 1 set 0 e)
+  c=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v2 2 set 0 e)
+  d=$(redis-cli --eval /tmp/lww_set.lua lwwproof:1 , v3 3 set 0 e)
   ver=$(redis-cli HGET lwwproof:1 ver); val=$(redis-cli HGET lwwproof:1 val)
   echo "$a $b $c $d $ver $val"
 ')"
