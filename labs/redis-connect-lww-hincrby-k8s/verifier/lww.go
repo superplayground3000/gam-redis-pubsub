@@ -98,15 +98,13 @@ func PostResetEpoch(ctx context.Context, writerURL, epoch string) error {
 	return nil
 }
 
-// CompareSrcMax compares every key in central's srcmax:<epoch> hash (the
+// compareSrcMaxMap compares every key in an already-read srcmax map (the
 // authoritative HINCRBY-minted max) against region HGET <key> ver. Tombstoned
 // keys retain ver==max so they still match. mismatches = region != src;
-// regressions = region > src (impossible => fence bug).
-func CompareSrcMax(ctx context.Context, central, region *StreamClient, epoch string) (checked, mismatches, regressions int, err error) {
-	src, err := central.HGetAllInt(ctx, "srcmax:"+epoch)
-	if err != nil {
-		return 0, 0, 0, err
-	}
+// regressions = region > src (impossible => fence bug). Taking the snapshot as
+// an argument lets the caller read srcmax ONCE and derive every statistic from
+// the same map (no divergent re-reads).
+func compareSrcMaxMap(ctx context.Context, region *StreamClient, src map[string]int64) (checked, mismatches, regressions int, err error) {
 	for key, srcMax := range src {
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		regionVer, ok, e := region.HGetVer(cctx, key)
@@ -123,6 +121,17 @@ func CompareSrcMax(ctx context.Context, central, region *StreamClient, epoch str
 		}
 	}
 	return checked, mismatches, regressions, nil
+}
+
+// CompareSrcMax reads central's srcmax:<epoch> hash then compares it against the
+// region. Convenience wrapper around compareSrcMaxMap for callers (and tests)
+// that don't need the snapshot themselves.
+func CompareSrcMax(ctx context.Context, central, region *StreamClient, epoch string) (checked, mismatches, regressions int, err error) {
+	src, err := central.HGetAllInt(ctx, "srcmax:"+epoch)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	return compareSrcMaxMap(ctx, region, src)
 }
 
 // mintEpoch builds a unique epoch token from a caller-supplied seed (the Job

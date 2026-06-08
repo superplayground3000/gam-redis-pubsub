@@ -71,11 +71,18 @@ func main() {
 	// srcmax:<epoch> on central, which the writer mints into during the run. A
 	// fresh epoch has an empty srcmax hash; a non-empty one means we're reusing
 	// an epoch that already carries minted versions (would certify a stale state).
+	// We ALSO scan the region for any leftover key embedding this epoch: residue
+	// from a colliding epoch is invisible to the srcmax-only comparison and could
+	// otherwise yield a false PASS.
 	src0, err := centralC.HGetAllInt(ctx, "srcmax:"+epoch)
 	if err != nil {
 		log.Fatalf("empty-store probe (srcmax:%s): %v", epoch, err)
 	}
-	storeEmpty := len(src0) == 0
+	regionDirty, err := regionC.RegionHasEpochKey(ctx, epoch)
+	if err != nil {
+		log.Fatalf("region epoch probe: %v", err)
+	}
+	storeEmpty := len(src0) == 0 && !regionDirty
 
 	// 3. Warmup at half rate.
 	_ = PostRate(ctx, *writerURL, *rate/2)
@@ -174,12 +181,16 @@ func main() {
 
 	// 8. Per-key version comparison against the authoritative central srcmax.
 	// srcmax:<epoch> holds the HINCRBY-minted max for every key the writer
-	// touched; the region must match it for each.
-	src, err := centralC.HGetAllInt(ctx, "srcmax:"+epoch)
+	// touched; the region must match it for each. Read the snapshot ONCE (bounded
+	// context) and derive EVERY statistic from that single map so the comparison,
+	// writes-per-key, and tombstone counts can't diverge across separate re-reads.
+	srcCtx, srcCancel := context.WithTimeout(ctx, 15*time.Second)
+	src, err := centralC.HGetAllInt(srcCtx, "srcmax:"+epoch)
+	srcCancel()
 	if err != nil {
 		log.Fatalf("read srcmax: %v", err)
 	}
-	checked, mismatches, regressions, err := CompareSrcMax(ctx, centralC, regionC, epoch)
+	checked, mismatches, regressions, err := compareSrcMaxMap(ctx, regionC, src)
 	if err != nil {
 		log.Fatalf("compare srcmax: %v", err)
 	}
@@ -198,7 +209,12 @@ func main() {
 	// Tombstone stats: how many of the minted keys carry the deleted=1 flag in region.
 	tombstones := 0
 	for key := range src {
-		if del, _ := regionC.HGetDeleted(ctx, key); del == "1" {
+		del, err := regionC.HGetDeleted(ctx, key)
+		if err != nil {
+			log.Printf("tombstone probe %s: %v", key, err)
+			continue
+		}
+		if del == "1" {
 			tombstones++
 		}
 	}
