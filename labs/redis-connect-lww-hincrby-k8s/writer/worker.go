@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"log"
+	"math/rand"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -21,6 +22,9 @@ type Worker struct {
 	Counters      *Counters
 	Minter        *Minter
 	Ops           *OpPicker
+	// Rnd is this worker's private PRNG for random id selection (per-worker so there's
+	// no cross-goroutine sharing). Seeded distinctly per worker in main.go.
+	Rnd *rand.Rand
 	// Epoch is read per batch from the shared EpochHolder so a concurrent /reset is
 	// observed; set directly only in tests.
 	Epoch       string
@@ -113,9 +117,12 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 }
 
 func (w *Worker) pickID() int64 {
-	// Shared keyspace: every worker draws from [0, KeySpaceSize) so writers contend
-	// on the same keys (the multi-writer-same-key scenario).
-	return int64(w.Counters.Sent.Load()) % w.KeySpaceSize
+	// Random over the shared [0, KeySpaceSize) space: same-key bursts (birthday
+	// collisions within a batch) put multiple versions of one key in flight at
+	// once, so the 3 sink pods process them concurrently and the fence is
+	// exercised under genuine reordering (verifier observes stale>0). Round-robin
+	// (Sent % N) spaced same-key messages too evenly to reliably reorder.
+	return w.Rnd.Int63n(w.KeySpaceSize)
 }
 
 // queueSrcmax queues the hmax (HSET-to-max) EVAL onto pipe so it commits in the

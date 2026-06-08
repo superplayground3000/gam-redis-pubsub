@@ -25,6 +25,7 @@ func TestEmitOnceWritesStreamAndSrcmax(t *testing.T) {
 		Minter:   NewMinter(rdb),
 		Counters: &Counters{},
 		Ops:      NewOpPicker(OpWeights{Set: 1}, rand.New(rand.NewSource(1))),
+		Rnd:      rand.New(rand.NewSource(1)),
 		Epoch:    "run-test",
 	}
 
@@ -98,6 +99,7 @@ func TestSetRenameSetVersionsAreComparable(t *testing.T) {
 		StreamMaxLen: 1000, PayloadBytes: 8, KeySpaceSize: 1,
 		Minter:   NewMinter(rdb),
 		Counters: &Counters{},
+		Rnd:      rand.New(rand.NewSource(1)),
 		Epoch:    "run-test",
 	}
 
@@ -167,6 +169,7 @@ func TestRenameRecordsSrcmaxForActiveOnly(t *testing.T) {
 		Minter:   NewMinter(rdb),
 		Counters: &Counters{}, // Sent=0 -> Patterns[0], id=0
 		Ops:      NewOpPicker(OpWeights{Rename: 1}, rand.New(rand.NewSource(1))),
+		Rnd:      rand.New(rand.NewSource(1)),
 		Epoch:    epoch,
 	}
 
@@ -208,5 +211,17 @@ func TestRenameRecordsSrcmaxForActiveOnly(t *testing.T) {
 	v := msgs[0].Values
 	if v["old_key"] != standbyKey || v["new_key"] != activeKey || v["op"] != string(OpRename) {
 		t.Fatalf("rename XADD fields wrong: old_key=%v new_key=%v op=%v", v["old_key"], v["new_key"], v["op"])
+	}
+}
+
+// TestPickIDStaysInRange asserts random id selection never escapes the shared
+// [0, KeySpaceSize) space (out-of-range ids would target nonexistent keys).
+func TestPickIDStaysInRange(t *testing.T) {
+	w := &Worker{KeySpaceSize: 8, Rnd: rand.New(rand.NewSource(42))}
+	for i := 0; i < 100000; i++ {
+		id := w.pickID()
+		if id < 0 || id >= w.KeySpaceSize {
+			t.Fatalf("pickID()=%d out of [0,%d)", id, w.KeySpaceSize)
+		}
 	}
 }

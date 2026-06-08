@@ -70,7 +70,9 @@ func main() {
 			Counters:      counters,
 			Minter:        minter,
 			// Each worker gets its own *rand.Rand to avoid sharing one across goroutines.
-			Ops:         NewOpPicker(weights, mrand.New(mrand.NewSource(seed+int64(i)))),
+			Ops: NewOpPicker(weights, mrand.New(mrand.NewSource(seed+int64(i)))),
+			// Separate per-worker PRNG for random id selection (distinct stream from Ops).
+			Rnd:         mrand.New(mrand.NewSource(seed + int64(i)*1000 + 1)),
 			EpochHolder: epochHolder,
 		}
 		wg.Add(1)
