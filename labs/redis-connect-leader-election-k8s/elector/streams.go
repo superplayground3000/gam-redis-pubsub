@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	neturl "net/url"
 	"strings"
 	"time"
 )
@@ -29,7 +30,7 @@ func newStreamsClient(base string) *streamsClient {
 }
 
 func (c *streamsClient) post(ctx context.Context, id, configYAML string) error {
-	url := fmt.Sprintf("%s/streams/%s", c.base, id)
+	url := fmt.Sprintf("%s/streams/%s", c.base, neturl.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewBufferString(configYAML))
 	if err != nil {
 		return err
@@ -39,7 +40,7 @@ func (c *streamsClient) post(ctx context.Context, id, configYAML string) error {
 }
 
 func (c *streamsClient) delete(ctx context.Context, id string) error {
-	url := fmt.Sprintf("%s/streams/%s", c.base, id)
+	url := fmt.Sprintf("%s/streams/%s", c.base, neturl.PathEscape(id))
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, url, nil)
 	if err != nil {
 		return err
@@ -70,6 +71,9 @@ func retry(ctx context.Context, n int, delay time.Duration, fn func() error) err
 	for i := 0; i < n; i++ {
 		if err = fn(); err == nil {
 			return nil
+		}
+		if i == n-1 {
+			break
 		}
 		select {
 		case <-ctx.Done():

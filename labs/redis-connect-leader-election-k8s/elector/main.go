@@ -7,7 +7,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -79,9 +81,13 @@ func main() {
 		writeMetric(w, "elector_delete_total{result=\"ok\"}", float64(delOK.Load()))
 		writeMetric(w, "elector_delete_total{result=\"err\"}", float64(delE.Load()))
 	})
+	ln, err := net.Listen("tcp", healthAddr)
+	if err != nil {
+		log.Fatalf("health server listen %s: %v", healthAddr, err)
+	}
 	go func() {
 		log.Printf("elector health/metrics on %s", healthAddr)
-		if err := http.ListenAndServe(healthAddr, mux); err != nil {
+		if err := http.Serve(ln, mux); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Printf("health server: %v", err)
 		}
 	}()
@@ -95,10 +101,13 @@ func main() {
 		log.Fatalf("k8s client: %v", err)
 	}
 
-	// FAIL-CLOSED BOOT: before anything, ensure no residual stream.
-	bootCtx, bootCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if err := retry(bootCtx, 30, retryPd, func() error { return sc.delete(bootCtx, streamID) }); err != nil {
-		log.Printf("boot DELETE (best-effort): %v", err)
+	// FAIL-CLOSED BOOT: ensure no residual stream before joining election. The generous
+	// timeout tolerates the connect sidecar still warming up; on genuine failure we exit
+	// so kubelet restarts us rather than entering election in an unknown state.
+	bootCtx, bootCancel := context.WithTimeout(context.Background(), 45*time.Second)
+	if err := retry(bootCtx, 40, retryPd, func() error { return sc.delete(bootCtx, streamID) }); err != nil {
+		bootCancel()
+		log.Fatalf("boot DELETE failed (%v) -> exiting fail-closed; kubelet will restart", err)
 	}
 	bootCancel()
 	log.Printf("boot: ensured no local stream; entering election as %q", podName)
