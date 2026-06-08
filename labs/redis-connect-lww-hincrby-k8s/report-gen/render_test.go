@@ -37,3 +37,16 @@ func TestRenderEscapesAndHandlesEmpty(t *testing.T) {
 		t.Fatal("expected an HTML document")
 	}
 }
+
+func TestRenderEscapesLab(t *testing.T) {
+	html, err := Render(Sweep{Lab: `<script>alert(1)</script>`})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(html, "<script>alert(1)</script>") {
+		t.Fatal("Lab was not escaped — XSS hole")
+	}
+	if !strings.Contains(html, "&lt;script&gt;") {
+		t.Fatal("expected HTML-escaped Lab")
+	}
+}
