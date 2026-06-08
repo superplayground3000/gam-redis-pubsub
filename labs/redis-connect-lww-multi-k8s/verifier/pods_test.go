@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -29,9 +30,11 @@ func sinkStub(applied, stale, duplicate int64) *httptest.Server {
 // hostPort splits an httptest URL "http://127.0.0.1:PORT" into host, port.
 func hostPort(t *testing.T, srv *httptest.Server) (string, string) {
 	t.Helper()
-	hp := strings.TrimPrefix(srv.URL, "http://")
-	i := strings.LastIndexByte(hp, ':')
-	return hp[:i], hp[i+1:]
+	h, p, err := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	if err != nil {
+		t.Fatalf("split %s: %v", srv.URL, err)
+	}
+	return h, p
 }
 
 func TestScrapeAllSumsAcrossPods(t *testing.T) {
@@ -83,5 +86,40 @@ func TestDeltaSumsAcrossPods(t *testing.T) {
 	}
 	if a != 150 || s != 10 || d != 0 {
 		t.Fatalf("delta = (%d,%d,%d), want (150,10,0)", a, s, d)
+	}
+}
+
+func TestDedupeSorted(t *testing.T) {
+	got := dedupeSorted([]string{"a:1", "a:1", "b:1", "b:1", "c:1"})
+	want := []string{"a:1", "b:1", "c:1"}
+	if len(got) != len(want) {
+		t.Fatalf("dedupeSorted len = %d (%v), want %d (%v)", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("dedupeSorted[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestSumDeltaMissingPodFails(t *testing.T) {
+	pairs := []string{"a:4195", "b:4195"}
+	base := map[string]lwwCounts{"a:4195": {10, 1, 0}, "b:4195": {20, 2, 0}}
+	cur := map[string]lwwCounts{"a:4195": {60, 4, 0}} // b vanished mid-run
+	_, _, _, err := sumDelta(pairs, base, cur)
+	if err == nil {
+		t.Fatal("expected error when a baseline pod is missing at end-of-window, got nil")
+	}
+}
+
+func TestScrapeAllPairsFailsIfOnePodUnreachable(t *testing.T) {
+	s1 := sinkStub(100, 5, 1)
+	defer s1.Close()
+	h, p := hostPort(t, s1)
+	good := h + ":" + p
+	// 127.0.0.1:1 is reserved/closed → connection refused.
+	_, err := scrapeAllPairs(context.Background(), []string{good, "127.0.0.1:1"})
+	if err == nil {
+		t.Fatal("expected scrapeAllPairs to fail when one pod is unreachable, got nil")
 	}
 }

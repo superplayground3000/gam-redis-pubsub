@@ -92,7 +92,7 @@ func main() {
 	// from a FRESH scrape at the start of each window (not a shared closure var) so
 	// the extend-once call doesn't divide a whole window's cumulative delta by ~1s.
 	_ = PostRate(ctx, *writerURL, *rate)
-	runStale := func(window time.Duration) (int64, int64, int64, float64) {
+	runStale := func(window time.Duration) (int64, int64, int64, float64, error) {
 		end := time.Now().Add(window)
 		ticker := time.NewTicker(time.Second)
 		defer ticker.Stop()
@@ -102,7 +102,7 @@ func main() {
 		for time.Now().Before(end) {
 			select {
 			case <-ctx.Done():
-				return 0, 0, 0, 0
+				return 0, 0, 0, 0, nil
 			case <-ticker.C:
 				sent, ok := scrapeWriterSent(ctx, *writerURL)
 				if !ok {
@@ -117,16 +117,20 @@ func main() {
 			}
 		}
 		a, s, d, serr := sinkBase.Delta(ctx)
-		if serr != nil {
-			log.Fatalf("end-of-window sink aggregation: %v", serr)
-		}
 		rateAvg := 0.0
 		if n > 0 {
 			rateAvg = sumRate / n
 		}
-		return a, s, d, rateAvg
+		if serr != nil {
+			return 0, 0, 0, rateAvg, fmt.Errorf("end-of-window sink aggregation: %w", serr)
+		}
+		return a, s, d, rateAvg, nil
 	}
-	applied, stale, duplicate, rateAvg := runStale(*duration)
+	applied, stale, duplicate, rateAvg, rerr := runStale(*duration)
+	if rerr != nil {
+		_ = PostRate(ctx, *writerURL, 0) // stop traffic before failing loud
+		log.Fatalf("%v", rerr)
+	}
 
 	// 6. Drain + quiescence so all in-flight messages settle before we compare.
 	// quiesceOK tracks whether the pipeline actually drained; a timeout makes the
@@ -140,7 +144,11 @@ func main() {
 	if stale == 0 && *extendOnce {
 		log.Printf("stale==0 after first window; extending once")
 		_ = PostRate(ctx, *writerURL, *rate)
-		a, s, d, r2 := runStale(*duration)
+		a, s, d, r2, rerr2 := runStale(*duration)
+		if rerr2 != nil {
+			_ = PostRate(ctx, *writerURL, 0) // stop traffic before failing loud
+			log.Fatalf("%v", rerr2)
+		}
 		applied, stale, duplicate = a, s, d
 		if r2 > rateAvg {
 			rateAvg = r2

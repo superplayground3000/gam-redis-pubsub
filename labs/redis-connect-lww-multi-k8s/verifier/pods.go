@@ -20,6 +20,20 @@ type SinkBaseline struct {
 	base  map[string]lwwCounts
 }
 
+// dedupeSorted removes adjacent duplicates from an already-sorted slice.
+func dedupeSorted(s []string) []string {
+	if len(s) < 2 {
+		return s
+	}
+	out := s[:1]
+	for _, v := range s[1:] {
+		if v != out[len(out)-1] {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
 // resolveSinkPairs resolves the headless service DNS name to one host:port per pod.
 func resolveSinkPairs(ctx context.Context, dns, port string) ([]string, error) {
 	var r net.Resolver
@@ -31,6 +45,7 @@ func resolveSinkPairs(ctx context.Context, dns, port string) ([]string, error) {
 		return nil, fmt.Errorf("resolve %s: no sink pod IPs (is connect-sink ready?)", dns)
 	}
 	sort.Strings(ips)
+	ips = dedupeSorted(ips)
 	pairs := make([]string, len(ips))
 	for i, ip := range ips {
 		pairs[i] = net.JoinHostPort(ip, port)
