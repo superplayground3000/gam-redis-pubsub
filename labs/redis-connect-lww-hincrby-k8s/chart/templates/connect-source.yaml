@@ -1,0 +1,78 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
+  labels: { app: connect-source }
+spec:
+  replicas: {{ .Values.connect.source.replicas }}
+  selector:
+    matchLabels: { app: connect-source }
+  template:
+    metadata:
+      labels: { app: connect-source }
+    spec:
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      initContainers:
+        - name: wait-redis-central
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.redis.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - HP="{{ include "rrcs.redis.central.hostPort" . }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
+        - name: wait-stream
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - until nats --server {{ include "rrcs.nats.url" . | quote }} --creds /etc/nats-creds/publisher/user.creds stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done
+          volumeMounts:
+            - name: nats-creds
+              mountPath: /etc/nats-creds/publisher
+              readOnly: true
+      containers:
+        - name: connect
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.connect.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          args: ["run", "/connect.yaml"]
+          ports:
+            - containerPort: 4195
+          readinessProbe:
+            httpGet: { path: /ready, port: 4195 }
+            periodSeconds: 2
+            timeoutSeconds: 2
+            failureThreshold: 30
+          livenessProbe:
+            httpGet: { path: /ping, port: 4195 }
+            periodSeconds: 10
+            timeoutSeconds: 2
+            failureThreshold: 6
+          volumeMounts:
+            - name: config
+              mountPath: /connect.yaml
+              subPath: connect.yaml
+            - name: nats-creds
+              mountPath: /etc/nats-creds/publisher
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources.connect | nindent 12 }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source-config") }}
+        - name: nats-creds
+          secret:
+            secretName: {{ include "rrcs.nats.credsSecret.publisher" . }}
+            defaultMode: 0444    # Secret is in a per-pod tmpfs; non-root connect user needs read access
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
+  labels: { app: connect-source }
+spec:
+  selector: { app: connect-source }
+  ports:
+    - name: http
+      port: 4195
+      targetPort: 4195

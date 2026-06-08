@@ -1,0 +1,97 @@
+# QoS: last-write-wins. Consumes JetStream APP_EVENTS; for each delivery applies a
+# version-gated compare-and-set to region Redis (HSET only if incoming version is
+# strictly greater), then appends to the region-events ledger for observability.
+# Sink runs threads:4 + high max_in_flight ON PURPOSE — the CAS makes ordering
+# unnecessary, so reordering of same-key messages is expected and fenced.
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+
+input:
+  label: jetstream_source
+  nats_jetstream:
+    urls: ["{{ include "rrcs.nats.url" . }}"]
+    auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
+    subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
+    stream: {{ .Values.nats.stream.name | quote }}
+    # Shared consumer across N sink pods via a `queue` (deliver group), WITHOUT an
+    # explicit `durable` — this Connect build (4.92.0) rejects durable+queue together
+    # ("both 'queue' and 'durable' can't be set simultaneously"). The NATS client
+    # derives the consumer/durable name FROM the queue name, so the queue name MUST
+    # equal .Values.nats.stream.consumer.durable (region-writer): the subscriber JWT
+    # (scripts/gen-nats-auth.sh) grants CONSUMER.CREATE/INFO + $JS.ACK scoped to that
+    # exact name. All sink pods sharing this queue bind to ONE consumer, so each
+    # message goes to exactly one pod — the inter-pod reorder vector the fence survives.
+    queue: {{ .Values.nats.stream.consumer.durable | quote }}
+    deliver: all
+    ack_wait: 30s
+
+pipeline:
+  threads: 4
+  processors:
+    - mapping: |
+        meta key       = this.key
+        meta op        = this.op.or("set")
+        meta old_key   = this.old_key.or("")
+        meta new_key   = this.new_key.or("")
+        meta version   = this.version.string()
+        meta event_id  = this.event_id
+        meta value     = this.value
+        meta now_ms    = (timestamp_unix_nano() / 1000000).string()
+        root = this.value
+    # The last-write-wins compare-and-set. result: 1 applied, 0 stale, -1 duplicate.
+    # NOTE (de-risk T1.1): this image's `redis` processor has NO result_map field,
+    # and the eval result REPLACES message content. The Lua is embedded at Helm
+    # render time via toJson (single source: files/connect/lww_{set,rename}.lua) —
+    # bound to a `let` so its newlines/`;` don't break the array literal; no
+    # per-message file(). Route rename ops to the 2-key rename Lua; set/delete to
+    # the 1-key set Lua.
+    - switch:
+        - check: meta("op") == "rename"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/lww_rename.lua" | toJson }}
+                  root = [ $script, 2, meta("old_key"), meta("new_key"), meta("value"), meta("version"), meta("now_ms"), meta("event_id") ]
+        - processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/lww_set.lua" | toJson }}
+                  root = [ $script, 1, meta("key"), meta("value"), meta("version"), meta("op"), meta("now_ms"), meta("event_id") ]
+    # Capture the eval result. MUST be its own mapping (combining with a root
+    # reassignment yields null — de-risk T1.1).
+    - mapping: 'meta lww_applied = this.string()'
+    - mapping: |
+        meta lww_result = if meta("lww_applied") == "1" { "applied" } else if meta("lww_applied") == "0" { "stale" } else { "duplicate" }
+    # Export applied/stale/duplicate as a labelled counter for the verifier + dashboard.
+    - metric:
+        type: counter
+        name: lww_apply
+        labels:
+          result: ${! meta("lww_result") }
+          op: ${! meta("op") }
+    # Restore the original value as the body for the observability ledger
+    # (content() currently holds the eval result number).
+    - mapping: 'root = meta("value")'
+
+output:
+  label: region_ledger
+  redis_streams:
+    url: {{ include "rrcs.redis.region.url" . }}
+    stream: region-events
+    body_key: value
+    max_length: 100000
+    max_in_flight: 64
+    metadata:
+      exclude_prefixes: ["nats_"]
+
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true

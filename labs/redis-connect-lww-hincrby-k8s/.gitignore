@@ -1,0 +1,8 @@
+# Built Go binaries
+writer/writer
+collector/collector
+bin/
+# Rendered manifests
+out/
+# Local run output (sweep.json + generated report.html)
+reports/
