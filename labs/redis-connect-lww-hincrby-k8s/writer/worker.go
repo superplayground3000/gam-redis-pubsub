@@ -73,8 +73,17 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 	case OpRename:
 		oldKey := pat.Key("standby", epoch, id)
 		newKey := pat.Key("active", epoch, id)
+		// Record srcmax for the ACTIVE (new) key ONLY. The standby is intentionally
+		// not tracked: a rename's win is decided by lww_rename.lua's CAS gate on the
+		// ACTIVE key, so whether the standby tombstone actually applied depends on an
+		// outcome the producer cannot predict at mint time. If a later set (higher
+		// version) beats this rename on the active key, the rename is correctly
+		// rejected and the standby is never tombstoned — but srcmax[standby]=<renameVer>
+		// would then exceed region[standby].ver, a FALSE mismatch. In the sweep
+		// workload the standby is only ever a tombstone target (set/delete target
+		// active), so it has no producer-knowable authoritative max to verify; its
+		// tombstone semantics are covered deterministically by scripts/proof-rename.sh.
 		w.queueSrcmax(ctx, pipe, epoch, newKey, ver)
-		w.queueSrcmax(ctx, pipe, epoch, oldKey, ver)
 		val := payloadJSON(eid, nowMs, ver, pad)
 		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: w.StreamKey, MaxLen: w.StreamMaxLen, Approx: true,

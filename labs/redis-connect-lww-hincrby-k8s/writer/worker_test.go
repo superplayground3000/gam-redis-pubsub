@@ -139,3 +139,74 @@ func opWeightFor(op Op) OpWeights {
 		return OpWeights{Set: 1}
 	}
 }
+
+// TestRenameRecordsSrcmaxForActiveOnly is the regression test for the false
+// standby mismatch: a rename's win is decided by the active-key CAS, so the
+// producer cannot know whether the standby tombstone actually applied at mint
+// time. Recording srcmax[standby]=<renameVer> for a rename that later loses the
+// active-key gate manufactures srcmax > region.ver — a false mismatch. The writer
+// must record srcmax for the ACTIVE (new) key only on a rename.
+func TestRenameRecordsSrcmaxForActiveOnly(t *testing.T) {
+	mr, err := miniredis.Run()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mr.Close()
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	defer rdb.Close()
+	ctx := context.Background()
+
+	pat := Patterns[0]
+	epoch := "run-test"
+	activeKey := pat.Key("active", epoch, 0)
+	standbyKey := pat.Key("standby", epoch, 0)
+
+	w := &Worker{
+		ID: 0, Workers: 1, RDB: rdb, StreamKey: "app.events",
+		StreamMaxLen: 1000, PayloadBytes: 8, KeySpaceSize: 1,
+		Minter:   NewMinter(rdb),
+		Counters: &Counters{}, // Sent=0 -> Patterns[0], id=0
+		Ops:      NewOpPicker(OpWeights{Rename: 1}, rand.New(rand.NewSource(1))),
+		Epoch:    epoch,
+	}
+
+	pipe := rdb.TxPipeline()
+	gotKey, ver, err := w.emitOne(ctx, pipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if gotKey != activeKey {
+		t.Fatalf("rename returned key %q want active %q", gotKey, activeKey)
+	}
+
+	// Active key srcmax recorded at the rename version.
+	got, err := rdb.HGet(ctx, "srcmax:"+epoch, activeKey).Int64()
+	if err != nil {
+		t.Fatalf("srcmax missing for active key %s: %v", activeKey, err)
+	}
+	if got != ver {
+		t.Fatalf("srcmax[active]=%d want %d", got, ver)
+	}
+
+	// Standby key srcmax must NOT be recorded — its applied version depends on the
+	// active-key CAS outcome the producer can't predict.
+	if _, err := rdb.HGet(ctx, "srcmax:"+epoch, standbyKey).Result(); err != redis.Nil {
+		t.Fatalf("srcmax recorded for standby key %s (should be absent): err=%v", standbyKey, err)
+	}
+
+	// XADD must still carry both old_key and new_key so lww_rename.lua can tombstone.
+	msgs, err := rdb.XRange(ctx, "app.events", "-", "+").Result()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(msgs) != 1 {
+		t.Fatalf("want 1 stream entry, got %d", len(msgs))
+	}
+	v := msgs[0].Values
+	if v["old_key"] != standbyKey || v["new_key"] != activeKey || v["op"] != string(OpRename) {
+		t.Fatalf("rename XADD fields wrong: old_key=%v new_key=%v op=%v", v["old_key"], v["new_key"], v["op"])
+	}
+}
