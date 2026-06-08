@@ -26,3 +26,19 @@ func TestThreePatterns(t *testing.T) {
 		t.Fatalf("want 3 patterns, got %d", len(Patterns))
 	}
 }
+
+func TestEntityIDIsSharedHashTagContent(t *testing.T) {
+	p := Pattern{Domain: "company", Entity: "employees"}
+	ent := p.EntityID("run-1", 55688)
+	if want := "employees:run-1-55688"; ent != want {
+		t.Fatalf("EntityID=%q want %q", ent, want)
+	}
+	// Key must embed EntityID verbatim as the hash tag, for both statuses, so the
+	// counter field (EntityID) and the key's tag can never drift.
+	if got, want := p.Key("active", "run-1", 55688), "lb:company:active:{"+ent+"}"; got != want {
+		t.Fatalf("active key=%q want %q", got, want)
+	}
+	if got, want := p.Key("standby", "run-1", 55688), "lb:company:standby:{"+ent+"}"; got != want {
+		t.Fatalf("standby key=%q want %q", got, want)
+	}
+}

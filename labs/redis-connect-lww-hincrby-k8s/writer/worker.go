@@ -59,14 +59,20 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 	eid := newEventID()
 	pad := makePad(w.PayloadBytes)
 
+	// Single per-entity counter: every op (set, delete, rename) on this entity mints
+	// from kv:ver <ent>, so all versions for the entity are one comparable monotonic
+	// sequence. This is what makes set-after-rename win the sink CAS instead of being
+	// rejected as stale across two incomparable number spaces (the version flaw).
+	ent := pat.EntityID(epoch, id)
+	ver, err := w.Minter.NextForEntity(ctx, ent)
+	if err != nil {
+		return "", 0, err
+	}
+
 	switch op {
 	case OpRename:
 		oldKey := pat.Key("standby", epoch, id)
 		newKey := pat.Key("active", epoch, id)
-		ver, err := w.Minter.NextGlobal(ctx)
-		if err != nil {
-			return "", 0, err
-		}
 		w.queueSrcmax(ctx, pipe, epoch, newKey, ver)
 		w.queueSrcmax(ctx, pipe, epoch, oldKey, ver)
 		val := payloadJSON(eid, nowMs, ver, pad)
@@ -81,10 +87,6 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 		return newKey, ver, nil
 	default: // set | delete
 		key := pat.Key("active", epoch, id)
-		ver, err := w.Minter.NextPerKey(ctx, key)
-		if err != nil {
-			return "", 0, err
-		}
 		w.queueSrcmax(ctx, pipe, epoch, key, ver)
 		val := ""
 		if op == OpSet {

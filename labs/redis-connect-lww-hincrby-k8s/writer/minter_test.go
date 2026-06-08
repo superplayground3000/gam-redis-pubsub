@@ -18,16 +18,20 @@ func newMini(t *testing.T) (*redis.Client, func()) {
 	return rdb, func() { rdb.Close(); mr.Close() }
 }
 
-func TestMinterPerKeyMonotonicAcrossCallers(t *testing.T) {
+// TestMinterPerEntityMonotonicAcrossCallers proves the single per-entity counter
+// yields strictly-increasing, collision-free versions regardless of which caller
+// (op type) mints — the property that makes set/delete/rename versions comparable.
+func TestMinterPerEntityMonotonicAcrossCallers(t *testing.T) {
 	rdb, done := newMini(t)
 	defer done()
 	m := NewMinter(rdb)
 	ctx := context.Background()
+	ent := "employees:e-1"
 	seen := map[int64]bool{}
 	last := int64(0)
 	for i := 0; i < 10; i++ {
 		for range []int{0, 1} {
-			v, err := m.NextPerKey(ctx, "lb:company:active:{employees:e-1}")
+			v, err := m.NextForEntity(ctx, ent)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -42,14 +46,16 @@ func TestMinterPerKeyMonotonicAcrossCallers(t *testing.T) {
 	}
 }
 
-func TestMinterGlobalMonotonic(t *testing.T) {
+// TestMinterDistinctEntitiesAreIndependent confirms different entities keep their
+// own sequences (one HINCRBY field per entity, not a single global counter).
+func TestMinterDistinctEntitiesAreIndependent(t *testing.T) {
 	rdb, done := newMini(t)
 	defer done()
 	m := NewMinter(rdb)
 	ctx := context.Background()
-	a, _ := m.NextGlobal(ctx)
-	b, _ := m.NextGlobal(ctx)
-	if b <= a {
-		t.Fatalf("global not monotonic: %d then %d", a, b)
+	a1, _ := m.NextForEntity(ctx, "employees:e-1")
+	b1, _ := m.NextForEntity(ctx, "groups:e-2")
+	if a1 != 1 || b1 != 1 {
+		t.Fatalf("each entity should start at 1: a1=%d b1=%d", a1, b1)
 	}
 }
