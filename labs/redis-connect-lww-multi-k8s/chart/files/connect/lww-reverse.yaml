@@ -15,6 +15,12 @@ input:
     subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
     durable: {{ .Values.nats.stream.consumer.durable | quote }}
+    # Deliver group: lets all N sink pods share ONE durable push consumer and
+    # load-balance deliveries (each message → exactly one pod). Without this, the
+    # 2nd/3rd pod binding the same durable is rejected by NATS. This is what makes
+    # same-key messages land on DIFFERENT pods concurrently — the inter-pod reorder
+    # vector the LWW fence must survive.
+    queue: {{ printf "%s-q" .Values.nats.stream.consumer.durable | quote }}
     deliver: all
     ack_wait: 30s
 
