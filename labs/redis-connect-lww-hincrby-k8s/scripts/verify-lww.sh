@@ -84,12 +84,19 @@ run_proof "delete" bash "${SCRIPT_DIR}/proof-delete.sh" "${NS}" "$(REGION_POD)"
 run_proof "rename" bash "${SCRIPT_DIR}/proof-rename.sh" "${NS}" "$(REGION_POD)"
 
 # --- Rate sweep --------------------------------------------------------------
-# Parse SWEEP_TIERS (comma-separated). For each tier, render+apply the verifier
-# Job, wait for completion, parse its RESULT_JSON verdict, and accumulate a JSON
-# tier object. Track the highest tier whose verdict.pass==true.
-IFS=',' read -r -a TIERS <<<"${SWEEP_TIERS}"
+# Parse SWEEP_TIERS (comma-separated), sorted ascending so the "max passing tier"
+# is a true MONOTONIC ceiling: the highest tier such that it AND every lower tier
+# passed. A higher-tier pass must NOT mask a lower-tier failure. We also separate
+# two failure modes: a real LWW VIOLATION (mismatches/regressions > 0) hard-fails
+# the whole run at any tier; a throughput-ceiling fail (e.g. quiescence false —
+# the pipeline couldn't drain at that rate) just caps the ceiling, it is not a
+# correctness break.
+IFS=',' read -r -a _RAW_TIERS <<<"${SWEEP_TIERS}"
+mapfile -t TIERS < <(printf '%s\n' "${_RAW_TIERS[@]}" | sort -n)
 LOWEST_TIER="${TIERS[0]}"
 max_passing_tier=0
+ceiling_open=true   # once a tier fails, no higher tier counts toward the ceiling
+VIOLATION=false     # set true on any tier with mismatches>0 or regressions>0
 TIER_JSON='[]'
 
 run_tier() {
@@ -131,19 +138,32 @@ run_tier() {
   fi
 
   echo "[sweep] tier=${tier} ${result}"
-  local pass
+  local pass mism regr
   pass=$(jq -r '.verdict.pass' <<<"${result}")
+  mism=$(jq -r '.lww.mismatches' <<<"${result}")
+  regr=$(jq -r '.lww.regressions' <<<"${result}")
   TIER_JSON="$(jq --argjson rate "${tier}" --argjson r "${result}" \
     '. + [{rate:$rate,
            pass:($r.verdict.pass),
            mismatches:($r.lww.mismatches),
+           regressions:($r.lww.regressions),
            stale:($r.lww.stale),
            applied:($r.lww.applied),
            duplicate:($r.lww.duplicate),
            tombstones:($r.lww.tombstones)}]' \
     <<<"${TIER_JSON}")"
-  if [[ "$pass" == "true" ]] && (( tier > max_passing_tier )); then
+  # A real LWW violation at ANY tier hard-fails the run — it is not a throughput
+  # ceiling, the fence is broken.
+  if (( mism > 0 || regr > 0 )); then
+    echo "[sweep] tier=${tier} LWW VIOLATION: mismatches=${mism} regressions=${regr}"
+    VIOLATION=true
+  fi
+  # Monotonic ceiling: advance only while every tier so far has passed; the first
+  # failure closes the ceiling so no higher pass can mask it.
+  if [[ "$pass" == "true" ]] && [[ "$ceiling_open" == "true" ]]; then
     max_passing_tier="${tier}"
+  else
+    ceiling_open=false
   fi
 }
 
@@ -176,13 +196,18 @@ echo "[report] wrote reports/report.html"
 # --- Final verdict -----------------------------------------------------------
 # Pass iff every proof passed AND the sweep cleared at least the lowest tier.
 echo "[verify-lww] proofs: ${PROOF_RESULTS[*]}"
-echo "[verify-lww] max_passing_tier=${max_passing_tier} (lowest swept tier=${LOWEST_TIER})"
-if [[ "${allproofs}" == "true" ]] && (( max_passing_tier >= LOWEST_TIER )); then
-  echo "[verify-lww] PASS — all proofs green; sweep cleared >= ${LOWEST_TIER} (max ${max_passing_tier}). Report: reports/report.html"
+echo "[verify-lww] max_passing_tier=${max_passing_tier} (monotonic; lowest swept tier=${LOWEST_TIER}); violation=${VIOLATION}"
+# Pass iff: every proof passed, NO tier showed an LWW violation (mismatches/
+# regressions), and the monotonic ceiling cleared at least the lowest tier.
+if [[ "${VIOLATION}" == "true" ]]; then
+  echo "[verify-lww] FAIL — LWW VIOLATION observed in the sweep (a tier had mismatches/regressions > 0); the fence is broken. Report: reports/report.html"
+  exit 1
+elif [[ "${allproofs}" == "true" ]] && (( max_passing_tier >= LOWEST_TIER )); then
+  echo "[verify-lww] PASS — all proofs green; no LWW violation; max sustained tier=${max_passing_tier} msg/s. Report: reports/report.html"
   exit 0
 else
-  reason="proofs=${allproofs}, max_passing_tier=${max_passing_tier} < lowest ${LOWEST_TIER}"
-  [[ "${allproofs}" == "true" ]] && reason="sweep did not clear the lowest tier (${LOWEST_TIER}); max_passing_tier=${max_passing_tier}"
+  reason="proofs=${allproofs}; max_passing_tier=${max_passing_tier} < lowest ${LOWEST_TIER} (pipeline could not sustain even the lowest tier)"
+  [[ "${allproofs}" != "true" ]] && reason="a proof failed (${PROOF_RESULTS[*]})"
   echo "[verify-lww] FAIL — ${reason}. Report: reports/report.html"
   exit 1
 fi

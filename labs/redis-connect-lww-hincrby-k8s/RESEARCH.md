@@ -92,6 +92,14 @@ tombstone is physically deleted would otherwise resurrect the key with an old va
 horizon must be larger than the maximum possible reorder/redelivery delay. Keys whose
 `deleted_at` is missing or non-numeric are never reaped (safe over corrupt partial writes).
 
+The horizon also bounds a second race: the verifier compares region against
+`srcmax:<epoch>`, and a tombstoned key still counts (its `ver` is retained). If GC
+physically `DEL`ed a current-run tombstone *before* the comparison, that key would read as
+a false mismatch. With the defaults this cannot happen — `GC_HORIZON` (5 min) is far larger
+than a full sweep tier (~1 min), so current-epoch tombstones never age past the horizon
+during a run. If you shorten `gc.horizon` or greatly lengthen tier timings, keep the horizon
+comfortably above one tier's wall-clock to preserve this margin.
+
 ### Atomic dual-key rename: gate on active, tombstone standby
 
 `lww_rename.lua` handles the standby→active promotion atomically within a single Lua
