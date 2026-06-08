@@ -1,110 +1,170 @@
-# Redis → Connect Last-Write-Wins (Kubernetes) — RESEARCH
+# Redis → Connect LWW under Multiple Connect Instances (Kubernetes) — RESEARCH
 
 ## Property demonstrated
 
-A stale change (lower version) can never overwrite a newer change at the Redis KV
-sink, regardless of arrival order across a parallel pipeline — and we measure the
-sustained applied-write throughput of a single-instance sink that relies on this
-fence instead of strict ordering.
+Horizontally scaling the **relay** tier — N>1 `connect-source` *and* N>1
+`connect-sink` replicas — preserves the LWW compare-and-set fence exactly
+(`mismatches=0`, with `stale>0` now driven by *cross-instance* reordering),
+because correctness lives in Redis's atomic per-key `EVAL` and not in the
+pipeline; **but** scaling the **version-origin** tier (the writer) breaks LWW via
+a silent lost update that a version-only check cannot even detect.
 
-This lab is a Kubernetes/Helm fork of `../redis-redpanda-connect-stress-k8s`. The
-mechanism it verifies comes from `../../last-write-wins-lab/research.md` (the upstream
-design answer): a **last-write-wins compare-and-set (CAS) fence at the sink**.
+This lab is a fork of `../redis-connect-lww-k8s` (single-instance LWW), which
+itself forks `../redis-redpanda-connect-stress-k8s`. The fence mechanism comes
+from `../../last-write-wins-lab/research.md`.
+
+## Why this is the right question
+
+The parent lab deliberately excludes "HA / multi-pod sink" and runs exactly one
+pod per service; its parallelism — and therefore its reordering — is *intra-pod*
+(`pipeline.threads`, source `max_in_flight`). This lab takes the excluded case
+head-on: does the fence still hold when the reordering is *inter-pod* — when
+same-key messages are processed concurrently by *different* sink pods, and when
+the source stream is consumed in parallel by *different* source pods?
+
+The hypothesis (and the result this lab must prove or falsify) is that
+**multi-instance connect is safe**: `connect` never *mints* a version, it only
+*relays* one. Correctness is enforced by `chart/files/connect/lww_set.lua`, which
+Redis executes atomically and serially per key regardless of how many client
+connections or pods call it. Scaling the relay tier therefore adds reordering
+pressure that the fence absorbs; it does not add a new way to lose a write —
+correctness is independent of pod count and arrival order.
+
+The sharp contrast — and the reason this lab is more than a replica-count bump —
+is that scaling the **writer** is *not* safe, and the existing proof instrument is
+**blind** to the breakage. See "The negative result" below.
 
 ## Essentials (what is load-bearing)
 
-Pipeline: `writer → redis-central stream → connect-source → NATS JetStream →
-connect-sink → redis-region`. Same as the parent, with exactly one change in the data
-path: the sink's blind `SET` becomes a version-gated CAS.
+Pipeline is identical to the parent: `writer → redis-central stream →
+connect-source → NATS JetStream → connect-sink → redis-region`. Exactly two knobs
+change from `replicas: 1`: `connect-source` and `connect-sink` each run **3**
+pods (values-driven, `connect.source.replicas` / `connect.sink.replicas`). This
+introduces two **new inter-pod reorder vectors** that the parent (intra-pod only)
+never exercised:
 
-- **Per-key monotonic version.** The writer owns each key with a single goroutine
-  (`keyID % workers == i`) and stamps a strictly-increasing `version`. No clock
-  dependence; no two writers ever touch the same key.
-- **The CAS fence (`chart/files/connect/lww_set.lua`).** A Redis Lua `EVAL` applied
-  at connect-sink: `HSET val/ver` only if the incoming version is strictly greater
-  than the stored one. Returns `1` applied / `0` stale (strictly older) / `-1`
-  duplicate (equal). Order-independent and idempotent by construction; Redis
-  serializes per key, so it is correct without any pipeline ordering guarantees.
-- **The relaxation is the point.** Because correctness lives at the sink, the sink
-  runs `pipeline.threads: 4` and the source publishes with `max_in_flight: 256` —
-  which *causes* same-key reordering. The lab proves the fence survives it.
+1. **Source-side parallel consumption.** Three source pods share the
+   Redis-Streams consumer group `propagator` via distinct consumers
+   (`client_id: ${HOSTNAME}`). Redis Streams delivers each entry to exactly one
+   consumer, so the three pods drain `app.events` in parallel. The order in which
+   entries reach NATS no longer matches XADD order across pods.
+2. **Sink-side concurrent CAS.** Three sink pods share **one** JetStream durable
+   via a `queue` deliver group, so same-key messages can land on *different* pods
+   *concurrently*, each issuing an `EVAL` for the same key. Redis serializes them
+   per key; the fence must yield the correct final state regardless of the
+   inter-pod interleaving.
 
-### Wire contract (enough to re-implement a client)
+## Wire contract delta vs parent
 
-- Writer XADD fields on `app.events`: `value` (JSON body), `event_id`, `key`
-  (`lww:<epoch>:<id>`), `pattern`, `t_send_ms`, `version` (int).
-- connect-sink CAS call: `EVAL lww_set.lua 1 <key> <value> <version>`.
-- Sink metric: `lww_apply_total{result=applied|stale|duplicate}` at `:4195/metrics`.
-- Writer control plane: `POST /reset {"epoch":"<id>"}`, `GET /state` →
-  `{boot_id, epoch, keys{<key>:<maxVer>}, distinct_keys, total_versions}`,
-  `POST /rate {"rate":n}`, `GET /metrics`.
+The writer XADD fields, the `EVAL lww_set.lua 1 <key> <value> <version>` CAS
+call, and the sink metric `lww_apply_total{result=applied|stale|duplicate}` are
+all unchanged from the parent. The deltas are:
 
-## How the proof is made unambiguous (spec §3.4.1)
+- **Sink input** (`chart/files/connect/lww-reverse.yaml`) adds
+  `queue: region-writer-q` to its `nats_jetstream` input, making all N sink pods
+  share one durable push consumer and load-balance deliveries (each message →
+  exactly one pod).
+- **Verifier metric scrape.** `lww_apply` is a per-pod counter. The parent
+  scraped one ClusterIP URL, which round-robins to a single pod and can hit
+  different pods on baseline vs. final scrape → garbage deltas. The verifier now
+  resolves the headless Service `lab-connect-sink-headless` (`clusterIP: None`,
+  one DNS A-record per ready pod), scrapes every pod's `:4195/metrics`, and
+  **sums** applied/stale/duplicate for both the baseline and the end-of-window
+  scrape; the proof delta is `sum_end − sum_baseline`.
+- **Fail-loud guard.** The per-IP set and per-IP baseline are captured at sustain
+  start and re-scraped at end. If the pod set changed, an IP is unreachable, or
+  any pod's current counter is *below* its baseline (a restart resetting
+  cumulative counters), the scrape is a hard precondition failure — never a
+  silent under-count.
+- **Correctness check UNCHANGED.** `verifier/lww.go::CompareVersions` reads region
+  Redis directly (the single source of truth) and is already pod-count-independent;
+  `mismatches=0` remains the robust correctness signal.
 
-`stale > 0` only proves reordering-was-fenced under a precondition the verifier
-*asserts*, not assumes:
+## The negative result (Proof C)
 
-> the run's keys begin with no stored version, numbered by a single non-restarting
-> monotonic writer.
+`verifier/lww.go::CompareVersions` tallies a mismatch on `regionVer != srcMax` —
+it compares **version only, never value**. Consequence, with two uncoordinated
+writers on a shared key:
 
-Guards: a **fresh per-run epoch key namespace** (`lww:<epoch>:<id>`) so the store is
-provably empty for the run; a **writer `boot_id`** checked unchanged across the window
-(no mid-run restart); **windowed counter deltas** (baseline at sustain start) so a
-prior run / warmup / the deterministic Proof A cannot satisfy the signal; and the
-**3-way Lua** so equal-version duplicates (routine at-least-once redelivery) are
-counted separately and excluded from the proof. A no-op fence fails two independent
-ways (`stale==0` and, under reorder, `mismatches>0`).
+- Both stamp the key with the *same* monotonic version sequence (each starts at 1
+  and increments independently) and both reach some max version `K`. Region ends
+  at version `K`, which **equals** each writer's max → `CompareVersions` reports
+  `mismatches=0` → verdict PASS.
+- But the two writers wrote *different values* at version `K`. The fence's `EVAL`
+  keeps whichever landed first; the second arrives with an *equal* version and is
+  dropped down the Lua's `duplicate` (`-1`) branch. **A committed update is
+  silently lost** — no `stale`, no `mismatch`, no `regression`.
 
-## Validated result (kind, single instance)
+So a version-only fence verified by a version-only check cannot see a concurrent
+same-version lost update. This is why multi-**writer** breaks LWW *invisibly*, and
+why the single-writer-per-key precondition is load-bearing. The fence is safe
+under multi-**connect** precisely because connect never violates that precondition;
+multi-**writer** does.
 
-`scripts/verify-lww.sh` on a local `kind` cluster:
+## How the proof is made unambiguous
 
-- **Proof A** (deterministic): apply versions 3,1,2 then replay 3 to one key →
-  returns `1 0 0 -1`, final `ver=3 val=v3`. The fence works in isolation.
-- **Proof B** (end-to-end): drive the writer through the real parallel pipeline,
-  wait for quiescence, compare every key's region version to the writer's source max.
-  - @ 5,000 msg/s: `rate_achieved≈4999.96`, `stale=2726`, `mismatches=0`,
-    `regressions=0`, `writes_per_key≈5091`, **pass**.
-  - @ 20,000 msg/s (writer cap): `rate_achieved≈19999.6`, `stale=7014`,
-    `mismatches=0`, **pass**.
+The harness runs three proofs (see `scripts/verify-lww.sh`); exit 0 requires all
+three:
 
-**Throughput estimate:** a single connect-sink pod sustains **≥20,000 applied
-writes/s** with zero LWW violations (the writer's `MAX_RATE` cap, not an observed
-ceiling — the sink kept up with no backlog, so the true ceiling is higher). The
-non-zero `stale` count is the system working: thousands of strictly-older arrivals
-were reordered and fenced while the final per-key state stayed exactly correct.
+- **Proof A — deterministic mechanism.** Apply versions 3,1,2 then replay 3 to one
+  key, direct to redis-region → returns `1 0 0 -1`, final `ver=3 val=v3`. The
+  fence works in isolation.
+- **Proof C — deterministic negative.** Scripted, direct against redis-region via
+  `lww_set.lua` (`scripts/proof-c.sh`): two uncoordinated writers apply
+  interleaved versions `1..K`, asserting (a) the version-only check would report
+  `mismatches=0` (PASS) yet (b) the value check shows exactly one writer's
+  version-`K` commit survives — the other was rejected as `duplicate` with no
+  signal. Labelled unambiguously: *single-writer-per-key precondition violated →
+  LWW broken, invisibly to the version-only instrument.*
+- **Proof B′ — end-to-end positive.** Drive the writer through the real pipeline
+  with 3 source + 3 sink pods. It keeps the parent's precondition guards — fresh
+  per-run epoch key namespace (store provably empty at start), writer `boot_id`
+  checked unchanged (no mid-run restart), pipeline quiesced, windowed counter
+  deltas, and `stale > 0` required — *and* adds the per-pod metric aggregation
+  across all sink pods with the restart guard above. Pass requires
+  `mismatches == 0` and `regressions == 0` and `stale > 0`. This is the parent's
+  exact bar, now met under inter-pod concurrency.
 
-## Design decisions
+## Validated result
 
-- **Version token = per-key logical counter, single writer per key** (research's
-  "best" option) — clean integer compare, no clock skew, makes the reorder proof
-  deterministic.
-- **Single instance** — one pod per service; the parallelism (and thus reordering)
-  is intra-pod (`threads`/`max_in_flight`). Demonstrates the fence without HA noise.
-- **Small keyspace (32)** — same-key messages must land inside the pipeline's
-  in-flight windows to reorder; a large keyspace spaces them out and yields
-  inconclusive (`stale=0`) runs. Empirically tuned (see `chart/values.yaml`).
-- **Lua embedded at Helm render time** (`toJson`) rather than a mounted file —
-  single source of truth, no per-message file read. (The image's `redis` processor
-  has no `result_map`; the eval result is captured by a trailing `mapping`.)
+_Pending: numbers recorded after `scripts/verify-lww.sh` passes on kind (see plan
+Task 8)._
 
-### Rejected alternatives (from upstream research)
+This lab's ethos is that docs do not assert throughput numbers, stale counts, or
+"it passes" before an actual validation run. The end-to-end run is a later task;
+the figures (rate achieved, stale count, applied writes/s) will be filled in here
+from that run's `RESULT_JSON` once Proof A + Proof C + Proof B′ all exit 0.
 
-- **NATS-side timestamp/discard** — JetStream discard is limit-triggered, never
-  "apply only if newer"; `DiscardNewPerSubject` is first-write-wins (the opposite).
-- **Source-side `now()` timestamp** — stamps processing time; redelivery/reclaim
-  makes a stale event look newer. The version must come from the source of truth.
+## Design decisions / rejected alternatives
+
+- **Deliver group (shared durable) over per-pod-durable fan-out.** A `queue`
+  deliver group lets all N sink pods share one JetStream durable so each message
+  is processed once — realistic HA work-distribution. A per-pod-durable fan-out
+  (every pod processes every message) would still prove the fence's idempotency
+  under concurrent duplicate CAS, but is not realistic HA. Which variant the
+  `nats_jetstream` input actually supports is confirmed empirically during the run
+  (the Research/build stage selects and confirms the shared-durable path; the
+  fan-out is documented only as a last resort).
+- **DNS enumeration over the Kubernetes API.** The verifier discovers sink pods by
+  resolving the headless Service name (`net.LookupHost`), not by listing pods via
+  the API server — no RBAC / ServiceAccount permissions needed.
+- **Version token = per-key logical counter, single writer per key** (carried from
+  the parent): clean integer compare, no clock skew, deterministic reorder proof.
 
 ## Deliberately excluded
 
-- HA / multi-pod sink and Redis Cluster (single instance only here).
-- Chaos/crash-replay, the tier × mode × QoS matrix, latency SLOs (carried by the
-  parent lab; dropped to keep one concern).
-- Event-time / wall-clock LWW and its skew hazard (we use a logical counter).
-- Deletes / tombstones (keys are never deleted).
+- **The writer-HA fix.** Proof C shows the *break* only; leader election or
+  hash-partitioned key ownership across writer pods (the cure) is out of scope.
+- **Redis Cluster / sharded region.** Single region instance; the fence's per-key
+  atomicity is under test, not cross-shard coordination.
+- **Sink autoscaling (HPA), chaos / pod-kill mid-run, latency SLOs.** Carried or
+  excluded by ancestor labs; dropped here to keep one concern.
+- **Event-time / wall-clock LWW.** The version is a logical per-key counter, as in
+  the parent.
 
 ## Further reading
 
 - `../../last-write-wins-lab/research.md` — the upstream mechanism design.
-- `../../docs/superpowers/specs/2026-06-04-redis-connect-lww-k8s-design.md` — this lab's spec (§3.4.1 precondition).
-- `../redis-redpanda-connect-stress-k8s/` — the parent stress lab this forks.
+- `../../docs/superpowers/specs/2026-06-05-redis-connect-lww-multi-k8s-design.md` — this lab's spec.
+- `../redis-connect-lww-k8s/` — the single-instance parent lab.
+- `../redis-redpanda-connect-stress-k8s/` — the grandparent stress lab.
