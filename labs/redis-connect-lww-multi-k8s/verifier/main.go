@@ -23,7 +23,8 @@ func main() {
 		writerURL   = flag.String("writer", "http://writer:8081", "writer URL")
 		region      = flag.String("redis-region", "redis-region:6379", "")
 		central     = flag.String("redis-central", "redis-central:6379", "")
-		connectSink = flag.String("connect-sink", "http://connect-sink:4195", "")
+		connectSinkDNS  = flag.String("connect-sink-dns", "connect-sink-headless", "headless Service DNS name resolving to every sink pod IP")
+		connectSinkPort = flag.String("connect-sink-port", "4195", "sink pod metrics port")
 		natsURL     = flag.String("nats", "http://nats:8222", "NATS monitoring URL")
 		natsStream  = flag.String("nats-stream", "APP_EVENTS", "")
 		sampleN     = flag.Int("empty-sample", 64, "keys to probe for empty-store precondition")
@@ -81,10 +82,11 @@ func main() {
 	// connect-sink counters are cumulative since the pod started, so all proof
 	// signals are deltas against this baseline. A failed baseline scrape would make
 	// the deltas garbage (full lifetime counters), so it is a hard precondition fail.
-	a0, s0, d0, err := ScrapeLWW(ctx, *connectSink)
+	sinkBase, err := NewSinkBaseline(ctx, *connectSinkDNS, *connectSinkPort)
 	if err != nil {
-		log.Fatalf("baseline scrape (connect-sink /metrics): %v", err)
+		log.Fatalf("baseline scrape (sink pods via %s): %v", *connectSinkDNS, err)
 	}
+	log.Printf("aggregating lww_apply across %d sink pods", sinkBase.PodCount())
 
 	// 5. Sustain at full rate, sampling throughput each second. lastSent is seeded
 	// from a FRESH scrape at the start of each window (not a shared closure var) so
@@ -114,15 +116,15 @@ func main() {
 				lastSent, lastAt = sent, time.Now()
 			}
 		}
-		a, s, d, serr := ScrapeLWW(ctx, *connectSink)
+		a, s, d, serr := sinkBase.Delta(ctx)
 		if serr != nil {
-			log.Printf("WARN end-of-window scrape: %v", serr)
+			log.Fatalf("end-of-window sink aggregation: %v", serr)
 		}
 		rateAvg := 0.0
 		if n > 0 {
 			rateAvg = sumRate / n
 		}
-		return a - a0, s - s0, d - d0, rateAvg
+		return a, s, d, rateAvg
 	}
 	applied, stale, duplicate, rateAvg := runStale(*duration)
 
