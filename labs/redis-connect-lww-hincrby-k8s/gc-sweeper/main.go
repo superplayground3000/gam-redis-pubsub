@@ -34,9 +34,9 @@ func main() {
 
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { w.Write([]byte("ok")) })
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "gc_reaped_total %d\n", s.Reaped)
-		fmt.Fprintf(w, "gc_tombstones %d\n", s.Tombstones)
-		fmt.Fprintf(w, "gc_oldest_tombstone_age_ms %d\n", s.OldestAgeMs)
+		fmt.Fprintf(w, "gc_reaped_total %d\n", s.Reaped.Load())
+		fmt.Fprintf(w, "gc_tombstones %d\n", s.Tombstones.Load())
+		fmt.Fprintf(w, "gc_oldest_tombstone_age_ms %d\n", s.OldestAgeMs.Load())
 	})
 	go func() { log.Fatal(http.ListenAndServe(*metricsAddr, nil)) }()
 
@@ -47,7 +47,7 @@ func main() {
 		if err != nil && ctx.Err() == nil {
 			log.Printf("sweep error: %v", err)
 		} else if n > 0 {
-			log.Printf("reaped %d tombstones (total %d, oldest %dms)", n, s.Reaped, s.OldestAgeMs)
+			log.Printf("reaped %d tombstones (total %d, oldest %dms)", n, s.Reaped.Load(), s.OldestAgeMs.Load())
 		}
 		select {
 		case <-ctx.Done():

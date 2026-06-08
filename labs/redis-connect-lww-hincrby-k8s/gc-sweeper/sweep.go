@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"log"
 	"strconv"
+	"sync/atomic"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -10,13 +12,16 @@ import (
 // Sweeper reaps tombstones (deleted=1) older than HorizonMs. Physical DEL only
 // after the horizon so a very-late stale write cannot resurrect a key the fence
 // already tombstoned (design-doc §7 GC).
+//
+// Reaped/Tombstones/OldestAgeMs are read concurrently by the /metrics HTTP
+// handler while SweepOnce writes them, so they are atomic.
 type Sweeper struct {
 	RDB         *redis.Client
 	HorizonMs   int64
 	ScanCount   int64
-	Reaped      int64
-	Tombstones  int64
-	OldestAgeMs int64
+	Reaped      atomic.Int64
+	Tombstones  atomic.Int64
+	OldestAgeMs atomic.Int64
 }
 
 // SweepOnce scans the keyspace once and DELs eligible tombstones, using `now` (ms)
@@ -35,7 +40,20 @@ func (s *Sweeper) SweepOnce(ctx context.Context, now int64) (int64, error) {
 				continue
 			}
 			tombstones++
-			da, _ := strconv.ParseInt(toS(vals[1]), 10, 64)
+			raw, ok := vals[1].(string)
+			if !ok {
+				// deleted_at field absent — HMGet yields nil for a missing field.
+				log.Printf("gc: tombstone %s has missing deleted_at; skipping reap", k)
+				continue
+			}
+			da, perr := strconv.ParseInt(raw, 10, 64)
+			if perr != nil {
+				// Partial-write tombstone: deleted=1 but deleted_at non-numeric.
+				// Never reap — we cannot prove it is past the horizon, and a bogus
+				// da=0 would otherwise resurrect a fenced key.
+				log.Printf("gc: tombstone %s has corrupt deleted_at (%v); skipping reap", k, vals[1])
+				continue
+			}
 			if age := now - da; age > oldest {
 				oldest = age
 			}
@@ -50,15 +68,8 @@ func (s *Sweeper) SweepOnce(ctx context.Context, now int64) (int64, error) {
 			break
 		}
 	}
-	s.Reaped += reaped
-	s.Tombstones = tombstones
-	s.OldestAgeMs = oldest
+	s.Reaped.Add(reaped)
+	s.Tombstones.Store(tombstones)
+	s.OldestAgeMs.Store(oldest)
 	return reaped, nil
-}
-
-func toS(v any) string {
-	if s, ok := v.(string); ok {
-		return s
-	}
-	return "0"
 }
