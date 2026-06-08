@@ -115,9 +115,29 @@ script (Redis executes it serially per the hash-tag slot):
 
 Both keys carry the same hash tag `{<entity>:<epoch>-<id>}` (see `writer/keys.go`), which
 guarantees they land on the same Redis slot. The atomic dual-key operation is therefore
-possible on a single-node Redis and on a Redis Cluster (all keys in the same slot). The
-rename version comes from the global counter `kv:gver`, which produces a value guaranteed
-to be larger than any per-key counter for either key at the time of the rename.
+possible on a single-node Redis and on a Redis Cluster (all keys in the same slot).
+
+**Version source — one counter per entity, not a global sequencer.** Every op on an entity
+(set/delete on the active key, and the rename promotion) mints from a SINGLE per-entity
+counter, `HINCRBY kv:ver <entity-id> 1`, where `<entity-id>` is the immutable hash-tag
+content shared by the active and standby variants (`Pattern.EntityID`). This is the key
+correctness property: all versions for an entity live in ONE comparable, monotonic
+sequence, so a `set` issued after a `rename` always carries the higher version and wins the
+sink CAS (LWW holds). An earlier design used a separate global counter (`kv:gver`) for
+rename; that was abandoned because it put rename versions and set/delete versions in two
+incomparable number spaces on the same active key — a set after a rename could then be
+silently dropped as "stale" against the (much larger) global value. The immutable-ID +
+single-counter approach is the design doc's §9 recommendation.
+
+**Why the verifier does not track the standby key.** The producer records `srcmax` only for
+the active (new) key on a rename, never for the standby (old) key. A rename's outcome is
+gated on the active key's CAS, so the producer cannot know at mint time whether the standby
+tombstone actually applied: if a higher-versioned set beats the rename on the active key,
+the fence correctly rejects the rename and the standby is left untouched — but a recorded
+`srcmax[standby]` would then exceed the standby's region version and manufacture a false
+mismatch. In the sweep the standby is only ever a tombstone target with no producer-knowable
+authoritative max, so it is excluded from the comparison; the deterministic
+`scripts/proof-rename.sh` validates standby tombstone semantics precisely instead.
 
 ### Per-epoch key isolation
 
