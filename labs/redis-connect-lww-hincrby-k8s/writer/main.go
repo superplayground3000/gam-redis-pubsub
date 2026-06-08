@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"log"
 	mrand "math/rand"
 	"net/http"
@@ -101,15 +102,22 @@ func main() {
 	<-sigC
 	log.Println("shutdown: draining")
 	lim.Set(0)
-	httpSrv.Shutdown(context.Background())
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = httpSrv.Shutdown(shutdownCtx)
+	shutdownCancel()
 	cancel()
 	wg.Wait()
 }
 
-// newBootID returns a random 8-byte hex id, stable for the process lifetime.
+// newBootID returns a random 8-byte hex id, stable for the process lifetime. If
+// the OS RNG fails it falls back to a deterministic pid-based id rather than ever
+// returning an empty/garbage BootID (which the verifier keys runs off of).
 func newBootID() string {
 	b := make([]byte, 8)
-	_, _ = rand.Read(b)
+	if _, err := rand.Read(b); err != nil {
+		log.Printf("WARN: crypto/rand failed for boot_id (%v); falling back to pid-based id", err)
+		return fmt.Sprintf("pid-%d-fallback", os.Getpid())
+	}
 	return hex.EncodeToString(b)
 }
 

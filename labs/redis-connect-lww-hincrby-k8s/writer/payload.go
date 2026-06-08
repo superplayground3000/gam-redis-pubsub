@@ -32,11 +32,14 @@ func newEventID() string { return uuid.NewString() }
 
 func makePad(n int) string { return strings.Repeat("x", n) }
 
-// payloadJSON is the snapshot body carried in the stream value field.
+// payloadJSON is the snapshot body carried in the stream value field. ts_ns is
+// derived from tsMs (the same instant carried in the t_send_ms metadata) so the
+// body timestamp and the latency metadata agree rather than drifting by the few
+// microseconds between two time.Now() calls.
 func payloadJSON(eventID string, tsMs, version int64, pad string) string {
 	b, _ := json.Marshal(map[string]any{
 		"event_id": eventID,
-		"ts_ns":    time.Now().UnixNano(),
+		"ts_ns":    tsMs * 1_000_000,
 		"version":  version,
 		"pad":      pad,
 	})

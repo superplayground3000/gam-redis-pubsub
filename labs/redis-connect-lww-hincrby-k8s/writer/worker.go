@@ -34,10 +34,22 @@ func (w *Worker) epoch() string {
 	return w.Epoch
 }
 
-// emitOne picks an op, builds the key(s), mints a version (HINCRBY), records it
-// into srcmax:<epoch> (hmax via HSET-max), and queues the XADD onto pipe. Returns
-// the primary kv_key and version used. Mint + srcmax happen eagerly (they must
-// precede the XADD on the wire); only the XADD is pipelined.
+// emitOne picks an op, builds the key(s), mints a version (HINCRBY), and QUEUES
+// both the srcmax record (hmax EVAL) and the XADD onto pipe. Returns the primary
+// kv_key and version used.
+//
+// Atomicity: the HINCRBY mint is eager (a minted-but-unpublished version just
+// leaves a harmless gap in kv:ver — the verifier's fence compares with > only, so
+// gaps are fine). The srcmax record and the XADD are BOTH queued onto the same
+// pipeliner; when Run Exec's it as a MULTI/EXEC, they commit together. A failed
+// Exec applies NEITHER, so srcmax never claims a version that wasn't published —
+// which would otherwise be a permanent false mismatch in CompareSrcMax.
+//
+// /reset race: epoch is read ONCE here so this event is internally consistent —
+// its key and its srcmax entry use the same epoch. A late old-epoch event that is
+// published after a /reset lands in srcmax:<old-epoch> under an old-epoch key,
+// which the verifier (reading srcmax:<new-epoch>) never inspects. Epoch-in-key
+// isolation thus makes the reset race benign with no extra synchronization.
 func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int64, error) {
 	epoch := w.epoch()
 	pat := Patterns[w.Counters.Sent.Load()%int64(len(Patterns))]
@@ -55,12 +67,8 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 		if err != nil {
 			return "", 0, err
 		}
-		if err := w.recordSrcmax(ctx, epoch, newKey, ver); err != nil {
-			return "", 0, err
-		}
-		if err := w.recordSrcmax(ctx, epoch, oldKey, ver); err != nil {
-			return "", 0, err
-		}
+		w.queueSrcmax(ctx, pipe, epoch, newKey, ver)
+		w.queueSrcmax(ctx, pipe, epoch, oldKey, ver)
 		val := payloadJSON(eid, nowMs, ver, pad)
 		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: w.StreamKey, MaxLen: w.StreamMaxLen, Approx: true,
@@ -77,9 +85,7 @@ func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int
 		if err != nil {
 			return "", 0, err
 		}
-		if err := w.recordSrcmax(ctx, epoch, key, ver); err != nil {
-			return "", 0, err
-		}
+		w.queueSrcmax(ctx, pipe, epoch, key, ver)
 		val := ""
 		if op == OpSet {
 			val = payloadJSON(eid, nowMs, ver, pad)
@@ -101,8 +107,10 @@ func (w *Worker) pickID() int64 {
 	return int64(w.Counters.Sent.Load()) % w.KeySpaceSize
 }
 
-func (w *Worker) recordSrcmax(ctx context.Context, epoch, key string, ver int64) error {
-	return w.RDB.Eval(ctx, hmaxScript, []string{"srcmax:" + epoch}, key, ver).Err()
+// queueSrcmax queues the hmax (HSET-to-max) EVAL onto pipe so it commits in the
+// same MULTI/EXEC as the XADD — see emitOne's atomicity note.
+func (w *Worker) queueSrcmax(ctx context.Context, pipe redis.Pipeliner, epoch, key string, ver int64) {
+	pipe.Eval(ctx, hmaxScript, []string{"srcmax:" + epoch}, key, ver)
 }
 
 func (w *Worker) Run(ctx context.Context) {
@@ -132,7 +140,10 @@ func (w *Worker) Run(ctx context.Context) {
 			continue
 		}
 		w.Counters.Inflight.Add(1)
-		pipe := w.RDB.Pipeline()
+		// TxPipeline => MULTI/EXEC: every event's XADD + srcmax EVAL in this batch
+		// commit atomically, so a failed Exec applies none of them (srcmax never
+		// outruns the published stream).
+		pipe := w.RDB.TxPipeline()
 		var n int
 		for i := 0; i < depth; i++ {
 			if _, _, err := w.emitOne(ctx, pipe); err != nil {
