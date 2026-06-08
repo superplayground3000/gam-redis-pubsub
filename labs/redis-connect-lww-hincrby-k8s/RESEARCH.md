@@ -1,214 +1,179 @@
-# Redis → Connect LWW under Multiple Connect Instances (Kubernetes) — RESEARCH
+# Redis → Connect LWW with HINCRBY Shared Counter (Kubernetes) — RESEARCH
 
 ## Property demonstrated
 
-Horizontally scaling the **relay** tier — N>1 `connect-source` *and* N>1
-`connect-sink` replicas — preserves the LWW compare-and-set fence exactly
-(`mismatches=0`, with `stale>0` now driven by *cross-instance* reordering),
-because correctness lives in Redis's atomic per-key `EVAL` and not in the
-pipeline; **but** scaling the **version-origin** tier (the writer) breaks LWW via
-a silent lost update that a version-only check cannot even detect.
+Under **multiple uncoordinated writers writing to the same keys**, with versions minted by
+a shared `HINCRBY` counter on central Redis (`kv:ver` for set/delete, `kv:gver` for
+rename), the last-write-wins compare-and-set fence holds exactly (`mismatches=0`, `stale>0`)
+across **set**, **delete** (tombstone + GC), and **atomic standby→active rename** — through
+3 connect-source and 3 connect-sink pods. The lab also sweeps a rate ladder and identifies
+the maximum sustained throughput at which this property holds.
 
-This lab is a fork of `../redis-connect-lww-k8s` (single-instance LWW), which
-itself forks `../redis-redpanda-connect-stress-k8s`. The fence mechanism comes
-from `../../last-write-wins-lab/research.md`.
+This inverts the parent lab's lesson: `redis-connect-lww-multi-k8s` proved multi-writer-
+same-key is **unsafe** with a local counter (Proof C); this lab proves it is **safe** with
+`HINCRBY` (Proof MW+). The negative control (Proof MW-) is retained in the same harness so
+the contrast is immediate and unambiguous.
 
 ## Why this is the right question
 
-The parent lab deliberately excludes "HA / multi-pod sink" and runs exactly one
-pod per service; its parallelism — and therefore its reordering — is *intra-pod*
-(`pipeline.threads`, source `max_in_flight`). This lab takes the excluded case
-head-on: does the fence still hold when the reordering is *inter-pod* — when
-same-key messages are processed concurrently by *different* sink pods, and when
-the source stream is consumed in parallel by *different* source pods?
+The parent lab's Proof C demonstrated a silent lost update: two writers each maintaining a
+local counter both reach version `K` and one's value is dropped as a `duplicate` with no
+signal. The parent's conclusion was that the single-writer-per-key precondition is load-
+bearing. This lab challenges that conclusion: **what if a shared, atomic version source
+eliminates version collisions entirely?**
 
-The hypothesis (and the result this lab must prove or falsify) is that
-**multi-instance connect is safe**: `connect` never *mints* a version, it only
-*relays* one. Correctness is enforced by `chart/files/connect/lww_set.lua`, which
-Redis executes atomically and serially per key regardless of how many client
-connections or pods call it. Scaling the relay tier therefore adds reordering
-pressure that the fence absorbs; it does not add a new way to lose a write —
-correctness is independent of pod count and arrival order.
+The answer, borne out by the fence and the proofs: yes. `HINCRBY` on a single Redis hash
+field serializes version minting across all writers for a given key, so every `XADD` event
+carries a globally unique, strictly-increasing version. The CAS fence at the sink then
+works correctly regardless of how many writers are running, because no two writers ever
+hold the same version for the same key at the same moment.
 
-The sharp contrast — and the reason this lab is more than a replica-count bump —
-is that scaling the **writer** is *not* safe, and the existing proof instrument is
-**blind** to the breakage. See "The negative result" below.
+## Design decisions
 
-## Essentials (what is load-bearing)
+### HINCRBY as the version source
 
-Pipeline is identical to the parent: `writer → redis-central stream →
-connect-source → NATS JetStream → connect-sink → redis-region`. Exactly two knobs
-change from `replicas: 1`: `connect-source` and `connect-sink` each run **3**
-pods (values-driven, `connect.source.replicas` / `connect.sink.replicas`). This
-introduces two **new inter-pod reorder vectors** that the parent (intra-pod only)
-never exercised:
+`v = HINCRBY kv:ver <kv_key> 1` (source Redis, before `XADD`) mints the version for
+set/delete operations (`writer/version.go: Minter.NextPerKey`). For rename, a separate
+global counter `HINCRBY kv:gver global 1` is used (`Minter.NextGlobal`) because a rename
+must atomically dominate two key sequences (active and standby), and a per-key counter
+cannot guarantee it dominates both simultaneously.
 
-1. **Source-side parallel consumption.** Three source pods share the
-   Redis-Streams consumer group `propagator` via distinct consumers
-   (`client_id: ${HOSTNAME}`). Redis Streams delivers each entry to exactly one
-   consumer, so the three pods drain `app.events` in parallel. The order in which
-   entries reach NATS no longer matches XADD order across pods.
-2. **Sink-side concurrent CAS.** Three sink pods share **one** JetStream durable
-   via a `queue` deliver group, so same-key messages can land on *different* pods
-   *concurrently*, each issuing an `EVAL` for the same key. Redis serializes them
-   per key; the fence must yield the correct final state regardless of the
-   inter-pod interleaving.
+**Why HINCRBY makes multi-writer-same-key safe:**
+- Redis serializes all `HINCRBY` calls to a given hash field on a single thread. Every
+  writer — regardless of concurrency — gets a distinct integer. No two writers share a
+  version for the same key. The fence's `v > stored_ver` is always comparing distinct
+  values, so the `duplicate` branch (`v == stored_ver`) is never triggered by a real
+  competing write.
+- There is no in-process counter in the writer. A writer restart does not reset any
+  sequence; it just issues the next `HINCRBY` from wherever Redis is.
+- Gaps in `kv:ver` are harmless: a minted-but-unpublished version leaves a gap that the
+  fence's strict `>` absorbs without issue. The verifier compares against the minted max,
+  not a contiguous sequence.
 
-## Wire contract delta vs parent
+### srcmax:<epoch> — authoritative source-of-truth for the verifier
 
-The writer XADD fields, the `EVAL lww_set.lua 1 <key> <value> <version>` CAS
-call, and the sink metric `lww_apply_total{result=applied|stale|duplicate}` are
-all unchanged from the parent. The deltas are:
+Under HINCRBY, a key's `kv:ver` in central Redis records the highest version ever minted,
+not the highest version actually published to the stream. These diverge if a pipeline
+execution fails after minting but before the `XADD` commits.
 
-- **Sink input** (`chart/files/connect/lww-reverse.yaml`) adds a queue-only deliver
-  group `queue: region-writer` to its `nats_jetstream` input (no separate `durable`,
-  since connect 4.92.0 forbids `durable`+`queue` together; the queue name must equal
-  the durable name `region-writer` so the derived consumer name matches the
-  subscriber JWT grants). All N sink pods join this one deliver group and
-  load-balance deliveries (each message → exactly one pod).
-- **Verifier metric scrape.** `lww_apply` is a per-pod counter. The parent
-  scraped one ClusterIP URL, which round-robins to a single pod and can hit
-  different pods on baseline vs. final scrape → garbage deltas. The verifier now
-  resolves the headless Service `lab-connect-sink-headless` (`clusterIP: None`,
-  one DNS A-record per ready pod), scrapes every pod's `:4195/metrics`, and
-  **sums** applied/stale/duplicate for both the baseline and the end-of-window
-  scrape; the proof delta is `sum_end − sum_baseline`.
-- **Fail-loud guard.** The per-IP set and per-IP baseline are captured at sustain
-  start and re-scraped at end. If the pod set changed, an IP is unreachable, or
-  any pod's current counter is *below* its baseline (a restart resetting
-  cumulative counters), the scrape is a hard precondition failure — never a
-  silent under-count.
-- **Correctness check UNCHANGED.** `verifier/lww.go::CompareVersions` reads region
-  Redis directly (the single source of truth) and is already pod-count-independent;
-  `mismatches=0` remains the robust correctness signal.
+To give the verifier a reliable comparison target, the writer records every minted version
+into `srcmax:<epoch>` via `hmax.lua` (HSET-to-max: atomically update a hash field to
+`max(current, incoming)`). **Critically, the `hmax EVAL` and the `XADD` are queued onto
+the same `TxPipeline` and committed together in a single `MULTI/EXEC`
+(`writer/worker.go: Run`).** A failed `Exec` applies neither, so `srcmax` never claims a
+version that was not published to the stream. This prevents permanent false mismatches.
 
-## The negative result (Proof C)
+The epoch token is embedded in the key name (`srcmax:<epoch>`) and in every KV key
+(`lb:<domain>:<status>:{<entity>:<epoch>-<id>}`). This isolates re-runs without flushing:
+a `/reset` call on the writer rotates the epoch, and subsequent events land under the new
+epoch in both the KV keyspace and `srcmax`. The verifier reads `srcmax:<new-epoch>` and
+only inspects keys that embed the new epoch, so a stale event from the old epoch is
+invisible to the new run's comparison.
 
-`verifier/lww.go::CompareVersions` tallies a mismatch on `regionVer != srcMax` —
-it compares **version only, never value**. Consequence, with two uncoordinated
-writers on a shared key:
+### CAS fence extended for delete: tombstone semantics
 
-- Both stamp the key with the *same* monotonic version sequence (each starts at 1
-  and increments independently) and both reach some max version `K`. Region ends
-  at version `K`, which **equals** each writer's max → `CompareVersions` reports
-  `mismatches=0` → verdict PASS.
-- But the two writers wrote *different values* at version `K`. The fence's `EVAL`
-  keeps whichever landed first; the second arrives with an *equal* version and is
-  dropped down the Lua's `duplicate` (`-1`) branch. **A committed update is
-  silently lost** — no `stale`, no `mismatch`, no `regression`.
+The design requires `delete` to leave the version intact so a stale (lower-version) set
+cannot resurrect a deleted key (`chart/files/connect/lww_set.lua`). When `op=delete`:
+- `ver` is set to the incoming version (same as a set).
+- `deleted=1` and `deleted_at=<now_ms>` are recorded.
+- `val` is cleared.
 
-So a version-only fence verified by a version-only check cannot see a concurrent
-same-version lost update. This is why multi-**writer** breaks LWW *invisibly*, and
-why the single-writer-per-key precondition is load-bearing. The fence is safe
-under multi-**connect** precisely because connect never violates that precondition;
-multi-**writer** does.
+A subsequent stale set (`v < stored_ver`) hits the `return 0` (stale) branch before the
+`op` check, so the tombstone's version blocks resurrection. A strictly newer set (`v >
+stored_ver`) does revive the key (clears `deleted=0`), which is the correct LWW behavior:
+a new-version set after a delete is a legitimate update.
 
-## How the proof is made unambiguous
+### Tombstone GC with horizon
 
-The harness runs three proofs (see `scripts/verify-lww.sh`); exit 0 requires all
-three:
+Physical `DEL` is deferred: `gc-sweeper/sweep.go` only reaps tombstones whose
+`deleted_at` is older than `GC_HORIZON` (default 5 minutes). This matches the
+`gc_grace_seconds` pattern from Cassandra: a very-late, stale write that arrives after the
+tombstone is physically deleted would otherwise resurrect the key with an old value. The
+horizon must be larger than the maximum possible reorder/redelivery delay. Keys whose
+`deleted_at` is missing or non-numeric are never reaped (safe over corrupt partial writes).
 
-- **Proof A — deterministic mechanism.** Apply versions 3,1,2 then replay 3 to one
-  key, direct to redis-region → returns `1 0 0 -1`, final `ver=3 val=v3`. The
-  fence works in isolation.
-- **Proof C — deterministic negative.** Scripted, direct against redis-region via
-  `lww_set.lua` (`scripts/proof-c.sh`): two uncoordinated writers apply
-  interleaved versions `1..K`, asserting (a) the version-only check would report
-  `mismatches=0` (PASS) yet (b) the value check shows exactly one writer's
-  version-`K` commit survives — the other was rejected as `duplicate` with no
-  signal. Labelled unambiguously: *single-writer-per-key precondition violated →
-  LWW broken, invisibly to the version-only instrument.*
-- **Proof B′ — end-to-end positive.** Drive the writer through the real pipeline
-  with 3 source + 3 sink pods. It keeps the parent's precondition guards — fresh
-  per-run epoch key namespace (store provably empty at start), writer `boot_id`
-  checked unchanged (no mid-run restart), pipeline quiesced, windowed counter
-  deltas, and `stale > 0` required — *and* adds the per-pod metric aggregation
-  across all sink pods with the restart guard above. Pass requires
-  `mismatches == 0` and `regressions == 0` and `stale > 0`. This is the parent's
-  exact bar, now met under inter-pod concurrency.
+### Atomic dual-key rename: gate on active, tombstone standby
 
-## Validated result
+`lww_rename.lua` handles the standby→active promotion atomically within a single Lua
+script (Redis executes it serially per the hash-tag slot):
+1. Gate the entire promotion on the **new (active) key**: `v > stored_active_ver` to
+   apply, `v < stored_active_ver` to return stale, `v == stored_active_ver` to return
+   duplicate.
+2. If the gate passes, write the active key (`deleted=0, ver=v, val=snapshot`).
+3. Tombstone the **old (standby) key**: write `deleted=1, ver=v` — but only if `v >
+   stored_standby_ver` (never roll a standby's version backwards; equal version is also
+   skipped because a redelivery would re-tombstone with the same data, which is idempotent
+   but unnecessary).
 
-Validated on a 3-pod kind cluster (`lwwm`, namespace `lwwm-k8s`), `profile=lww`,
-`scripts/verify-lww.sh` exit 0 — Proof A (mechanism), Proof C (negative), and
-Proof B′ (multi-instance end-to-end) all green.
+Both keys carry the same hash tag `{<entity>:<epoch>-<id>}` (see `writer/keys.go`), which
+guarantees they land on the same Redis slot. The atomic dual-key operation is therefore
+possible on a single-node Redis and on a Redis Cluster (all keys in the same slot). The
+rename version comes from the global counter `kv:gver`, which produces a value guaranteed
+to be larger than any per-key counter for either key at the time of the rename.
 
-- **Sink pods:** 3 × `connect-sink` (all `1/1 Running`).
-- **Per-pod `lww_apply` counters** (from each pod's `:4195/metrics`):
+### Per-epoch key isolation
 
-  | sink pod | applied | duplicate |
-  |---|---|---|
-  | `lab-connect-sink-…-chz5t` | 42920 | 0 |
-  | `lab-connect-sink-…-crf6f` | 42960 | 0 |
-  | `lab-connect-sink-…-kd474` | 42862 | 0 |
+`writer/keys.go` embeds the epoch in the hash tag: `lb:<domain>:<status>:{<entity>:<epoch>-<id>}`.
+The epoch is also the suffix of `srcmax:<epoch>`. This means:
+- The region keyspace for each run is disjoint from previous runs — the empty-store
+  precondition (`StoreEmptyAtStart`) checks `srcmax:<epoch>` and scans the region for
+  epoch-tagged keys, so a fresh epoch is provably clean.
+- A `/reset` race (the writer receives a new epoch while in-flight events use the old one)
+  is benign: old-epoch events publish to `srcmax:<old-epoch>` under old-epoch keys; the
+  verifier reads `srcmax:<new-epoch>` and never inspects those.
 
-  Applied work is split ~1/3 per pod (≈42.9k each, sum ≈128.7k) with **zero
-  duplicates** — confirming **DISTRIBUTION** mode: all pods bind to one shared
-  consumer, so each message is delivered to exactly one pod. (A FAN-OUT layout
-  would show each pod ≈ the full message count, or duplicate ≈ applied.)
+### Sink metric aggregation across pods
 
-- **Proof B′ result** (`lww` block, rate target 5000):
+`lww_apply_total` is a per-pod Prometheus counter. The verifier resolves the headless
+Service `lab-connect-sink-headless` (DNS A-records → one IP per ready pod), scrapes every
+pod's `:4195/metrics`, and sums applied/stale/duplicate across all pods. A baseline is
+captured at sustain start; the proof signals are windowed deltas. If the pod set changes,
+any pod is unreachable, or any pod's counter is below its baseline (restart reset), the
+scrape is a hard precondition failure — never a silent under-count.
 
-  | metric | value |
-  |---|---|
-  | `rate_achieved_avg` | 4999.92 msg/s |
-  | `stale` | 31236 |
-  | `duplicate` | 0 |
-  | `mismatches` | 0 |
-  | `regressions` | 0 |
-  | `writes_per_key_avg` | 5090.625 |
-  | `keys_checked` | 32 |
-  | verdict | **pass** |
+## The proofs
 
-  `mismatches=0` with `stale>0` is the load-bearing outcome: same-key messages
-  were reordered across pods, the CAS fence rejected 31236 strictly-older
-  arrivals, and every key converged to its highest version.
-
-This lab's ethos is that docs do not assert throughput numbers, stale counts, or
-"it passes" before an actual validation run; the figures above are taken verbatim
-from that run's Proof B′ JSON and per-pod metrics.
-
-## Design decisions / rejected alternatives
-
-- **Deliver group (shared durable) over per-pod-durable fan-out.** A `queue`
-  deliver group lets all N sink pods share one JetStream consumer so each message
-  is processed once — realistic HA work-distribution. A per-pod-durable fan-out
-  (every pod processes every message) would still prove the fence's idempotency
-  under concurrent duplicate CAS, but is not realistic HA. The observed run was
-  **DISTRIBUTION** (each pod applied ≈1/3 of writes, duplicate=0), confirming the
-  shared-consumer path.
-- **Queue-only consumer, queue name == durable name (connect 4.92.0 constraint).**
-  This Redpanda Connect build (4.92.0) rejects `durable` and `queue` set together
-  ("both 'queue' and 'durable' can't be set simultaneously"), so the
-  `nats_jetstream` input uses a `queue` with **no** explicit `durable`. The NATS
-  client derives the consumer/durable name *from the queue name*, so the queue
-  name is set equal to `.Values.nats.stream.consumer.durable` (`region-writer`).
-  This is load-bearing: the subscriber JWT (`scripts/gen-nats-auth.sh`) grants
-  `CONSUMER.CREATE`/`INFO` and `$JS.ACK.APP_EVENTS.region-writer.>` scoped to that
-  exact name; a mismatched queue name (e.g. the earlier `region-writer-q`) derives
-  consumer `region-writer-q`, which the JWT does not authorize, and the sink pods
-  stay `0/1`. The init job creates only the stream (no consumer), so there is no
-  pre-existing-consumer conflict on a fresh install.
-- **DNS enumeration over the Kubernetes API.** The verifier discovers sink pods by
-  resolving the headless Service name (`net.LookupHost`), not by listing pods via
-  the API server — no RBAC / ServiceAccount permissions needed.
-- **Version token = per-key logical counter, single writer per key** (carried from
-  the parent): clean integer compare, no clock skew, deterministic reorder proof.
+- **Proof A** — deterministic fence in isolation (3→1→2 + replay 3 → `1 0 0 -1 ver=3`).
+- **Proof MW+** — positive: HINCRBY + two writers + same key → `dup=0`, all writes land,
+  `ver=K*2` (every write has a unique version, none dropped). This is the headline result.
+- **Proof MW-** (negative control, `proof-c.sh`) — local counters + two writers + same
+  key → one writer's version-K value is silently dropped as `duplicate(-1)`; a version-
+  only check reports `mismatches=0` (false PASS). The proof exits 0 when it confirms the
+  lost update — proving the precondition from the parent lab and underscoring why HINCRBY
+  is necessary.
+- **Proof delete** — tombstone retains ver; stale set cannot resurrect; newer set revives.
+- **Proof rename** — atomic standby→active: both keys updated in one Lua execution;
+  stale rename rejected; the pairing is never split.
+- **Proof B′ sweep** — end-to-end positive under inter-pod concurrency: the verifier Job
+  runs at each rate tier, compares every key's region ver against `srcmax:<epoch>`, requires
+  `mismatches=0` AND `stale>0`. The report identifies the max passing tier.
 
 ## Deliberately excluded
 
-- **The writer-HA fix.** Proof C shows the *break* only; leader election or
-  hash-partitioned key ownership across writer pods (the cure) is out of scope.
-- **Redis Cluster / sharded region.** Single region instance; the fence's per-key
-  atomicity is under test, not cross-shard coordination.
-- **Sink autoscaling (HPA), chaos / pod-kill mid-run, latency SLOs.** Carried or
-  excluded by ancestor labs; dropped here to keep one concern.
-- **Event-time / wall-clock LWW.** The version is a logical per-key counter, as in
-  the parent.
+- **Wall-clock and HLC version sources.** The design decision tree
+  (`../../lww-update-delete-gc-hinc/design-decision-tree.md` §4) shows wall-clock is
+  unsafe under multi-writer-same-key (clock skew produces inverted ordering); HLC is
+  safe but adds complexity. HINCRBY is the simplest safe choice and is the lab's focus.
+- **Redis Cluster multi-node hot-slot study.** All keys in this lab carry a hash tag
+  (`{<entity>:<epoch>-<id>}`), so a follow-on Cluster lab is structurally possible without
+  key-design changes. This lab uses single-node central and single-node region instances;
+  cross-shard coordination is not demonstrated.
+- **Delta / CRDT merge.** The design is snapshot-only. LWW with delta (incremental) values
+  requires strict ordering or field-level merge; that is a different problem space.
+- **Writer HA / leader election.** Proof MW- shows the break with local counters; Proof MW+
+  shows HINCRBY fixes it. The "fix" for local-counter multi-writer (hash-partitioned key
+  ownership, leader election) is out of scope.
+- **Sink autoscaling (HPA), chaos / pod-kill mid-run, latency SLOs.** Excluded to keep one
+  concern per lab.
 
 ## Further reading
 
-- `../../last-write-wins-lab/research.md` — the upstream mechanism design.
-- `../../docs/superpowers/specs/2026-06-05-redis-connect-lww-multi-k8s-design.md` — this lab's spec.
-- `../redis-connect-lww-k8s/` — the single-instance parent lab.
-- `../redis-redpanda-connect-stress-k8s/` — the grandparent stress lab.
+- `../../lww-update-delete-gc-hinc/design-decision-tree.md` — the design document this lab
+  implements (§4: writer topology × version source matrix; §6: HINCRBY placement; §7: sink
+  KV fields and tombstone GC; §5: XADD envelope).
+- `../../lww-update-delete-gc-hinc/lab-requirements.md` — original requirements.
+- `../../docs/design/lab-coverage-analysis.md` — coverage map for the lab series.
+- `../redis-connect-lww-multi-k8s/` — parent lab (multi-instance connect, local counter,
+  single-writer-per-key precondition; Proof C is its Proof C).
+- `../../last-write-wins-lab/research.md` — upstream mechanism design (why
+  NATS/source-timestamp don't work; why the fence belongs at the sink).
