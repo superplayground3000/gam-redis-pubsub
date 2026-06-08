@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
-# LWW verification harness. Boots the chart (profile=lww), runs Proof A
-# (deterministic 3->1->2 + duplicate, direct to redis-region) and Proof B
-# (end-to-end verifier Job at a target rate). Exits 0 iff both pass.
+# LWW (multi-instance) verification harness. Boots the chart (profile=lww) with
+# N>1 connect-source + connect-sink pods, then runs:
+#   Proof A  — deterministic fence mechanism (3->1->2 + duplicate, direct to region)
+#   Proof C  — NEGATIVE: multi-writer same-version lost update, invisible to the
+#              version-only check (proves the single-writer-per-key precondition)
+#   Proof B' — end-to-end positive: fence holds (mismatches=0, stale>0) under
+#              INTER-pod reordering, with lww_apply summed across all sink pods.
+# Exits 0 iff all three pass.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -49,6 +54,10 @@ if [[ "$A" != "1" || "$B" != "0" || "$C" != "0" || "$D" != "-1" || "$VER" != "3"
 fi
 echo "[proofA] PASS"
 
+echo "[proofC] negative: multi-writer (two owners of one key) breaks LWW invisibly"
+bash "${SCRIPT_DIR}/proof-c.sh" "${NS}" "$(REGION_POD)" 5
+echo "[proofC] PASS"
+
 echo "[proofB] verifier Job at rate=${RATE} epoch=${EPOCH}"
 JOB="verifier-${EPOCH}"
 helm template "${RELEASE}" ./chart -n "${NS}" -s templates/verifier-job.yaml \
@@ -76,7 +85,7 @@ kubectl -n "${NS}" delete job/"${JOB_FULL}" --wait=false >/dev/null 2>&1 || true
 PASS=$(echo "$RESULT" | jq -r '.verdict.pass')
 echo "$RESULT" | jq '{rate_achieved_avg:.lww.rate_achieved_avg, stale:.lww.stale, duplicate:.lww.duplicate, mismatches:.lww.mismatches, writes_per_key_avg:.lww.writes_per_key_avg, verdict:.verdict}'
 if [[ "$PASS" == "true" ]]; then
-  echo "[verify-lww] PASS — both proofs green"; exit 0
+  echo "[verify-lww] PASS — all three proofs green (A mechanism, C negative, B' multi-instance)"; exit 0
 else
   echo "[verify-lww] FAIL — $(echo "$RESULT" | jq -r '.verdict.reason')"; exit 1
 fi
