@@ -95,6 +95,14 @@ natsBox:
 
 connect:
   image: hpdevelop/connect:4.92.0-claudefix
+  # Multi-instance is the whole point of this lab: source + sink run N>1 so that
+  # reordering is INTER-pod (parallel stream consumption at the source; concurrent
+  # same-key CAS at the sink), not just intra-pod threads. The LWW fence must hold
+  # regardless. >=2 each is required to exercise the property; 3 is the default.
+  source:
+    replicas: 3
+  sink:
+    replicas: 3
 
 writer:
   image: redis-rrcs/writer:dev

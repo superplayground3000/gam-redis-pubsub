@@ -4,7 +4,7 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink") }}
   labels: { app: connect-sink }
 spec:
-  replicas: 1
+  replicas: {{ .Values.connect.sink.replicas }}
   selector:
     matchLabels: { app: connect-sink }
   template:

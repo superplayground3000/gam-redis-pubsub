@@ -4,7 +4,7 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
   labels: { app: connect-source }
 spec:
-  replicas: 1
+  replicas: {{ .Values.connect.source.replicas }}
   selector:
     matchLabels: { app: connect-source }
   template:
