@@ -1,29 +1,26 @@
 #!/usr/bin/env bash
 # Renders the chart to plain YAML at out/manifests.yaml.
-# Usage: scripts/render.sh [--profile=lww] [--values=path] [extra helm args...]
-# Env: RRCS_NS (default rrcs-k8s)
+# Usage: scripts/render.sh [--values=path] [extra helm args...]
+# Env: LEL_NS (default lel-k8s)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${LAB_DIR}"
 
-NS="${RRCS_NS:-rrcs-k8s}"
-PROFILE="lww"
+NS="${LEL_NS:-lel-k8s}"
 VALUES=""
 EXTRA=()
 for arg in "$@"; do
   case "$arg" in
-    --profile=*) PROFILE="${arg#*=}";;
-    --values=*)  VALUES="${arg#*=}";;
-    *)           EXTRA+=("$arg");;
+    --values=*) VALUES="${arg#*=}";;
+    *)          EXTRA+=("$arg");;
   esac
 done
 
 mkdir -p out
-args=(template rrcs ./chart --namespace "${NS}")
-[[ -n "${PROFILE}" ]] && args+=(--set "profile=${PROFILE}")
-[[ -n "${VALUES}" ]]  && args+=(-f "${VALUES}")
+args=(template lel ./chart --namespace "${NS}")
+[[ -n "${VALUES}" ]] && args+=(-f "${VALUES}")
 
 helm "${args[@]}" "${EXTRA[@]}" > out/manifests.yaml
 
