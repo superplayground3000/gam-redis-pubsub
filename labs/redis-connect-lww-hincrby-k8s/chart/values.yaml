@@ -117,9 +117,31 @@ writer:
     # same-key messages are ~32 apart in the stream (<< 256), so reordering is the
     # common case and the verifier reliably observes stale>0. Larger values (e.g. 1000)
     # space same-key messages beyond the in-flight window → no reorder → inconclusive.
-    KEY_SPACE_SIZE: "32"
+    KEY_SPACE_SIZE: "64"
     PAYLOAD_BYTES: "200"
     MAX_RATE: "20000"
+    # Op-mix weights for the writer's set/delete/rename selection.
+    OP_W_SET: "8"
+    OP_W_DELETE: "1"
+    OP_W_RENAME: "1"
+
+# GC sweeper: tombstone reaper that drops region keys whose tombstone is older
+# than gc.horizon, polling every gc.interval.
+gc:
+  image: redis-rrcs/gc-sweeper:dev
+  pullPolicy: ""
+  horizon: "5m"
+  interval: "30s"
+
+# Sweep harness tiers (rate ladder) + per-tier duration, consumed by scripts.
+sweep:
+  tiers: "5000,10000,20000,40000"
+  durationS: 30
+
+# HTML report generator image.
+report:
+  image: redis-rrcs/report-gen:dev
+  pullPolicy: ""
 
 dashboard:
   image: redis-rrcs/dashboard:dev
@@ -158,5 +180,8 @@ resources:
     requests: { cpu: 100m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 128Mi }
   dashboard:
+    requests: { cpu: 100m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 128Mi }
+  gc:
     requests: { cpu: 100m, memory: 64Mi }
     limits:   { cpu: 500m, memory: 128Mi }

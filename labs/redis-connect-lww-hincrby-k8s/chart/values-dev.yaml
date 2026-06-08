@@ -8,6 +8,10 @@ verifier:
   pullPolicy: Never
 dashboard:
   pullPolicy: Never
+gc:
+  pullPolicy: Never
+report:
+  pullPolicy: Never
 nats:
   persistence:
     mode: emptyDir
