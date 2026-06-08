@@ -100,6 +100,28 @@ func (s *StreamClient) HGetAllInt(ctx context.Context, hash string) (map[string]
 	return out, nil
 }
 
+// RegionHasEpochKey reports whether any key in this redis contains the epoch
+// token — used as a start-of-run precondition so leftover region residue from a
+// colliding epoch can't be silently excluded from the comparison (false PASS).
+func (s *StreamClient) RegionHasEpochKey(ctx context.Context, epoch string) (bool, error) {
+	var cursor uint64
+	for {
+		keys, next, err := s.rdb.Scan(ctx, cursor, "*", 500).Result()
+		if err != nil {
+			return false, err
+		}
+		for _, k := range keys {
+			if strings.Contains(k, epoch) {
+				return true, nil
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			return false, nil
+		}
+	}
+}
+
 // HGetDeleted returns the tombstone flag for a key ("1" if tombstoned, "" if unset).
 func (s *StreamClient) HGetDeleted(ctx context.Context, key string) (string, error) {
 	v, err := s.rdb.HGet(ctx, key, "deleted").Result()

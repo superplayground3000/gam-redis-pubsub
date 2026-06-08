@@ -33,3 +33,43 @@ func TestHGetAllSrcmaxAndTombstone(t *testing.T) {
 		t.Fatalf("deleted=%q want 0", del)
 	}
 }
+
+func TestRegionHasEpochKey(t *testing.T) {
+	ctx := context.Background()
+
+	// Empty region: no key contains the epoch token → false.
+	mrEmpty, _ := miniredis.Run()
+	defer mrEmpty.Close()
+	empty := NewStreamClient(mrEmpty.Addr())
+	defer empty.Close()
+	dirty, err := empty.RegionHasEpochKey(ctx, "run-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirty {
+		t.Fatal("empty region must report no epoch key")
+	}
+
+	// Region with a key whose name embeds the epoch → true.
+	mrDirty, _ := miniredis.Run()
+	defer mrDirty.Close()
+	region := NewStreamClient(mrDirty.Addr())
+	defer region.Close()
+	mrDirty.HSet("lb:company:active:{employees:run-9-3}", "ver", "5")
+	dirty, err = region.RegionHasEpochKey(ctx, "run-9")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !dirty {
+		t.Fatal("region with leftover epoch key must report dirty")
+	}
+
+	// A key from a DIFFERENT epoch must not trip the probe.
+	dirty, err = region.RegionHasEpochKey(ctx, "run-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dirty {
+		t.Fatal("key from a different epoch must not count as dirty")
+	}
+}
