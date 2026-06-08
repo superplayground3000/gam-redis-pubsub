@@ -1,6 +1,11 @@
 # Built Go binaries
 writer/writer
+elector/elector
+observer/observer
 collector/collector
+# Re-include go.sum (root .gitignore ignores it globally); we commit it for
+# reproducible builds — the elector/observer Dockerfiles COPY it explicitly.
+!go.sum
 # Rendered manifests
 out/
 # Local run output
