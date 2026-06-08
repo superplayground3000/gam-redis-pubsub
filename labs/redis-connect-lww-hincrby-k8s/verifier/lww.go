@@ -31,6 +31,7 @@ type LWWResult struct {
 	BootOK            bool    `json:"boot_ok"`
 	StoreEmptyAtStart bool    `json:"store_empty_at_start"`
 	QuiescenceOK      bool    `json:"quiescence_ok"`
+	Tombstones        int     `json:"tombstones"`
 }
 
 type LWWVerdict struct {
@@ -101,6 +102,33 @@ func PostResetEpoch(ctx context.Context, writerURL, epoch string) error {
 // mismatches (region != source max) and regressions (region > source max).
 func CompareVersions(ctx context.Context, region *StreamClient, st State) (checked, mismatches, regressions int, err error) {
 	for key, srcMax := range st.Keys {
+		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		regionVer, ok, e := region.HGetVer(cctx, key)
+		cancel()
+		if e != nil {
+			return checked, mismatches, regressions, e
+		}
+		checked++
+		if !ok || regionVer != srcMax {
+			mismatches++
+		}
+		if ok && regionVer > srcMax {
+			regressions++
+		}
+	}
+	return checked, mismatches, regressions, nil
+}
+
+// CompareSrcMax compares every key in central's srcmax:<epoch> hash (the
+// authoritative HINCRBY-minted max) against region HGET <key> ver. Tombstoned
+// keys retain ver==max so they still match. mismatches = region != src;
+// regressions = region > src (impossible => fence bug).
+func CompareSrcMax(ctx context.Context, central, region *StreamClient, epoch string) (checked, mismatches, regressions int, err error) {
+	src, err := central.HGetAllInt(ctx, "srcmax:"+epoch)
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	for key, srcMax := range src {
 		cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 		regionVer, ok, e := region.HGetVer(cctx, key)
 		cancel()

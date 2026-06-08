@@ -1,6 +1,11 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"testing"
+
+	"github.com/alicebob/miniredis/v2"
+)
 
 func TestLWWVerdictPassRequiresAllConditions(t *testing.T) {
 	base := LWWResult{
@@ -63,5 +68,41 @@ func TestLWWVerdictReasonIsSpecific(t *testing.T) {
 	v := ComputeLWWVerdict(r)
 	if v.Pass || v.Reason == "" {
 		t.Fatalf("want fail with reason, got %+v", v)
+	}
+}
+
+func TestCompareSrcMax(t *testing.T) {
+	mrC, _ := miniredis.Run()
+	defer mrC.Close()
+	mrR, _ := miniredis.Run()
+	defer mrR.Close()
+	central := NewStreamClient(mrC.Addr())
+	defer central.Close()
+	region := NewStreamClient(mrR.Addr())
+	defer region.Close()
+	ctx := context.Background()
+
+	k := "lb:general:active:{items:run-2-3}"
+	mrC.HSet("srcmax:run-2", k, "12")
+	mrR.HSet(k, "ver", "12") // region caught up
+
+	checked, mism, regr, err := CompareSrcMax(ctx, central, region, "run-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if checked != 1 || mism != 0 || regr != 0 {
+		t.Fatalf("checked=%d mism=%d regr=%d", checked, mism, regr)
+	}
+
+	mrR.HSet(k, "ver", "11") // region behind -> mismatch
+	_, mism, _, _ = CompareSrcMax(ctx, central, region, "run-2")
+	if mism != 1 {
+		t.Fatalf("want 1 mismatch, got %d", mism)
+	}
+
+	mrR.HSet(k, "ver", "13") // region ahead -> regression (impossible/fence bug)
+	_, _, regr, _ = CompareSrcMax(ctx, central, region, "run-2")
+	if regr != 1 {
+		t.Fatalf("want 1 regression, got %d", regr)
 	}
 }
