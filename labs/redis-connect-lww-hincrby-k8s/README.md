@@ -84,8 +84,8 @@ RRCS_NS=lwwh-k8s RRCS_RELEASE=lwwh scripts/verify-lww.sh
 ```
 
 The script runs all proofs then performs a **rate sweep** (default tiers: 5000, 10000,
-20000, 40000 msg/s) and writes `reports/report.html`. The report shows the maximum
-passing tier for your hardware.
+20000 msg/s — the top tier matches the writer's `MAX_RATE`) and writes
+`reports/report.html`. The report shows the maximum sustained tier for your hardware.
 
 To override sweep tiers or timing:
 
@@ -149,7 +149,7 @@ to clear at least the lowest configured tier.
 | `writer.env.KEY_SPACE_SIZE` | `64` | Shared keyspace size (all writers draw from the same pool, forcing same-key contention) |
 | `gc.horizon` | `5m` | Tombstone GC horizon — do not reap tombstones newer than this |
 | `gc.interval` | `30s` | How often gc-sweeper scans for expired tombstones |
-| `sweep.tiers` | `5000,10000,20000,40000` | Rate ladder (msg/s) for the sweep; also overridable via `SWEEP_TIERS` env var |
+| `sweep.tiers` | `5000,10000,20000` | Rate ladder (msg/s) for the sweep; also overridable via `SWEEP_TIERS` env var |
 | `sweep.durationS` | `30` | Sustain window per tier (seconds) |
 
 ## Expected output

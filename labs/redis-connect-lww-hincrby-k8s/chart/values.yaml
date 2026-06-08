@@ -134,8 +134,10 @@ gc:
   interval: "30s"
 
 # Sweep harness tiers (rate ladder) + per-tier duration, consumed by scripts.
+# Keep the top tier at/under writer.env.MAX_RATE (20000) — a higher tier is
+# silently capped by the writer and reports a misleading rate. Raise both together.
 sweep:
-  tiers: "5000,10000,20000,40000"
+  tiers: "5000,10000,20000"
   durationS: 30
 
 # HTML report generator image.
