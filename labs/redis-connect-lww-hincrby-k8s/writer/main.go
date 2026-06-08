@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"log"
+	mrand "math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,10 +24,13 @@ func main() {
 	workers := envInt("WORKERS", 8)
 	pipelineDepth := envInt("PIPELINE_DEPTH", 50)
 	initialRate := envInt("INITIAL_RATE", 0)
-	keySpaceSize := envInt("KEY_SPACE_SIZE", 100_000)
+	keySpaceSize := envInt("KEY_SPACE_SIZE", 32)
 	payloadBytes := envInt("PAYLOAD_BYTES", 200)
 	maxRate := envInt("MAX_RATE", 20_000)
 	healthAddr := envStr("HEALTH_ADDR", ":8081")
+	opWSet := envInt("OP_W_SET", 8)
+	opWDelete := envInt("OP_W_DELETE", 1)
+	opWRename := envInt("OP_W_RENAME", 1)
 
 	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: workers * 2})
 	defer rdb.Close()
@@ -36,15 +42,19 @@ func main() {
 	lim.Set(initialRate)
 	counters := &Counters{}
 
-	// Single-owner-per-key invariant: worker i owns keys where keyID % workers == i.
-	// If the keyspace is smaller than the worker count, some workers would own zero
-	// keys and the ownership math has no safe assignment — refuse to run rather than
-	// let two workers share a key (which would silently break per-key version
-	// monotonicity, the reorder-proof precondition).
+	// Workers draw ids from a SHARED [0, KeySpaceSize) space so they contend on the
+	// same keys (multi-writer-same-key). Per-key version monotonicity is preserved by
+	// the Redis HINCRBY minter, not by partitioning the keyspace — but we still want
+	// at least as many keys as workers so contention is meaningful.
 	if keySpaceSize < workers {
-		log.Fatalf("KEY_SPACE_SIZE (%d) must be >= WORKERS (%d): single-owner-per-key requires at least one key per worker", keySpaceSize, workers)
+		log.Fatalf("KEY_SPACE_SIZE (%d) must be >= WORKERS (%d)", keySpaceSize, workers)
 	}
-	versions := NewVersions(workers)
+
+	minter := NewMinter(rdb)
+	epochHolder := &EpochHolder{}
+	weights := OpWeights{Set: opWSet, Delete: opWDelete, Rename: opWRename}
+	seed := time.Now().UnixNano()
+	bootID := newBootID()
 
 	var wg sync.WaitGroup
 	for i := 0; i < workers; i++ {
@@ -57,7 +67,10 @@ func main() {
 			KeySpaceSize:  int64(keySpaceSize),
 			Lim:           lim,
 			Counters:      counters,
-			Versions:      versions,
+			Minter:        minter,
+			// Each worker gets its own *rand.Rand to avoid sharing one across goroutines.
+			Ops:         NewOpPicker(weights, mrand.New(mrand.NewSource(seed+int64(i)))),
+			EpochHolder: epochHolder,
 		}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.Run(ctx) }()
@@ -65,7 +78,7 @@ func main() {
 
 	srv := &Server{
 		Lim: lim, Counters: counters, MaxRate: maxRate,
-		Versions: versions,
+		Epoch: epochHolder, BootID: bootID,
 		HealthCheck: func() bool {
 			c, cf := context.WithTimeout(context.Background(), 500*time.Millisecond)
 			defer cf()
@@ -77,7 +90,7 @@ func main() {
 
 	httpSrv := &http.Server{Addr: healthAddr, Handler: mux}
 	go func() {
-		log.Printf("writer listening on %s", healthAddr)
+		log.Printf("writer listening on %s (boot_id=%s)", healthAddr, bootID)
 		if err := httpSrv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("http server: %v", err)
 		}
@@ -91,6 +104,13 @@ func main() {
 	httpSrv.Shutdown(context.Background())
 	cancel()
 	wg.Wait()
+}
+
+// newBootID returns a random 8-byte hex id, stable for the process lifetime.
+func newBootID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
 }
 
 func envStr(k, def string) string {

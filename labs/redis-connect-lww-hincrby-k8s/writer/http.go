@@ -4,14 +4,27 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sync/atomic"
 )
+
+// EpochHolder holds the active run epoch; swapped atomically by /reset.
+type EpochHolder struct{ v atomic.Pointer[string] }
+
+func (e *EpochHolder) Set(s string) { e.v.Store(&s) }
+func (e *EpochHolder) Get() string {
+	if p := e.v.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 type Server struct {
 	Lim         *Limiter
 	Counters    *Counters
 	MaxRate     int
 	HealthCheck func() bool
-	Versions    *Versions
+	Epoch       *EpochHolder
+	BootID      string
 }
 
 type rateReq struct {
@@ -85,7 +98,7 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Counters.Reset()
-	s.Versions.SetEpoch(rq.Epoch)
+	s.Epoch.Set(rq.Epoch)
 	fmt.Fprintf(w, "reset; epoch=%s\n", rq.Epoch)
 }
 
@@ -95,5 +108,9 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.Versions.State())
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"boot_id": s.BootID,
+		"epoch":   s.Epoch.Get(),
+		"sent":    s.Counters.Sent.Load(),
+	})
 }

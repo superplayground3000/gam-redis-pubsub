@@ -11,7 +11,8 @@ import (
 func newTestServer() *Server {
 	return &Server{
 		Lim: NewLimiter(), Counters: &Counters{}, MaxRate: 100000,
-		Versions:    NewVersions(2),
+		Epoch:       &EpochHolder{},
+		BootID:      "test",
 		HealthCheck: func() bool { return true },
 	}
 }
@@ -29,8 +30,8 @@ func TestResetSetsEpochAndStateReportsIt(t *testing.T) {
 		t.Fatalf("reset code=%d body=%s", rr.Code, rr.Body.String())
 	}
 
-	// Simulate a write so /state has content.
-	s.Versions.Next(0, "lww:run-123:0")
+	// Simulate a write so /state reports a non-zero sent count.
+	s.Counters.Sent.Add(3)
 
 	req = httptest.NewRequest(http.MethodGet, "/state", nil)
 	rr = httptest.NewRecorder()
@@ -38,7 +39,11 @@ func TestResetSetsEpochAndStateReportsIt(t *testing.T) {
 	if rr.Code != 200 {
 		t.Fatalf("state code=%d", rr.Code)
 	}
-	var st State
+	var st struct {
+		BootID string `json:"boot_id"`
+		Epoch  string `json:"epoch"`
+		Sent   int64  `json:"sent"`
+	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &st); err != nil {
 		t.Fatalf("unmarshal: %v body=%s", err, rr.Body.String())
 	}
@@ -48,8 +53,8 @@ func TestResetSetsEpochAndStateReportsIt(t *testing.T) {
 	if st.BootID == "" {
 		t.Error("boot_id empty")
 	}
-	if st.Keys["lww:run-123:0"] != 1 {
-		t.Errorf("keys=%v", st.Keys)
+	if st.Sent != 3 {
+		t.Errorf("sent=%d want 3", st.Sent)
 	}
 }
 

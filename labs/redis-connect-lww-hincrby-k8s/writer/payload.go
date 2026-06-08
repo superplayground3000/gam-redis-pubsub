@@ -27,3 +27,18 @@ func NewPayload(seq int64, padBytes int) Payload {
 func (p Payload) JSON() ([]byte, error) {
 	return json.Marshal(p)
 }
+
+func newEventID() string { return uuid.NewString() }
+
+func makePad(n int) string { return strings.Repeat("x", n) }
+
+// payloadJSON is the snapshot body carried in the stream value field.
+func payloadJSON(eventID string, tsMs, version int64, pad string) string {
+	b, _ := json.Marshal(map[string]any{
+		"event_id": eventID,
+		"ts_ns":    time.Now().UnixNano(),
+		"version":  version,
+		"pad":      pad,
+	})
+	return string(b)
+}

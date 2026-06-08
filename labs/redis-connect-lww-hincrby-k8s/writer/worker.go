@@ -19,38 +19,101 @@ type Worker struct {
 	KeySpaceSize  int64
 	Lim           *Limiter
 	Counters      *Counters
-	Versions      *Versions
+	Minter        *Minter
+	Ops           *OpPicker
+	// Epoch is read per batch from the shared EpochHolder so a concurrent /reset is
+	// observed; set directly only in tests.
+	Epoch       string
+	EpochHolder *EpochHolder
 }
 
-// ownedKeyID returns the n-th key id (0-based) this worker owns, round-robining
-// over the strided subset { id : id % Workers == ID } of [0, KeySpaceSize).
-func (w *Worker) ownedKeyID(n int64) int64 {
-	stride := int64(w.Workers)
-	count := (w.KeySpaceSize - int64(w.ID) + stride - 1) / stride // # owned ids
-	if count <= 0 {
-		// Unreachable: main.go guards KEY_SPACE_SIZE >= WORKERS, so every worker
-		// (ID < Workers <= KeySpaceSize) owns >= 1 id. Clamp defensively to avoid a
-		// divide-by-zero; the result (ID) is still in-stride and collision-free.
-		count = 1
+func (w *Worker) epoch() string {
+	if w.EpochHolder != nil {
+		return w.EpochHolder.Get()
 	}
-	return int64(w.ID) + (n%count)*stride
+	return w.Epoch
+}
+
+// emitOne picks an op, builds the key(s), mints a version (HINCRBY), records it
+// into srcmax:<epoch> (hmax via HSET-max), and queues the XADD onto pipe. Returns
+// the primary kv_key and version used. Mint + srcmax happen eagerly (they must
+// precede the XADD on the wire); only the XADD is pipelined.
+func (w *Worker) emitOne(ctx context.Context, pipe redis.Pipeliner) (string, int64, error) {
+	epoch := w.epoch()
+	pat := Patterns[w.Counters.Sent.Load()%int64(len(Patterns))]
+	id := w.pickID()
+	op := w.Ops.Pick()
+	nowMs := time.Now().UnixMilli()
+	eid := newEventID()
+	pad := makePad(w.PayloadBytes)
+
+	switch op {
+	case OpRename:
+		oldKey := pat.Key("standby", epoch, id)
+		newKey := pat.Key("active", epoch, id)
+		ver, err := w.Minter.NextGlobal(ctx)
+		if err != nil {
+			return "", 0, err
+		}
+		if err := w.recordSrcmax(ctx, epoch, newKey, ver); err != nil {
+			return "", 0, err
+		}
+		if err := w.recordSrcmax(ctx, epoch, oldKey, ver); err != nil {
+			return "", 0, err
+		}
+		val := payloadJSON(eid, nowMs, ver, pad)
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: w.StreamKey, MaxLen: w.StreamMaxLen, Approx: true,
+			Values: map[string]any{
+				"value": val, "event_id": eid, "key": newKey, "old_key": oldKey,
+				"new_key": newKey, "op": string(op), "pattern": pat.Domain,
+				"t_send_ms": nowMs, "version": ver,
+			},
+		})
+		return newKey, ver, nil
+	default: // set | delete
+		key := pat.Key("active", epoch, id)
+		ver, err := w.Minter.NextPerKey(ctx, key)
+		if err != nil {
+			return "", 0, err
+		}
+		if err := w.recordSrcmax(ctx, epoch, key, ver); err != nil {
+			return "", 0, err
+		}
+		val := ""
+		if op == OpSet {
+			val = payloadJSON(eid, nowMs, ver, pad)
+		}
+		pipe.XAdd(ctx, &redis.XAddArgs{
+			Stream: w.StreamKey, MaxLen: w.StreamMaxLen, Approx: true,
+			Values: map[string]any{
+				"value": val, "event_id": eid, "key": key, "op": string(op),
+				"pattern": pat.Domain, "t_send_ms": nowMs, "version": ver,
+			},
+		})
+		return key, ver, nil
+	}
+}
+
+func (w *Worker) pickID() int64 {
+	// Shared keyspace: every worker draws from [0, KeySpaceSize) so writers contend
+	// on the same keys (the multi-writer-same-key scenario).
+	return int64(w.Counters.Sent.Load()) % w.KeySpaceSize
+}
+
+func (w *Worker) recordSrcmax(ctx context.Context, epoch, key string, ver int64) error {
+	return w.RDB.Eval(ctx, hmaxScript, []string{"srcmax:" + epoch}, key, ver).Err()
 }
 
 func (w *Worker) Run(ctx context.Context) {
-	var emitted int64
 	for {
 		rate := int(w.Lim.Current())
 		depth := w.PipelineDepth
 		if rate > 0 {
-			perTenth := rate / 10
-			if perTenth < 1 {
-				perTenth = 1
-			}
-			if perTenth < depth {
+			if perTenth := rate / 10; perTenth >= 1 && perTenth < depth {
 				depth = perTenth
 			}
 		}
-
 		waitCtx, waitCancel := context.WithTimeout(ctx, 500*time.Millisecond)
 		err := w.Lim.WaitN(waitCtx, depth)
 		waitCancel()
@@ -60,10 +123,7 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			continue
 		}
-
-		if w.Versions.Epoch() == "" {
-			// No run started yet (no /reset received). Sleep before retrying so we
-			// don't hot-spin discarding granted tokens if a rate was set pre-reset.
+		if w.epoch() == "" {
 			select {
 			case <-ctx.Done():
 				return
@@ -71,39 +131,19 @@ func (w *Worker) Run(ctx context.Context) {
 			}
 			continue
 		}
-
 		w.Counters.Inflight.Add(1)
 		pipe := w.RDB.Pipeline()
 		var n int
 		for i := 0; i < depth; i++ {
-			id := w.ownedKeyID(emitted)
-			// Derive key + version from ONE epoch snapshot so a concurrent /reset
-			// can't pair an old-epoch key with a new-epoch counter.
-			key, ver, ok := w.Versions.NextForCurrent(w.ID, id)
-			if !ok {
-				break // epoch cleared mid-batch (not expected); flush what we have
+			if _, _, err := w.emitOne(ctx, pipe); err != nil {
+				if ctx.Err() == nil {
+					log.Printf("worker %d: emit error: %v", w.ID, err)
+				}
+				w.Counters.Errors.Add(1)
+				continue
 			}
-			emitted++
-			p := NewPayload(ver, w.PayloadBytes)
-			body, _ := p.JSON()
-			pipe.XAdd(ctx, &redis.XAddArgs{
-				Stream: w.StreamKey,
-				MaxLen: w.StreamMaxLen,
-				Approx: true,
-				Values: map[string]any{
-					"value":     string(body),
-					"event_id":  p.EventID,
-					"key":       key,
-					"pattern":   "stress",
-					"t_send_ms": p.TsNs / 1_000_000,
-					"version":   ver,
-				},
-			})
+			w.Counters.Sent.Add(1)
 			n++
-		}
-		if n == 0 {
-			w.Counters.Inflight.Add(-1)
-			continue
 		}
 		_, err = pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
@@ -112,8 +152,6 @@ func (w *Worker) Run(ctx context.Context) {
 			if ctx.Err() == nil {
 				log.Printf("worker %d: pipeline error: %v", w.ID, err)
 			}
-		} else {
-			w.Counters.Sent.Add(int64(n))
 		}
 	}
 }
