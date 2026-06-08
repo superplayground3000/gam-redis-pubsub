@@ -7,39 +7,43 @@
       "pass": true,
       "mismatches": 0,
       "regressions": 0,
-      "stale": 2470,
-      "applied": 147564,
+      "stale": 2570,
+      "applied": 147437,
       "duplicate": 0,
-      "tombstones": 8
+      "tombstones": 4
     },
     {
       "rate": 10000,
       "pass": true,
       "mismatches": 0,
       "regressions": 0,
-      "stale": 4975,
-      "applied": 295037,
+      "stale": 5014,
+      "applied": 294986,
       "duplicate": 0,
-      "tombstones": 11
+      "tombstones": 9
     },
     {
       "rate": 20000,
       "pass": true,
       "mismatches": 0,
       "regressions": 0,
-      "stale": 14417,
-      "applied": 585630,
+      "stale": 10479,
+      "applied": 589517,
       "duplicate": 0,
       "tombstones": 11
     }
   ],
   "proofs": [
     {
+      "name": "A (deterministic fence)",
+      "pass": true
+    },
+    {
       "name": "MW+",
       "pass": true
     },
     {
-      "name": "MW-",
+      "name": "MW- (negative control)",
       "pass": true
     },
     {

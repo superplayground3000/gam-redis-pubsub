@@ -35,6 +35,12 @@ RESOURCE_PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.res
 
 REGION_POD() { kubectl -n "${NS}" get pod -l app=redis-region -o jsonpath='{.items[0].metadata.name}'; }
 
+# Collect each proof's outcome as "name:pass" pairs for the report. Declared here
+# (before Proof A) so Proof A is recorded too — it is the deterministic precondition
+# and hard-exits on failure, so reaching the line that records it means it passed.
+PROOF_RESULTS=()
+allproofs=true
+
 echo "[proofA] deterministic 3->1->2 + duplicate, direct to redis-region"
 # Deliver the Lua via `kubectl cp` + `redis-cli --eval` (reads the script from a
 # file) rather than string-escaping it into a nested `sh -c` — the script contains
@@ -57,13 +63,11 @@ if [[ "$A" != "1" || "$B" != "0" || "$C" != "0" || "$D" != "-1" || "$VER" != "3"
   echo "[proofA] FAIL"; exit 1
 fi
 echo "[proofA] PASS"
+PROOF_RESULTS+=("A (deterministic fence):true")
 
 # --- Deterministic proofs against the region pod -----------------------------
-# Collect each proof's outcome as "name:pass" pairs. A proof script that exits
-# non-zero records pass=false but does NOT abort the run, so the report still
-# generates and the sweep still runs; allproofs tracks the overall gate.
-PROOF_RESULTS=()
-allproofs=true
+# A proof script that exits non-zero records pass=false but does NOT abort the run,
+# so the report still generates and the sweep still runs; allproofs tracks the gate.
 run_proof() {
   local name="$1"; shift
   echo "[proof] ${name}: $*"
@@ -79,7 +83,7 @@ run_proof() {
 run_proof "MW+"    bash "${SCRIPT_DIR}/proof-mwplus.sh" "${NS}" "$(REGION_POD)"
 # MW- is the NEGATIVE control: proof-c.sh PASSES (exit 0) when it confirms the
 # lost update, so a true here means the negative control behaved as designed.
-run_proof "MW-"    bash "${SCRIPT_DIR}/proof-c.sh"      "${NS}" "$(REGION_POD)" 5
+run_proof "MW- (negative control)" bash "${SCRIPT_DIR}/proof-c.sh" "${NS}" "$(REGION_POD)" 5
 run_proof "delete" bash "${SCRIPT_DIR}/proof-delete.sh" "${NS}" "$(REGION_POD)"
 run_proof "rename" bash "${SCRIPT_DIR}/proof-rename.sh" "${NS}" "$(REGION_POD)"
 
