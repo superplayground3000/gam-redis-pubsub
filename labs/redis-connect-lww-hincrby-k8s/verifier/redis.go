@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"strconv"
 	"strings"
 
@@ -80,4 +81,30 @@ func (s *StreamClient) HGetVer(ctx context.Context, key string) (int64, bool, er
 		return 0, false, perr
 	}
 	return n, true, nil
+}
+
+// HGetAllInt reads a hash of string->int64 (used for srcmax:<epoch>).
+func (s *StreamClient) HGetAllInt(ctx context.Context, hash string) (map[string]int64, error) {
+	m, err := s.rdb.HGetAll(ctx, hash).Result()
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		n, err := strconv.ParseInt(v, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("srcmax field %q non-int %q", k, v)
+		}
+		out[k] = n
+	}
+	return out, nil
+}
+
+// HGetDeleted returns the tombstone flag for a key ("1" if tombstoned, "" if unset).
+func (s *StreamClient) HGetDeleted(ctx context.Context, key string) (string, error) {
+	v, err := s.rdb.HGet(ctx, key, "deleted").Result()
+	if err == redis.Nil {
+		return "", nil
+	}
+	return v, err
 }
