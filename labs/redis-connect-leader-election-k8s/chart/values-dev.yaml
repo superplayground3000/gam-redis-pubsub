@@ -1,13 +1,14 @@
-# kind / local overlay. Images for writer+verifier+dashboard are built locally
-# and side-loaded via `kind load docker-image`, so pin THOSE to Never (fail fast
-# if not loaded, never attempt a registry pull). Public images stay at the global
-# IfNotPresent so a fresh kind node can pull them.
+# kind / local overlay. Locally-built images (writer, elector, observer, dashboard)
+# are side-loaded via `kind load docker-image`, so pin THOSE to Never (fail fast if
+# not loaded; never attempt a registry pull). Public images (redis, connect) stay at
+# the global IfNotPresent so a fresh kind node can pull them.
 writer:
   pullPolicy: Never
-verifier:
+elector:
+  pullPolicy: Never
+observer:
   pullPolicy: Never
 dashboard:
   pullPolicy: Never
-nats:
-  persistence:
-    mode: emptyDir
+connect:
+  replicas: 3
