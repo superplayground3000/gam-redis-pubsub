@@ -1,0 +1,54 @@
+{
+  "lab": "redis-connect-lww-hincrby-k8s",
+  "max_passing_tier": 20000,
+  "tiers": [
+    {
+      "rate": 5000,
+      "pass": true,
+      "mismatches": 0,
+      "regressions": 0,
+      "stale": 2470,
+      "applied": 147564,
+      "duplicate": 0,
+      "tombstones": 8
+    },
+    {
+      "rate": 10000,
+      "pass": true,
+      "mismatches": 0,
+      "regressions": 0,
+      "stale": 4975,
+      "applied": 295037,
+      "duplicate": 0,
+      "tombstones": 11
+    },
+    {
+      "rate": 20000,
+      "pass": true,
+      "mismatches": 0,
+      "regressions": 0,
+      "stale": 14417,
+      "applied": 585630,
+      "duplicate": 0,
+      "tombstones": 11
+    }
+  ],
+  "proofs": [
+    {
+      "name": "MW+",
+      "pass": true
+    },
+    {
+      "name": "MW-",
+      "pass": true
+    },
+    {
+      "name": "delete",
+      "pass": true
+    },
+    {
+      "name": "rename",
+      "pass": true
+    }
+  ]
+}

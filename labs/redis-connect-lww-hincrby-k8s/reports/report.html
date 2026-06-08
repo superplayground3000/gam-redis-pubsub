@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LWW Sweep Report &#8212; redis-connect-lww-hincrby-k8s</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace; background: #0f1117; color: #e2e8f0; padding: 2rem; }
+  h1 { font-size: 1.4rem; font-weight: 700; color: #f8fafc; margin-bottom: 1.5rem; letter-spacing: 0.05em; }
+  .banner { display: inline-block; padding: 0.5rem 1.2rem; border-radius: 6px; font-size: 1rem; font-weight: 600; margin-bottom: 2rem; }
+  .banner.green { background: #14532d; color: #86efac; border: 1px solid #16a34a; }
+  .banner.gray  { background: #1e2332; color: #94a3b8; border: 1px solid #334155; }
+  h2 { font-size: 1rem; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 0.75rem; }
+  section { margin-bottom: 2.5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th { background: #1e2332; color: #94a3b8; text-align: left; padding: 0.5rem 0.75rem; border-bottom: 1px solid #334155; font-weight: 600; letter-spacing: 0.04em; }
+  td { padding: 0.45rem 0.75rem; border-bottom: 1px solid #1e2332; vertical-align: middle; }
+  tr:hover td { background: #1a1f2e; }
+  .badge { display: inline-block; padding: 0.15rem 0.55rem; border-radius: 4px; font-size: 0.75rem; font-weight: 700; letter-spacing: 0.06em; }
+  .badge.pass { background: #14532d; color: #86efac; }
+  .badge.fail { background: #4c0519; color: #fca5a5; }
+  .bar-wrap { width: 120px; background: #1e2332; border-radius: 3px; overflow: hidden; height: 10px; display: inline-block; vertical-align: middle; }
+  .bar-fill { height: 10px; border-radius: 3px; }
+  .bar-fill.pass { background: #16a34a; }
+  .bar-fill.bar-fail { background: #dc2626; }
+  .num { color: #cbd5e1; }
+  .mismatch { color: #f87171; font-weight: 700; }
+  .zero { color: #4b5563; }
+</style>
+</head>
+<body>
+<h1>LWW Sweep Report &#8212; redis-connect-lww-hincrby-k8s</h1>
+
+
+<div class="banner green">Max passing tier: 20000 msg/s</div>
+
+
+<section>
+  <h2>Correctness Proofs</h2>
+  
+  <table>
+    <thead>
+      <tr>
+        <th>Proof</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      
+      <tr>
+        <td>MW+</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+      <tr>
+        <td>MW-</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+      <tr>
+        <td>delete</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+      <tr>
+        <td>rename</td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+    </tbody>
+  </table>
+  
+</section>
+
+<section>
+  <h2>Throughput Tiers</h2>
+  
+  <table>
+    <thead>
+      <tr>
+        <th>Rate (msg/s)</th>
+        <th>Applied</th>
+        <th>Stale</th>
+        <th>Duplicate</th>
+        <th>Mismatches</th>
+        <th>Tombstones</th>
+        <th>Applied bar</th>
+        <th>Result</th>
+      </tr>
+    </thead>
+    <tbody>
+      
+      <tr>
+        <td class="num">5000</td>
+        <td class="num">147564</td>
+        <td class="num">2470</td>
+        <td class="num">0</td>
+        <td><span class="zero">0</span></td>
+        <td class="num">8</td>
+        <td>
+          
+          <div class="bar-wrap"><div class="bar-fill pass" style="width:120px;"></div></div>
+        </td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+      <tr>
+        <td class="num">10000</td>
+        <td class="num">295037</td>
+        <td class="num">4975</td>
+        <td class="num">0</td>
+        <td><span class="zero">0</span></td>
+        <td class="num">11</td>
+        <td>
+          
+          <div class="bar-wrap"><div class="bar-fill pass" style="width:120px;"></div></div>
+        </td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+      <tr>
+        <td class="num">20000</td>
+        <td class="num">585630</td>
+        <td class="num">14417</td>
+        <td class="num">0</td>
+        <td><span class="zero">0</span></td>
+        <td class="num">11</td>
+        <td>
+          
+          <div class="bar-wrap"><div class="bar-fill pass" style="width:120px;"></div></div>
+        </td>
+        <td><span class="badge pass">PASS</span></td>
+      </tr>
+      
+    </tbody>
+  </table>
+  
+</section>
+
+</body>
+</html>
