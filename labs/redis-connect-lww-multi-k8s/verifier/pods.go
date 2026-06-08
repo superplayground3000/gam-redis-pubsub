@@ -16,7 +16,9 @@ type lwwCounts struct{ applied, stale, duplicate int64 }
 // deltas against the SAME pods. A pod vanishing or a counter regressing (restart)
 // is a hard precondition failure, not a silent under-count.
 type SinkBaseline struct {
-	pairs []string // host:port, pinned at baseline
+	dns   string
+	port  string
+	pairs []string // host:port, pinned at baseline (sorted, deduped)
 	base  map[string]lwwCounts
 }
 
@@ -83,6 +85,19 @@ func scrapeAllPairs(ctx context.Context, pairs []string) (map[string]lwwCounts, 
 	return out, nil
 }
 
+// sameSet reports whether two sorted, deduped string slices are identical.
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // sumDelta returns summed applied/stale/duplicate deltas across pinned pods, failing
 // loud if any pod's current counter is below baseline (a restart zeroed cumulative
 // counters, which would corrupt the delta and could manufacture a false stale>0).
@@ -114,11 +129,20 @@ func NewSinkBaseline(ctx context.Context, dns, port string) (*SinkBaseline, erro
 	if err != nil {
 		return nil, err
 	}
-	return &SinkBaseline{pairs: pairs, base: base}, nil
+	return &SinkBaseline{dns: dns, port: port, pairs: pairs, base: base}, nil
 }
 
-// Delta re-scrapes the SAME baseline pods and returns summed deltas.
+// Delta re-resolves the sink pod set, fails loud if it changed since baseline
+// (a pod appearing OR disappearing mid-run breaks the proof), then re-scrapes the
+// pinned pods and returns summed deltas.
 func (b *SinkBaseline) Delta(ctx context.Context) (applied, stale, duplicate int64, err error) {
+	now, err := resolveSinkPairs(ctx, b.dns, b.port)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("sink delta re-resolve (%s): %w", b.dns, err)
+	}
+	if !sameSet(b.pairs, now) {
+		return 0, 0, 0, fmt.Errorf("sink pod set changed mid-run (baseline %v, now %v): rescale/restart breaks the proof", b.pairs, now)
+	}
 	cur, err := scrapeAllPairs(ctx, b.pairs)
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("sink delta scrape (a baseline pod went unreachable; rescale/restart breaks the proof): %w", err)

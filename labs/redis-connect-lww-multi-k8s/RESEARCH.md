@@ -60,10 +60,12 @@ The writer XADD fields, the `EVAL lww_set.lua 1 <key> <value> <version>` CAS
 call, and the sink metric `lww_apply_total{result=applied|stale|duplicate}` are
 all unchanged from the parent. The deltas are:
 
-- **Sink input** (`chart/files/connect/lww-reverse.yaml`) adds
-  `queue: region-writer-q` to its `nats_jetstream` input, making all N sink pods
-  share one durable push consumer and load-balance deliveries (each message →
-  exactly one pod).
+- **Sink input** (`chart/files/connect/lww-reverse.yaml`) adds a queue-only deliver
+  group `queue: region-writer` to its `nats_jetstream` input (no separate `durable`,
+  since connect 4.92.0 forbids `durable`+`queue` together; the queue name must equal
+  the durable name `region-writer` so the derived consumer name matches the
+  subscriber JWT grants). All N sink pods join this one deliver group and
+  load-balance deliveries (each message → exactly one pod).
 - **Verifier metric scrape.** `lww_apply` is a per-pod counter. The parent
   scraped one ClusterIP URL, which round-robins to a single pod and can hit
   different pods on baseline vs. final scrape → garbage deltas. The verifier now

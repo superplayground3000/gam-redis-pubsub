@@ -123,3 +123,22 @@ func TestScrapeAllPairsFailsIfOnePodUnreachable(t *testing.T) {
 		t.Fatal("expected scrapeAllPairs to fail when one pod is unreachable, got nil")
 	}
 }
+
+func TestSameSet(t *testing.T) {
+	base := []string{"10.0.0.1:4195", "10.0.0.2:4195", "10.0.0.3:4195"}
+	if !sameSet(base, []string{"10.0.0.1:4195", "10.0.0.2:4195", "10.0.0.3:4195"}) {
+		t.Fatal("identical sets should compare equal")
+	}
+	// a new pod appeared mid-run
+	if sameSet(base, []string{"10.0.0.1:4195", "10.0.0.2:4195", "10.0.0.3:4195", "10.0.0.4:4195"}) {
+		t.Fatal("added pod should NOT compare equal (must fail loud)")
+	}
+	// a pod disappeared mid-run
+	if sameSet(base, []string{"10.0.0.1:4195", "10.0.0.2:4195"}) {
+		t.Fatal("removed pod should NOT compare equal")
+	}
+	// same size, different member
+	if sameSet(base, []string{"10.0.0.1:4195", "10.0.0.2:4195", "10.0.0.9:4195"}) {
+		t.Fatal("replaced pod should NOT compare equal")
+	}
+}
