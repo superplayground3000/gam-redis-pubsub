@@ -127,24 +127,66 @@ three:
 
 ## Validated result
 
-_Pending: numbers recorded after `scripts/verify-lww.sh` passes on kind (see plan
-Task 8)._
+Validated on a 3-pod kind cluster (`lwwm`, namespace `lwwm-k8s`), `profile=lww`,
+`scripts/verify-lww.sh` exit 0 — Proof A (mechanism), Proof C (negative), and
+Proof B′ (multi-instance end-to-end) all green.
+
+- **Sink pods:** 3 × `connect-sink` (all `1/1 Running`).
+- **Per-pod `lww_apply` counters** (from each pod's `:4195/metrics`):
+
+  | sink pod | applied | duplicate |
+  |---|---|---|
+  | `lab-connect-sink-…-chz5t` | 42920 | 0 |
+  | `lab-connect-sink-…-crf6f` | 42960 | 0 |
+  | `lab-connect-sink-…-kd474` | 42862 | 0 |
+
+  Applied work is split ~1/3 per pod (≈42.9k each, sum ≈128.7k) with **zero
+  duplicates** — confirming **DISTRIBUTION** mode: all pods bind to one shared
+  consumer, so each message is delivered to exactly one pod. (A FAN-OUT layout
+  would show each pod ≈ the full message count, or duplicate ≈ applied.)
+
+- **Proof B′ result** (`lww` block, rate target 5000):
+
+  | metric | value |
+  |---|---|
+  | `rate_achieved_avg` | 4999.92 msg/s |
+  | `stale` | 31236 |
+  | `duplicate` | 0 |
+  | `mismatches` | 0 |
+  | `regressions` | 0 |
+  | `writes_per_key_avg` | 5090.625 |
+  | `keys_checked` | 32 |
+  | verdict | **pass** |
+
+  `mismatches=0` with `stale>0` is the load-bearing outcome: same-key messages
+  were reordered across pods, the CAS fence rejected 31236 strictly-older
+  arrivals, and every key converged to its highest version.
 
 This lab's ethos is that docs do not assert throughput numbers, stale counts, or
-"it passes" before an actual validation run. The end-to-end run is a later task;
-the figures (rate achieved, stale count, applied writes/s) will be filled in here
-from that run's `RESULT_JSON` once Proof A + Proof C + Proof B′ all exit 0.
+"it passes" before an actual validation run; the figures above are taken verbatim
+from that run's Proof B′ JSON and per-pod metrics.
 
 ## Design decisions / rejected alternatives
 
 - **Deliver group (shared durable) over per-pod-durable fan-out.** A `queue`
-  deliver group lets all N sink pods share one JetStream durable so each message
+  deliver group lets all N sink pods share one JetStream consumer so each message
   is processed once — realistic HA work-distribution. A per-pod-durable fan-out
   (every pod processes every message) would still prove the fence's idempotency
-  under concurrent duplicate CAS, but is not realistic HA. Which variant the
-  `nats_jetstream` input actually supports is confirmed empirically during the run
-  (the Research/build stage selects and confirms the shared-durable path; the
-  fan-out is documented only as a last resort).
+  under concurrent duplicate CAS, but is not realistic HA. The observed run was
+  **DISTRIBUTION** (each pod applied ≈1/3 of writes, duplicate=0), confirming the
+  shared-consumer path.
+- **Queue-only consumer, queue name == durable name (connect 4.92.0 constraint).**
+  This Redpanda Connect build (4.92.0) rejects `durable` and `queue` set together
+  ("both 'queue' and 'durable' can't be set simultaneously"), so the
+  `nats_jetstream` input uses a `queue` with **no** explicit `durable`. The NATS
+  client derives the consumer/durable name *from the queue name*, so the queue
+  name is set equal to `.Values.nats.stream.consumer.durable` (`region-writer`).
+  This is load-bearing: the subscriber JWT (`scripts/gen-nats-auth.sh`) grants
+  `CONSUMER.CREATE`/`INFO` and `$JS.ACK.APP_EVENTS.region-writer.>` scoped to that
+  exact name; a mismatched queue name (e.g. the earlier `region-writer-q`) derives
+  consumer `region-writer-q`, which the JWT does not authorize, and the sink pods
+  stay `0/1`. The init job creates only the stream (no consumer), so there is no
+  pre-existing-consumer conflict on a fresh install.
 - **DNS enumeration over the Kubernetes API.** The verifier discovers sink pods by
   resolving the headless Service name (`net.LookupHost`), not by listing pods via
   the API server — no RBAC / ServiceAccount permissions needed.
