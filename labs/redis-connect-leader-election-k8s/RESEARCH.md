@@ -92,9 +92,25 @@ of active-gating.
 
 ## Validated result (kind, N=3)
 
-TO BE FILLED BY Task 18 — run `scripts/verify-election.sh` and record: steady-state
-`single_active=true`; Proof B1 `overlap_pairs` (approx overlap ms ≈ pairs × sample interval
-of 100ms); Proof B2 `gap_pairs` (× 100ms); and the lease timings used (default 6s/4s/1s).
+`scripts/verify-election.sh` on a local `kind` cluster (N=3 connect pods, lease 6s/4s/1s,
+observer sampling 100ms, writer 2000 msg/s):
+
+- **Proof A (single-active):** over a clean 6s post-settle window (61 samples),
+  `single_active=true` — every consecutive pair had exactly one pod's `consumed:<pod>`
+  counter rising **and** exactly one active stream cluster-wide; the Lease had a holder.
+  Active-gating holds in steady state.
+- **Proof B1 (dual-active overlap):** SIGSTOP the leader's elector (pid 14, under tini) →
+  `overlap_pairs=56` ≈ **5.6 s** during which ≥2 pods' counters rose simultaneously. Two
+  pods genuinely consumed at once — impossible under hard fencing. Best-effort confirmed.
+- **Proof B2 (zero-active gap):** `kubectl delete pod <leader> --force --grace-period=0` →
+  `gap_pairs=57` ≈ **5.7 s** during which no pod's counters advanced (stream died with the
+  pod, Lease lingered until expiry, then a standby took over).
+- **Verdict:** `single_active=true overlap_pairs=56 gap_pairs=57` → **PASS**. Gating works
+  **and** is best-effort — both failure windows (~the 6s lease duration) were measured.
+
+The non-zero overlap and gap are the system working as documented: leader election lowers
+the probability of concurrent consumption but does not eliminate the dual-active / zero-active
+windows, so correctness must never rest on the Lease.
 
 ## Design decisions
 

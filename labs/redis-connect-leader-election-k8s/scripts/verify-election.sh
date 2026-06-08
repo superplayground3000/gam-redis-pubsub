@@ -25,8 +25,10 @@ OBS() { K exec "deploy/${PREFIX}observer" -- wget -qO- "http://localhost:8070/$1
 LEASE_NAME="${PREFIX}connect-elector"
 
 leader_pod() { K get lease "${LEASE_NAME}" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null || true; }
-# PID of the elector binary (exact comm match, so we never hit tini/PID 1).
-elector_pid() { K exec "$1" -c elector -- pgrep -x elector | head -n1; }
+# PID of the elector binary. busybox pgrep -x matches argv[0] exactly, so the full
+# binary path selects ONLY the elector (tini's argv[0] is /sbin/tini, the connect
+# process is in another container) and never PID 1 — which SIGSTOP must avoid.
+elector_pid() { K exec "$1" -c elector -- pgrep -x /usr/local/bin/elector | head -n1; }
 now_ms() { date +%s%3N; }
 
 echo "[writer] reset + start rate=${RATE}"
