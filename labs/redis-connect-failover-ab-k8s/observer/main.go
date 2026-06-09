@@ -55,11 +55,12 @@ func (r *ring) since(t time.Time) []Sample {
 
 func main() {
 	var (
-		redisAddr     = env("REDIS_ADDR", "lab-redis-central:6379")
-		connectHost   = env("CONNECT_HEADLESS", "lab-connect-headless")
-		connectPort   = env("CONNECT_PORT", "4195")
-		listen        = env("LISTEN_ADDR", ":8070")
-		intervalMs, _ = strconv.Atoi(env("SAMPLE_INTERVAL_MS", "100"))
+		redisAddr          = env("REDIS_ADDR", "lab-redis-central:6379")
+		connectHost        = env("CONNECT_HEADLESS", "lab-connect-headless")
+		connectPort        = env("CONNECT_PORT", "4195")
+		listen             = env("LISTEN_ADDR", ":8070")
+		intervalMs, _      = strconv.Atoi(env("SAMPLE_INTERVAL_MS", "100"))
+		requireStreamCount = env("REQUIRE_STREAM_COUNT", "true") == "true"
 	)
 	if intervalMs <= 0 {
 		intervalMs = 100
@@ -98,7 +99,7 @@ func main() {
 		series := rb.since(parseSince(r))
 		writeJSON(w, map[string]any{
 			"samples":       len(series),
-			"single_active": SingleActive(series),
+			"single_active": SingleActive(series, requireStreamCount),
 			"overlap_pairs": OverlapPairs(series),
 			"gap_pairs":     GapPairs(series),
 		})

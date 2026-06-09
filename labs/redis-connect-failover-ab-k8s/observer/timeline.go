@@ -40,15 +40,19 @@ func total(s Sample) int64 {
 	return t
 }
 
-// SingleActive is true iff every consecutive pair has exactly one pod rising AND
-// every sample reports exactly one active stream. This is steady-state Proof A.
-func SingleActive(series []Sample) bool {
+// SingleActive is true iff every consecutive pair has exactly one pod rising. When
+// requireStreamCount is true (Method A: streams-mode connect), it additionally requires
+// every sample to report exactly one active stream. Method C (run-mode connect, no
+// streams API) passes requireStreamCount=false and relies on the counter signal alone.
+func SingleActive(series []Sample, requireStreamCount bool) bool {
 	if len(series) < 2 {
 		return false
 	}
-	for _, s := range series {
-		if s.ActiveStreams != 1 {
-			return false
+	if requireStreamCount {
+		for _, s := range series {
+			if s.ActiveStreams != 1 {
+				return false
+			}
 		}
 	}
 	for i := 1; i < len(series); i++ {
