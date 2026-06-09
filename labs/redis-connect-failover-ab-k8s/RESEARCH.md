@@ -89,19 +89,21 @@ sampling 100ms, lease 6s/4s/1s). Steady state for both methods: `single_active=t
 
 ```
 method  fault            failover_time_s    overlap_pairs   at_most_1_held
-A       graceful-delete  6.1                0               yes
-A       force-delete     7.1                0               yes
-C       graceful-delete  1.4                0               yes
-C       force-delete     0.8                0               yes
+A       graceful-delete  6.2                0               yes
+A       force-delete     6.5                0               yes
+C       graceful-delete  2.1                0               yes
+C       force-delete     1.1                0               yes
 [verify-failover] PASS — both methods steady single-active AND at-most-1 held
 ```
 
-(`failover_time_s = gap_pairs × 0.1s`; raw gap_pairs were A: 61/71, C: 14/8.) Both methods
+(`failover_time_s = gap_pairs × 0.1s`; raw gap_pairs were A: 62/65, C: 21/11.) Both methods
 kept at-most-one consumer throughout (no measured overlap) — as expected, since this
 matrix stops the old consumer rather than freezing it. The headline difference is
 liveness: **Method A's lease-gated failover (~6–7s) was markedly slower than Method C's
-reschedule-only failover (~1s)** — the reverse of the naive expectation, for the reason
-analysed above.
+reschedule-only failover (~1–2s)** — the reverse of the naive expectation, for the reason
+analysed above. The result is stable run-to-run (a separate run measured A 6.1/7.1s,
+C 1.4/0.8s); absolute numbers jitter by a few hundred ms with scheduling, but the
+ordering (C ≪ A) and `overlap_pairs = 0` for both hold every time.
 
 ## Design decisions
 
