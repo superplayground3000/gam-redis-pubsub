@@ -1,6 +1,7 @@
-# Run-window defaults for the leader-election lab (env-overridable).
-: "${RATE:=2000}"           # writer msg/s during the proofs
-: "${SETTLE_S:=15}"         # wait for a leader to win + consumption to ramp / reconverge
-: "${OBS_WINDOW_S:=6}"      # pure steady-state observation window for Proof A
-: "${OVERLAP_WAIT_S:=12}"   # how long to keep the leader's elector SIGSTOPped (>= lease + buffer)
-: "${GAP_WAIT_S:=12}"       # how long to observe after force-kill (>= lease + buffer)
+# Run-window defaults for the A-vs-C failover comparison (env-overridable).
+: "${RATE:=2000}"            # writer msg/s during the run
+: "${SETTLE_S:=20}"          # wait for the active consumer + consumption to ramp / reconverge
+: "${OBS_WINDOW_S:=6}"       # clean steady-state observation window
+: "${FAULT_WAIT_S:=20}"      # observe window after each fault (>= worst-case failover + buffer)
+: "${SAMPLE_MS:=100}"        # observer sample interval (keep in sync with values observer.sampleIntervalMs)
+: "${METHODS:=A C}"          # which methods to compare
