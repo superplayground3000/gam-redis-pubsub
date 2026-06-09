@@ -7,10 +7,15 @@ consuming a Redis stream, under failover:
 
 - **Method A** — Deployment of N pods (streams mode) + a fail-closed client-go
   **leader-election** controller (one elector sidecar per pod). The Lease holder
-  consumes. Optimizes **liveness**: fast failover, but *best-effort* (no fencing).
+  consumes. At-most-one is *best-effort* (no fencing), and failover is **lease-gated**:
+  a standby waits out the lease before taking over.
 - **Method C** — `StatefulSet replicas: 1` running connect in run mode. K8s
-  at-most-one pod identity is the only gate. Optimizes **safety**: overlap is
-  structurally ~0, but failover is slower and can stall.
+  at-most-one pod identity is the only gate, so overlap is **structural ~0**; failover is
+  just pod-reschedule + connect startup, but a **node failure can stall** it.
+
+> Measured result (see RESEARCH.md): under pod-delete faults, Method C recovered *faster*
+> (~1s) than Method A (~6–7s, lease-gated) — the reverse of the naive guess — while both
+> held at-most-1 (`overlap_pairs = 0`).
 
 For each method the harness injects **graceful delete** and **force delete** on the
 active consumer and records **failover time** (zero-active gap duration) and

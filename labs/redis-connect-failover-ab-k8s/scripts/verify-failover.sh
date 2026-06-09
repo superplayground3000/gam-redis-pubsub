@@ -51,8 +51,13 @@ wait_active_ready() {
   return 1
 }
 
-# reset_counters wipes the observer's consumed:* signal so a previous method's frozen
-# counters never pollute the next method's overlap/gap math.
+# reset_counters wipes the observer's consumed:* signal between methods so a previous
+# method's frozen counters never pollute the next method's overlap/gap math. The stream
+# (app.events) and consumer group (electors) are intentionally SHARED across methods —
+# that is the fairness guarantee: both methods see the identical writer load. Per-method
+# measurement is isolated by this counter reset PLUS the clean post-settle steady window,
+# so cross-method consumer-group / PEL residue cannot leak into a failover number. (We do
+# not destroy the group here: doing so under a live consumer risks a NOGROUP stall.)
 reset_counters() {
   K exec "deploy/${PREFIX}redis-central" -- \
     sh -c "redis-cli --scan --pattern 'consumed:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
@@ -103,6 +108,10 @@ run_method() {
   helm upgrade --install "${RELEASE}" ./chart -n "${NS}" --create-namespace \
     -f "${VALUES_FILE}" --set "method=${method}" --wait --timeout 5m
   PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.resourcePrefix // "lab-"')"
+  # Derive the sample interval from the chart's effective values so failover_time_s
+  # (= gap_pairs * SAMPLE_MS/1000) cannot drift from the observer's real cadence. An
+  # explicit SAMPLE_MS env var still wins.
+  SAMPLE_MS="${SAMPLE_MS:-$(helm get values "${RELEASE}" -n "${NS}" --all -o json | jq -r '.observer.sampleIntervalMs // 100')}"
 
   # OBS() depends on PREFIX, so (re)define it here.
   OBS() { K exec "deploy/${PREFIX}observer" -- wget -qO- "http://localhost:8070/$1"; }

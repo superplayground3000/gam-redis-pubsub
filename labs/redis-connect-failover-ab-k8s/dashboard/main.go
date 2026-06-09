@@ -2,7 +2,7 @@
 // (latest per-pod consumed:<pod> snapshot + active-stream count) and /verdict (rolling
 // single-active / overlap / gap status), plus the writer's /state for the run epoch,
 // and pushes a combined "stats" message to the browser over a websocket. It is purely
-// cosmetic — the proof is owned by the observer + scripts/verify-election.sh.
+// cosmetic — the proof is owned by the observer + scripts/verify-failover.sh.
 package main
 
 import (

@@ -81,7 +81,7 @@ because redis-central is a separate, always-up Deployment.
   you need that node-failure resilience and can tolerate lease-bounded failover; otherwise
   C is simpler, safer, and faster for planned/pod-level disruptions.
 
-## Validated result (kind, N=3 for A / replicas:1 for C)
+## Validated result (kind — Method A with 3 replicas, Method C with replicas:1)
 
 `scripts/verify-failover.sh` on a local `kind` cluster (writer 2000 msg/s, observer
 sampling 100ms, lease 6s/4s/1s). Steady state for both methods: `single_active=true`,
