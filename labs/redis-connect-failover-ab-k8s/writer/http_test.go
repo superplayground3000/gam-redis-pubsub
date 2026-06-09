@@ -11,7 +11,7 @@ import (
 func newTestServer() *Server {
 	return &Server{
 		Lim: NewLimiter(), Counters: &Counters{}, MaxRate: 100000,
-		Versions:    NewVersions(2),
+		Run:         NewRun(),
 		HealthCheck: func() bool { return true },
 	}
 }
@@ -29,9 +29,6 @@ func TestResetSetsEpochAndStateReportsIt(t *testing.T) {
 		t.Fatalf("reset code=%d body=%s", rr.Code, rr.Body.String())
 	}
 
-	// Simulate a write so /state has content.
-	s.Versions.Next(0, "lww:run-123:0")
-
 	req = httptest.NewRequest(http.MethodGet, "/state", nil)
 	rr = httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -47,9 +44,6 @@ func TestResetSetsEpochAndStateReportsIt(t *testing.T) {
 	}
 	if st.BootID == "" {
 		t.Error("boot_id empty")
-	}
-	if st.Keys["lww:run-123:0"] != 1 {
-		t.Errorf("keys=%v", st.Keys)
 	}
 }
 

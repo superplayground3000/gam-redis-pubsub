@@ -16,27 +16,14 @@ type Worker struct {
 	StreamMaxLen  int64
 	PipelineDepth int
 	PayloadBytes  int
-	KeySpaceSize  int64
 	Lim           *Limiter
 	Counters      *Counters
-	Versions      *Versions
+	Run           *Run
 }
 
-// ownedKeyID returns the n-th key id (0-based) this worker owns, round-robining
-// over the strided subset { id : id % Workers == ID } of [0, KeySpaceSize).
-func (w *Worker) ownedKeyID(n int64) int64 {
-	stride := int64(w.Workers)
-	count := (w.KeySpaceSize - int64(w.ID) + stride - 1) / stride // # owned ids
-	if count <= 0 {
-		// Unreachable: main.go guards KEY_SPACE_SIZE >= WORKERS, so every worker
-		// (ID < Workers <= KeySpaceSize) owns >= 1 id. Clamp defensively to avoid a
-		// divide-by-zero; the result (ID) is still in-stride and collision-free.
-		count = 1
-	}
-	return int64(w.ID) + (n%count)*stride
-}
-
-func (w *Worker) Run(ctx context.Context) {
+// Loop emits payloads to the stream at the limiter's current rate. It is gated on the
+// run epoch: nothing is sent until /reset opens the gate (Run.Epoch() != "").
+func (w *Worker) Loop(ctx context.Context) {
 	var emitted int64
 	for {
 		rate := int(w.Lim.Current())
@@ -61,7 +48,7 @@ func (w *Worker) Run(ctx context.Context) {
 			continue
 		}
 
-		if w.Versions.Epoch() == "" {
+		if w.Run.Epoch() == "" {
 			// No run started yet (no /reset received). Sleep before retrying so we
 			// don't hot-spin discarding granted tokens if a rate was set pre-reset.
 			select {
@@ -74,17 +61,9 @@ func (w *Worker) Run(ctx context.Context) {
 
 		w.Counters.Inflight.Add(1)
 		pipe := w.RDB.Pipeline()
-		var n int
 		for i := 0; i < depth; i++ {
-			id := w.ownedKeyID(emitted)
-			// Derive key + version from ONE epoch snapshot so a concurrent /reset
-			// can't pair an old-epoch key with a new-epoch counter.
-			key, ver, ok := w.Versions.NextForCurrent(w.ID, id)
-			if !ok {
-				break // epoch cleared mid-batch (not expected); flush what we have
-			}
 			emitted++
-			p := NewPayload(ver, w.PayloadBytes)
+			p := NewPayload(emitted, w.PayloadBytes)
 			body, _ := p.JSON()
 			pipe.XAdd(ctx, &redis.XAddArgs{
 				Stream: w.StreamKey,
@@ -93,27 +72,20 @@ func (w *Worker) Run(ctx context.Context) {
 				Values: map[string]any{
 					"value":     string(body),
 					"event_id":  p.EventID,
-					"key":       key,
 					"pattern":   "stress",
 					"t_send_ms": p.TsNs / 1_000_000,
-					"version":   ver,
 				},
 			})
-			n++
-		}
-		if n == 0 {
-			w.Counters.Inflight.Add(-1)
-			continue
 		}
 		_, err = pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
 		if err != nil {
-			w.Counters.Errors.Add(int64(n))
+			w.Counters.Errors.Add(int64(depth))
 			if ctx.Err() == nil {
 				log.Printf("worker %d: pipeline error: %v", w.ID, err)
 			}
 		} else {
-			w.Counters.Sent.Add(int64(n))
+			w.Counters.Sent.Add(int64(depth))
 		}
 	}
 }

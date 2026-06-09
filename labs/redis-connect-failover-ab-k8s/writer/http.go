@@ -11,7 +11,7 @@ type Server struct {
 	Counters    *Counters
 	MaxRate     int
 	HealthCheck func() bool
-	Versions    *Versions
+	Run         *Run
 }
 
 type rateReq struct {
@@ -85,7 +85,7 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Counters.Reset()
-	s.Versions.SetEpoch(rq.Epoch)
+	s.Run.SetEpoch(rq.Epoch)
 	fmt.Fprintf(w, "reset; epoch=%s\n", rq.Epoch)
 }
 
@@ -95,5 +95,5 @@ func (s *Server) state(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(s.Versions.State())
+	_ = json.NewEncoder(w).Encode(s.Run.State())
 }
