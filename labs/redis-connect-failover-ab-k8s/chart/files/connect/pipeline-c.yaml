@@ -1,0 +1,34 @@
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
+metrics:
+  prometheus: {}
+input:
+  label: redis_source
+  redis_streams:
+    url: {{ include "rrcs.redis.central.url" . }}
+    kind: simple
+    streams: [app.events]
+    consumer_group: electors
+    client_id: ${POD_NAME}
+    body_key: value
+    create_streams: true
+    start_from_oldest: false
+    commit_period: 200ms
+    timeout: 500ms
+    limit: 50
+    auto_replay_nacks: true
+pipeline:
+  threads: 1
+  processors:
+    - redis:
+        url: {{ include "rrcs.redis.central.url" . }}
+        command: incr
+        args_mapping: 'root = [ "consumed:${POD_NAME}" ]'
+output:
+  label: drop_sink
+  drop: {}
