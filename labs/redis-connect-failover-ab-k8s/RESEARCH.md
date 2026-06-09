@@ -62,11 +62,46 @@ because redis-central is a separate, always-up Deployment.
 
 ## Interpreting the result
 
-- **Liveness:** Method A recovers within ~the lease duration on force-delete and faster
-  on graceful delete; Method C pays connect's cold-start each time. Expect A ≤ C.
+- **Liveness — measured, and it refuted the naive hypothesis.** The naive expectation is
+  "A is the fast one, C pays connect cold-start, so A ≤ C." The measurement (below) shows
+  the **opposite**: Method A's recovery is gated by **lease timing** — a standby cannot
+  take over until the Lease is free/expired (~the 6s LeaseDuration) — so A lands at
+  ~6–7s regardless of graceful vs force. Method C's recovery is just **pod reschedule +
+  warm `connect run` startup** (~1s when the image is already on the node), so it is
+  several times faster here. Force-delete C even beats graceful C, because a StatefulSet
+  only recreates `connect-0` once the old pod has *fully* terminated — graceful waits out
+  the `terminationGracePeriodSeconds` drain, force-delete does not.
 - **Safety:** both hold at-most-1 under this matrix (`overlap_pairs = 0`). The difference
   is *why*: C's zero is structural (K8s identity), A's zero is best-effort and would break
   under SIGSTOP-class faults — so correctness must never rest on Method A's Lease.
+- **Takeaway:** under this fault matrix, Method C is both *safer* (structural at-most-1)
+  **and** *faster to recover* (no lease to wait out) — its documented weakness is the
+  uncovered case: a **node failure** strands the single pod (`Unknown`) until something
+  deletes it, an unbounded stall Method A's multi-pod election avoids. Pick A only when
+  you need that node-failure resilience and can tolerate lease-bounded failover; otherwise
+  C is simpler, safer, and faster for planned/pod-level disruptions.
+
+## Validated result (kind, N=3 for A / replicas:1 for C)
+
+`scripts/verify-failover.sh` on a local `kind` cluster (writer 2000 msg/s, observer
+sampling 100ms, lease 6s/4s/1s). Steady state for both methods: `single_active=true`,
+`overlap_pairs=0` over a clean 6s window (61 samples).
+
+```
+method  fault            failover_time_s    overlap_pairs   at_most_1_held
+A       graceful-delete  6.1                0               yes
+A       force-delete     7.1                0               yes
+C       graceful-delete  1.4                0               yes
+C       force-delete     0.8                0               yes
+[verify-failover] PASS — both methods steady single-active AND at-most-1 held
+```
+
+(`failover_time_s = gap_pairs × 0.1s`; raw gap_pairs were A: 61/71, C: 14/8.) Both methods
+kept at-most-one consumer throughout (no measured overlap) — as expected, since this
+matrix stops the old consumer rather than freezing it. The headline difference is
+liveness: **Method A's lease-gated failover (~6–7s) was markedly slower than Method C's
+reschedule-only failover (~1s)** — the reverse of the naive expectation, for the reason
+analysed above.
 
 ## Design decisions
 
