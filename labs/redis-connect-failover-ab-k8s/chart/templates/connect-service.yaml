@@ -1,0 +1,15 @@
+# Headless service: DNS returns ALL connect pod IPs so the observer can scrape each
+# pod's /streams (Method A) without the K8s API. Rendered for BOTH methods — the
+# selector app=connect matches the Deployment (A) and StatefulSet (C) pods alike.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-headless") }}
+  labels: { app: connect }
+spec:
+  clusterIP: None
+  selector: { app: connect }
+  ports:
+    - name: http
+      port: 4195
+      targetPort: 4195

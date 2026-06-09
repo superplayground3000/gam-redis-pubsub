@@ -23,6 +23,7 @@ spec:
             - { name: CONNECT_PORT,       value: "4195" }
             - { name: LISTEN_ADDR,        value: ":8070" }
             - { name: SAMPLE_INTERVAL_MS, value: "{{ .Values.observer.sampleIntervalMs }}" }
+            - { name: REQUIRE_STREAM_COUNT, value: "{{ if eq .Values.method "A" }}true{{ else }}false{{ end }}" }
           ports:
             - containerPort: 8070
           readinessProbe:

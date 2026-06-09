@@ -1,3 +1,4 @@
+{{- if eq .Values.method "A" }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -15,3 +16,13 @@ metadata:
 data:
   pipeline.yaml: |-
 {{ tpl (.Files.Get "files/connect/pipeline.yaml") . | indent 4 }}
+{{- else if eq .Values.method "C" }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-pipeline-c") }}
+  labels: { app: connect }
+data:
+  pipeline.yaml: |-
+{{ tpl (.Files.Get "files/connect/pipeline-c.yaml") . | indent 4 }}
+{{- end }}

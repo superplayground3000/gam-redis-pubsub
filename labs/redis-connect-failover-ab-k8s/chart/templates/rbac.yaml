@@ -1,3 +1,4 @@
+{{- if eq .Values.method "A" }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -26,3 +27,4 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: {{ include "rrcs.name" (dict "root" $ "base" "connect-elector") }}
+{{- end }}

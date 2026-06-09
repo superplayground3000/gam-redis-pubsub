@@ -1,6 +1,10 @@
 # Prefix prepended to every chart-rendered resource name (see rrcs.name helper).
 resourcePrefix: "lab-"
 
+# Which active-standby method to deploy: "A" (Deployment + leader-election controller)
+# or "C" (StatefulSet replicas:1). The verify-failover.sh harness toggles this per run.
+method: A
+
 images:
   registry: ""
   pullPolicy: IfNotPresent
@@ -18,6 +22,8 @@ connect:
   image: hpdevelop/connect:4.92.0-claudefix
   replicas: 3
   streamID: source_leg
+  # Method C only: grace period for the StatefulSet pod to drain on graceful delete.
+  terminationGracePeriodSeconds: 30
   # Lease timings — same algorithm as research's 15/10/2, shortened for fast demo failover.
   lease:
     name: connect-elector
@@ -41,8 +47,6 @@ writer:
     STREAM_MAXLEN: "100000"
     WORKERS: "8"
     PIPELINE_DEPTH: "50"
-    # Keyspace is irrelevant to gating (no LWW here); keep modest.
-    KEY_SPACE_SIZE: "1000"
     PAYLOAD_BYTES: "200"
     MAX_RATE: "20000"
 

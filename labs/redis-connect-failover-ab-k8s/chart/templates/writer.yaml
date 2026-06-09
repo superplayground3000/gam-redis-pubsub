@@ -32,7 +32,6 @@ spec:
             - { name: STREAM_MAXLEN, value: "{{ .Values.writer.env.STREAM_MAXLEN }}" }
             - { name: WORKERS,        value: "{{ .Values.writer.env.WORKERS }}" }
             - { name: PIPELINE_DEPTH, value: "{{ .Values.writer.env.PIPELINE_DEPTH }}" }
-            - { name: KEY_SPACE_SIZE, value: "{{ .Values.writer.env.KEY_SPACE_SIZE }}" }
             - { name: PAYLOAD_BYTES,  value: "{{ .Values.writer.env.PAYLOAD_BYTES }}" }
             - { name: MAX_RATE,       value: "{{ .Values.writer.env.MAX_RATE }}" }
           ports:
