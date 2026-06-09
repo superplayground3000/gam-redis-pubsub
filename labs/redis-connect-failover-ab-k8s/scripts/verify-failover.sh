@@ -7,7 +7,7 @@
 #   overlap_pairs                                    (>=2 active at once; robustness breach)
 #   at_most_1_held  = (overlap_pairs == 0)
 # Prints a comparison table. Exits 0 iff every method reached steady single-active AND
-# every scenario held at-most-1 (overlap_pairs == 0).
+# every scenario held at-most-1 (overlap_pairs == 0) with a readable verdict.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -22,7 +22,7 @@ VALUES_FILE="${LEL_VALUES:-chart/values-dev.yaml}"
 K() { kubectl -n "${NS}" "$@"; }
 now_ms() { date +%s%3N; }
 
-ROWS=()        # "method|fault|failover_s|overlap|at_most_1"
+ROWS=()        # "method|fault|failover_s|overlap"
 FAIL=0
 
 # active_pod METHOD -> name of the pod currently consuming.
@@ -35,6 +35,22 @@ active_pod() {
   fi
 }
 
+# wait_active_ready METHOD -> 0 once the active consumer pod exists and is Ready (~60s).
+# Guards against injecting the next fault on a still-terminating / not-yet-recreated pod.
+wait_active_ready() {
+  local method="$1" pod cond
+  for _ in $(seq 1 60); do
+    pod="$(active_pod "$method")"
+    if [[ -n "$pod" ]]; then
+      cond="$(K get pod "$pod" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"
+      [[ "$cond" == "True" ]] && return 0
+    fi
+    sleep 1
+  done
+  echo "[${method}] active consumer pod not Ready after 60s" >&2
+  return 1
+}
+
 # reset_counters wipes the observer's consumed:* signal so a previous method's frozen
 # counters never pollute the next method's overlap/gap math.
 reset_counters() {
@@ -42,11 +58,14 @@ reset_counters() {
     sh -c "redis-cli --scan --pattern 'consumed:*' | xargs -r redis-cli del" >/dev/null 2>&1 || true
 }
 
-# measure_fault METHOD FAULT_KIND -> echoes "failover_s overlap"
+# vnum JSON FIELD -> the numeric value of .FIELD, or empty string if missing/null/non-numeric.
+vnum() { printf '%s' "$1" | jq -er ".${2} | numbers" 2>/dev/null || true; }
+
+# measure_fault METHOD FAULT_KIND -> echoes exactly "failover_s overlap" (or "ERR ERR").
 measure_fault() {
-  local method="$1" kind="$2" pod start verdict gap overlap
+  local method="$1" kind="$2" pod start verdict gap overlap fs
   pod="$(active_pod "$method")"
-  if [[ -z "$pod" ]]; then echo "[${method}/${kind}] no active pod" >&2; echo "0 0"; return; fi
+  if [[ -z "$pod" ]]; then echo "[${method}/${kind}] no active pod" >&2; echo "ERR ERR"; return; fi
   echo "[${method}/${kind}] injecting on ${pod}" >&2
   start="$(now_ms)"
   if [[ "$kind" == "graceful-delete" ]]; then
@@ -55,13 +74,26 @@ measure_fault() {
     K delete pod "$pod" --force --grace-period=0 >/dev/null 2>&1 || true
   fi
   sleep "${FAULT_WAIT_S}"
-  verdict="$(OBS "verdict?since_unix_ms=${start}")"
+  verdict="$(OBS "verdict?since_unix_ms=${start}" 2>/dev/null || true)"
   echo "[${method}/${kind}] ${verdict}" >&2
-  gap="$(echo "$verdict" | jq -r '.gap_pairs')"
-  overlap="$(echo "$verdict" | jq -r '.overlap_pairs')"
-  local fs
-  fs="$(awk -v g="${gap:-0}" -v ms="${SAMPLE_MS}" 'BEGIN{printf "%.1f", g*ms/1000}')"
-  echo "${fs} ${overlap:-0}"
+  gap="$(vnum "$verdict" gap_pairs)"
+  overlap="$(vnum "$verdict" overlap_pairs)"
+  if [[ -z "$gap" || -z "$overlap" ]]; then
+    echo "[${method}/${kind}] unreadable verdict -> recording ERR" >&2
+    echo "ERR ERR"
+    return
+  fi
+  fs="$(awk -v g="$gap" -v ms="${SAMPLE_MS}" 'BEGIN{printf "%.1f", g*ms/1000}')"
+  echo "${fs} ${overlap}"
+}
+
+# scenario METHOD KIND -> waits for readiness, measures, appends a row, updates FAIL.
+scenario() {
+  local method="$1" kind="$2" fs ov
+  wait_active_ready "$method" || FAIL=1
+  read -r fs ov < <(measure_fault "$method" "$kind")
+  ROWS+=("${method}|${kind}|${fs}|${ov}")
+  if [[ ! "$ov" =~ ^[0-9]+$ ]] || [[ "$ov" -gt 0 ]]; then FAIL=1; fi
 }
 
 run_method() {
@@ -82,29 +114,22 @@ run_method() {
 
   echo "[steady] settle ${SETTLE_S}s, observe ${OBS_WINDOW_S}s"
   sleep "${SETTLE_S}"
+  wait_active_ready "$method" || true
   local s_start sv sa
   s_start="$(now_ms)"
   sleep "${OBS_WINDOW_S}"
-  sv="$(OBS "verdict?since_unix_ms=${s_start}")"
+  sv="$(OBS "verdict?since_unix_ms=${s_start}" 2>/dev/null || true)"
   echo "[steady] ${sv}"
-  sa="$(echo "$sv" | jq -r '.single_active')"
+  sa="$(printf '%s' "$sv" | jq -er '.single_active' 2>/dev/null || true)"
   if [[ "$sa" != "true" ]]; then
-    echo "[steady] FAIL — method ${method} did not reach single-active"
+    echo "[steady] FAIL — method ${method} did not reach single-active (verdict: '${sv}')"
     FAIL=1
   fi
 
-  # Scenario 1: graceful delete.
-  read -r fs1 ov1 < <(measure_fault "$method" "graceful-delete")
-  ROWS+=("${method}|graceful-delete|${fs1}|${ov1}")
-  [[ "${ov1:-0}" -gt 0 ]] && FAIL=1
-
+  scenario "$method" "graceful-delete"
   echo "[reconverge] ${SETTLE_S}s"
   sleep "${SETTLE_S}"
-
-  # Scenario 2: force delete.
-  read -r fs2 ov2 < <(measure_fault "$method" "force-delete")
-  ROWS+=("${method}|force-delete|${fs2}|${ov2}")
-  [[ "${ov2:-0}" -gt 0 ]] && FAIL=1
+  scenario "$method" "force-delete"
 }
 
 for m in ${METHODS}; do run_method "$m"; done
@@ -114,7 +139,11 @@ echo "==================== COMPARISON ===================="
 printf "%-7s %-16s %-18s %-15s %s\n" "method" "fault" "failover_time_s" "overlap_pairs" "at_most_1_held"
 for row in "${ROWS[@]}"; do
   IFS='|' read -r m f fs ov <<<"$row"
-  amh="yes"; [[ "${ov:-0}" -gt 0 ]] && amh="no"
+  if [[ "$ov" =~ ^[0-9]+$ ]]; then
+    amh="yes"; [[ "$ov" -gt 0 ]] && amh="no"
+  else
+    amh="?"
+  fi
   printf "%-7s %-16s %-18s %-15s %s\n" "$m" "$f" "$fs" "$ov" "$amh"
 done
 echo "===================================================="
@@ -123,5 +152,5 @@ if [[ "$FAIL" -eq 0 ]]; then
   echo "[verify-failover] PASS — both methods steady single-active AND at-most-1 held under graceful+force delete"
   exit 0
 fi
-echo "[verify-failover] FAIL — see rows above (steady single-active failed, or overlap_pairs>0)"
+echo "[verify-failover] FAIL — see rows above (steady single-active failed, verdict unreadable, or overlap_pairs>0)"
 exit 1
