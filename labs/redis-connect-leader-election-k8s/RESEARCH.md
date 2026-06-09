@@ -102,11 +102,16 @@ observer sampling 100ms, writer 2000 msg/s):
 - **Proof B1 (dual-active overlap):** SIGSTOP the leader's elector (pid 14, under tini) →
   `overlap_pairs=56` ≈ **5.6 s** during which ≥2 pods' counters rose simultaneously. Two
   pods genuinely consumed at once — impossible under hard fencing. Best-effort confirmed.
+- **Reconvergence gate (between B1 and B2):** after B1, a fresh steady-state window
+  re-asserts `single_active=true` and a non-empty Lease holder before B2 runs — so the B2
+  gap is provably caused by the force-kill, not a lingering B1 outage (guards against a
+  false PASS). This also demonstrates the cluster recovers to single-active after overlap.
 - **Proof B2 (zero-active gap):** `kubectl delete pod <leader> --force --grace-period=0` →
-  `gap_pairs=57` ≈ **5.7 s** during which no pod's counters advanced (stream died with the
+  `gap_pairs=66` ≈ **6.6 s** during which no pod's counters advanced (stream died with the
   pod, Lease lingered until expiry, then a standby took over).
-- **Verdict:** `single_active=true overlap_pairs=56 gap_pairs=57` → **PASS**. Gating works
-  **and** is best-effort — both failure windows (~the 6s lease duration) were measured.
+- **Verdict:** `single_active=true overlap_pairs=63 gap_pairs=66` → **PASS**. Gating works
+  **and** is best-effort — both failure windows (~the 6s lease duration) were measured, and
+  the cluster reconverged to single-active in between.
 
 The non-zero overlap and gap are the system working as documented: leader election lowers
 the probability of concurrent consumption but does not eliminate the dual-active / zero-active

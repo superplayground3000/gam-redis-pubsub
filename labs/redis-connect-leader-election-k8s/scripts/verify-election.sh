@@ -68,10 +68,24 @@ OVERLAP="$(echo "$B1_VERDICT" | jq -r '.overlap_pairs')"
 echo "[proofB1] reconverge ${SETTLE_S}s"
 sleep "${SETTLE_S}"
 
+# Pre-B2 gate: the cluster MUST have reconverged to exactly one active consumer after
+# B1. Otherwise a lingering B1 outage (no leader) could masquerade as the B2 gap and
+# produce a false PASS. This also asserts recovery-after-overlap as part of the proof.
+RC_START="$(now_ms)"
+sleep "${OBS_WINDOW_S}"
+RC_VERDICT="$(OBS "verdict?since_unix_ms=${RC_START}")"
+echo "[proofB2] reconverged: ${RC_VERDICT}"
+RC_SA="$(echo "$RC_VERDICT" | jq -r '.single_active')"
 LEADER2="$(leader_pod)"
+if [[ "$RC_SA" != "true" || -z "$LEADER2" ]]; then
+  echo "[proofB2] FAIL — cluster did not reconverge to single-active after B1 (single_active=${RC_SA} holder=${LEADER2})"
+  exit 1
+fi
+
 echo "[proofB2] force-delete current leader ${LEADER2}"
 B2_START="$(now_ms)"
-K delete pod "${LEADER2}" --force --grace-period=0 >/dev/null 2>&1 || true
+# No '|| true': LEADER2 was just verified present, so a delete failure is a real fault.
+K delete pod "${LEADER2}" --force --grace-period=0 >/dev/null
 sleep "${GAP_WAIT_S}"
 B2_VERDICT="$(OBS "verdict?since_unix_ms=${B2_START}")"
 echo "[proofB2] ${B2_VERDICT}"
