@@ -83,7 +83,7 @@ func main() {
 				// Drop invalid samples (Redis/DNS error) rather than feed corrupt
 				// data — a counter mis-read as 0 would fabricate false overlap/gap
 				// verdicts. The verdict math only ever sees complete snapshots.
-				if s, ok := sampleOnce(ctx, rdb, hc, connectHost, connectPort); ok {
+				if s, ok := sampleOnce(ctx, rdb, hc, connectHost, connectPort, requireStreamCount); ok {
 					rb.add(s)
 				}
 			}
@@ -111,13 +111,16 @@ func main() {
 	}
 }
 
-// sampleOnce reads all consumed:* counters and sums active streams across pods.
-// It returns ok=false if the snapshot is incomplete (Redis SCAN/GET error, or the
-// headless DNS lookup failed) so the caller can discard it: feeding a partial map or
-// a transiently-zero counter into the verdict math would manufacture false
-// overlap/gap windows. A per-pod /streams failure is NOT a sample error — a pod that
-// is down genuinely has zero active streams.
-func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, port string) (Sample, bool) {
+// sampleOnce reads all consumed:* counters and, when requireStreamCount is set, sums
+// active streams across pods. It returns ok=false if the snapshot is incomplete (Redis
+// SCAN/GET error, or — when stream counts are required — the headless DNS lookup failed)
+// so the caller can discard it: feeding a partial map or a transiently-zero counter into
+// the verdict math would manufacture false overlap/gap windows. A per-pod /streams
+// failure is NOT a sample error — a pod that is down genuinely has zero active streams.
+// When requireStreamCount is false (Method C, run-mode connect) the /streams scrape is
+// skipped entirely, so a failover that empties the headless Service does not drop the
+// zero-active samples we need to measure the gap.
+func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, port string, requireStreamCount bool) (Sample, bool) {
 	c, cancel := context.WithTimeout(ctx, 800*time.Millisecond)
 	defer cancel()
 	consumed := map[string]int64{}
@@ -139,13 +142,20 @@ func sampleOnce(ctx context.Context, rdb *redis.Client, hc *http.Client, host, p
 			break
 		}
 	}
-	ips, err := net.LookupHost(host)
-	if err != nil {
-		return Sample{}, false
-	}
+	// The stream-count signal (GET /streams via headless DNS) only exists for Method A
+	// (streams-mode connect). For Method C (run-mode, requireStreamCount=false) we MUST
+	// skip it: with StatefulSet replicas:1, a failover empties the headless Service, so a
+	// DNS lookup here would fail and drop exactly the zero-active samples we need to
+	// measure the gap. The consumed:* read above is enough — redis-central stays up.
 	active := 0
-	for _, ip := range ips {
-		active += streamCount(hc, ip, port)
+	if requireStreamCount {
+		ips, err := net.LookupHost(host)
+		if err != nil {
+			return Sample{}, false
+		}
+		for _, ip := range ips {
+			active += streamCount(hc, ip, port)
+		}
 	}
 	return Sample{T: time.Now(), Consumed: consumed, ActiveStreams: active}, true
 }
