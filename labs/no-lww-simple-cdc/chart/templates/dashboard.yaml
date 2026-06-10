@@ -18,6 +18,7 @@ spec:
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.dashboard.image) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.dashboard.pullPolicy) }}
           env:
+            - { name: CENTRAL_ADDR, value: {{ include "rrcs.redis.central.hostPort" . | quote }} }
             - { name: REGION_ADDR,      value: {{ include "rrcs.redis.region.hostPort" . | quote }} }
             - { name: WRITER_URL,       value: "http://{{ include "rrcs.name" (dict "root" $ "base" "writer") }}:8081" }
             - { name: CONNECT_SINK_URL, value: "http://{{ include "rrcs.name" (dict "root" $ "base" "connect-sink") }}:4195" }
