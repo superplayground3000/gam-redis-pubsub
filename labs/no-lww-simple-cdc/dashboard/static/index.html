@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Redis Connect — Last-Write-Wins (live)</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 14px; background: #0e1117; color: #e6e6e6; }
+  h1 { font-size: 16px; margin: 0 0 12px; color: #fff; }
+  h2 { font-size: 13px; color: #b8c2cc; margin: 16px 0 6px; font-weight: 500; }
+  table { border-collapse: collapse; width: 100%; font-size: 12px; }
+  th, td { border-bottom: 1px solid #2a2f3a; padding: 4px 8px; text-align: left; }
+  th { background: #161b22; color: #b8c2cc; font-weight: 500; }
+  .stats { display: flex; gap: 12px; flex-wrap: wrap; }
+  .card { background: #161b22; padding: 8px 12px; border-radius: 6px; min-width: 160px; }
+  .card .name { font-size: 11px; color: #b8c2cc; text-transform: uppercase; letter-spacing: 0.04em; }
+  .card .val { font-size: 20px; margin-top: 4px; }
+  .applied { color: #7ee787; } .stale { color: #d29922; } .dup { color: #8b95a3; }
+  #status { font-size: 11px; color: #8b95a3; margin-bottom: 8px; }
+  #log-wrap { max-height: 60vh; overflow-y: auto; border: 1px solid #2a2f3a; border-radius: 6px; }
+  code { background: #161b22; padding: 1px 4px; border-radius: 3px; }
+</style>
+</head>
+<body>
+<h1>Redis → Connect — Last-Write-Wins fence (single instance)</h1>
+<div id="status">connecting…</div>
+
+<h2>Counters (windowed by connect-sink)</h2>
+<div class="stats" id="stats">
+  <div class="card"><div class="name">applied</div><div class="val applied" id="c-applied">—</div></div>
+  <div class="card"><div class="name">stale fenced (reorder)</div><div class="val stale" id="c-stale">—</div></div>
+  <div class="card"><div class="name">duplicate (dedup)</div><div class="val dup" id="c-dup">—</div></div>
+  <div class="card"><div class="name">applied / sec</div><div class="val" id="c-rate">—</div></div>
+  <div class="card"><div class="name">source keys</div><div class="val" id="c-keys">—</div></div>
+</div>
+
+<h2>Live applied writes (winning versions)</h2>
+<div id="log-wrap">
+  <table>
+    <thead><tr><th>time</th><th>key</th><th>ver</th><th>value (snippet)</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+</div>
+
+<script>
+const rows = document.getElementById("rows");
+const status = document.getElementById("status");
+const set = (id, v) => document.getElementById(id).textContent = v;
+
+function onEvent(e) {
+  const ts = new Date(e.ts_ms).toISOString().split("T")[1].replace("Z","");
+  const tr = document.createElement("tr");
+  const snippet = (e.value || "").slice(0, 48);
+  tr.innerHTML = `<td>${ts}</td><td><code>${e.key}</code></td><td>${e.ver}</td><td>${snippet}</td>`;
+  rows.prepend(tr);
+  while (rows.childElementCount > 200) rows.removeChild(rows.lastChild);
+}
+function onStats(s) {
+  set("c-applied", s.applied);
+  set("c-stale", s.stale);
+  set("c-dup", s.duplicate);
+  set("c-rate", Math.round(s.applied_per_s));
+  set("c-keys", s.source_keys + (s.epoch ? " ("+s.epoch+")" : ""));
+}
+
+let ws;
+function connect() {
+  ws = new WebSocket((location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws");
+  ws.onopen = () => status.textContent = "live · " + new Date().toISOString();
+  ws.onclose = () => { status.textContent = "disconnected, retrying…"; setTimeout(connect, 1500); };
+  ws.onmessage = (m) => {
+    try {
+      const e = JSON.parse(m.data);
+      if (e.type === "event") onEvent(e);
+      else if (e.type === "stats") onStats(e);
+    } catch {}
+  };
+}
+connect();
+</script>
+</body>
+</html>

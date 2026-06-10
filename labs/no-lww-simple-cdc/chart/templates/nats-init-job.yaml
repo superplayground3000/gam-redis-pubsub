@@ -1,0 +1,87 @@
+{{- if not .Values.nats.external.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Hash-suffixed so a changed stream config or image yields a NEW Job name
+  # rather than failing `helm upgrade` on the immutable completed Job (spec §5.2).
+  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) | sha256sum | trunc 8))) }}
+  labels: { app: nats-init }
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: nats-init }
+    spec:
+      restartPolicy: OnFailure
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      volumes:
+        - name: admin-creds
+          secret:
+            secretName: {{ include "rrcs.nats.credsSecret.admin" . }}
+            defaultMode: 0444    # Secret is in a per-pod tmpfs; non-root nats-box user needs read access
+      initContainers:
+        - name: wait-nats
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              until nats --server {{ include "rrcs.nats.url" . }} --creds /etc/nats-creds/admin/user.creds rtt >/dev/null 2>&1; do
+                echo "waiting for nats..."; sleep 1;
+              done
+          volumeMounts:
+            - name: admin-creds
+              mountPath: /etc/nats-creds/admin
+              readOnly: true
+      containers:
+        - name: create-stream
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command: ["/bin/sh", "-c"]
+          args:
+            - |
+              set -e
+              SERVER={{ include "rrcs.nats.url" . | quote }}
+              CREDS="/etc/nats-creds/admin/user.creds"
+              STREAM={{ .Values.nats.stream.name | quote }}
+              DESIRED_SUBJECTS='{{ include "rrcs.nats.stream.subjects" . }}'
+              if nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" >/dev/null 2>&1; then
+                # Stream exists. Reconcile bound subjects so a subjectPrefix change
+                # on `helm upgrade` actually takes effect — without this, the new
+                # init Job (hash-renamed by the values change) would no-op and
+                # publishers + the connect-sink consumer would move to the new
+                # prefix while the stream stayed bound to the old one, silently
+                # dropping every message.
+                CURRENT_SUBJECTS=$(nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" --json \
+                                   | jq -r '.config.subjects | join(",")')
+                if [ "$CURRENT_SUBJECTS" != "$DESIRED_SUBJECTS" ]; then
+                  echo "reconcile: $STREAM subjects [$CURRENT_SUBJECTS] -> [$DESIRED_SUBJECTS]"
+                  nats --server "$SERVER" --creds "$CREDS" stream edit "$STREAM" \
+                    --subjects="$DESIRED_SUBJECTS" --force
+                else
+                  echo "$STREAM exists with desired subjects [$DESIRED_SUBJECTS]"
+                fi
+              else
+                nats --server "$SERVER" --creds "$CREDS" stream add "$STREAM" \
+                  --subjects "$DESIRED_SUBJECTS" \
+                  --storage file \
+                  --replicas 1 \
+                  --retention limits \
+                  --discard old \
+                  --max-age {{ .Values.nats.stream.maxAge }} \
+                  --max-bytes {{ .Values.nats.stream.maxBytes }} \
+                  --max-msgs=-1 \
+                  --max-msg-size={{ .Values.nats.stream.maxMsgSize }} \
+                  --dupe-window {{ .Values.nats.stream.dupeWindow }} \
+                  --defaults
+              fi
+              nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM"
+          volumeMounts:
+            - name: admin-creds
+              mountPath: /etc/nats-creds/admin
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources.verifier | nindent 12 }}
+{{- end }}
