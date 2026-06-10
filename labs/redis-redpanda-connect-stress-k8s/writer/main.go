@@ -22,9 +22,17 @@ func main() {
 	pipelineDepth := envInt("PIPELINE_DEPTH", 50)
 	initialRate := envInt("INITIAL_RATE", 0)
 	keySpaceSize := envInt("KEY_SPACE_SIZE", 100_000)
-	payloadBytes := envInt("PAYLOAD_BYTES", 200)
 	maxRate := envInt("MAX_RATE", 20_000)
 	healthAddr := envStr("HEALTH_ADDR", ":8081")
+
+	if os.Getenv("PAYLOAD_BYTES") != "" {
+		log.Printf("WARN: PAYLOAD_BYTES is ignored — write mode is now SET+XADD with SHA-256 hash values (fixed 64 bytes)")
+	}
+
+	log.Printf("writer config: addr=%s stream=%s workers=%d pipeline=%d key_space=%d initial_rate=%d max_rate=%d",
+		addr, streamKey, workers, pipelineDepth, keySpaceSize, initialRate, maxRate)
+	log.Printf("writer workload: 2 Redis commands per event (SET lp:{m2g|r2g}:... + XADD %s); effective Redis cmd rate = 2× event rate", streamKey)
+	log.Printf("writer key patterns: lp:m2g:active:employee:<10000..%d> | lp:r2g:active:tkms:<rule>#<role>", 10000+int64(keySpaceSize)-1)
 
 	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: workers * 2})
 	defer rdb.Close()
@@ -43,7 +51,6 @@ func main() {
 			StreamKey:     streamKey,
 			StreamMaxLen:  int64(streamMaxLen),
 			PipelineDepth: pipelineDepth,
-			PayloadBytes:  payloadBytes,
 			KeySpaceSize:  int64(keySpaceSize),
 			Lim:           lim,
 			Counters:      counters,

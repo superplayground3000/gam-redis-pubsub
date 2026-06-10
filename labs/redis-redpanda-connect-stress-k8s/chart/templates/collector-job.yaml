@@ -34,6 +34,7 @@ spec:
             - --slo-rate-pct={{ .Values.collector.sloRatePct }}
             - --slo-p99-ms={{ .Values.collector.sloP99Ms }}
             - --slo-allow-missing={{ .Values.collector.sloAllowMissing }}
+            - --writer=http://{{ include "rrcs.name" (dict "root" $ "base" "writer") }}:8081
             - --nats-stream={{ .Values.nats.stream.name }}
             - --nats={{ include "rrcs.nats.monitorUrl" . }}
             - --redis-central={{ include "rrcs.redis.central.hostPort" . }}

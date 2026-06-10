@@ -1,6 +1,9 @@
 # Reads central Redis stream and publishes each entry to NATS JetStream.
 # Each XADD entry has fields: event_id, key, value, pattern, t_send_ms.
-# body_key=value -> message body is the JSON value string; the rest land as metadata.
+#   key     = lp:m2g:active:employee:<id>  or  lp:r2g:active:tkms:<rule>#<role>
+#   pattern = "m2g" or "r2g"
+#   value   = SHA-256 hex hash of the key's current content (set by the writer)
+# body_key=value -> message body is the hash string; the rest land as metadata.
 
 http:
   address: 0.0.0.0:4195
@@ -25,7 +28,7 @@ input:
 pipeline:
   threads: 2
   processors:
-    # Re-wrap the message as a JSON envelope so the reverse leg has key + value
+    # Re-wrap as a JSON envelope so the reverse leg has key + hash-value
     # without depending on NATS header passthrough behavior.
     - mapping: |
         let original_value = content().string()
@@ -36,7 +39,10 @@ pipeline:
           "pattern":    meta("pattern").or("unknown"),
           "t_send_ms":  meta("t_send_ms").or("0").number()
         }
-        meta event_id = meta("event_id").or($original_value.hash("sha256").encode("hex"))
+        # Fallback: use the hash string itself as the dedup ID. It is sha256(key:seq)
+        # so it is deterministic across retries — a retried message produces the
+        # same fallback and JetStream dedup absorbs it correctly.
+        meta event_id = meta("event_id").or($original_value)
         meta pattern  = meta("pattern").or("unknown")
 
 output:

@@ -50,6 +50,8 @@ output:
     pattern: fan_out
     outputs:
       - cache:
+          # SET lp:m2g:active:employee:<id> <sha256-hash>
+          # or SET lp:r2g:active:tkms:<rule>#<role> <sha256-hash>
           target: region_kv
           key: ${! meta("key") }
           max_in_flight: 64

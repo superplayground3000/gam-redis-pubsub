@@ -25,6 +25,8 @@ input:
     timeout: 500ms
     limit: 50
     auto_replay_nacks: false
+    # key   = lp:m2g:active:employee:<id>  or  lp:r2g:active:tkms:<rule>#<role>
+    # value = SHA-256 hex hash written by the writer (body_key field above)
 
 pipeline:
   threads: 2

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"log"
-	"strconv"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -15,7 +14,6 @@ type Worker struct {
 	StreamKey     string
 	StreamMaxLen  int64
 	PipelineDepth int
-	PayloadBytes  int
 	KeySpaceSize  int64
 	Lim           *Limiter
 	Counters      *Counters
@@ -59,30 +57,46 @@ func (w *Worker) Run(ctx context.Context) {
 		pipe := w.RDB.Pipeline()
 		for i := 0; i < depth; i++ {
 			seq++
-			p := NewPayload(base|seq, w.PayloadBytes)
-			body, _ := p.JSON()
-			key := "stress:" + strconv.FormatInt((base|seq)%w.KeySpaceSize, 10)
+			p := NewPayload(base|seq, 0)
+			kv := NewKeyValue(base|seq, w.KeySpaceSize)
+			// SET the key in central Redis so connect can detect the change and
+			// replicate it; the XADD entry carries the same hash as the value so
+			// the sink can write exactly this hash to regional Redis.
+			pipe.Set(ctx, kv.Key, kv.Hash, 0)
 			pipe.XAdd(ctx, &redis.XAddArgs{
 				Stream: w.StreamKey,
 				MaxLen: w.StreamMaxLen,
 				Approx: true,
 				Values: map[string]any{
-					"value":     string(body),
+					"value":     kv.Hash,
 					"event_id":  p.EventID,
-					"key":       key,
-					"pattern":   "stress",
+					"key":       kv.Key,
+					"pattern":   kv.Pattern,
 					"t_send_ms": p.TsNs / 1_000_000,
 				},
 			})
 		}
-		_, err = pipe.Exec(ctx)
+		cmds, err := pipe.Exec(ctx)
 		w.Counters.Inflight.Add(-1)
 		if err != nil {
-			// Conservative semantic: any pipeline error charges the full batch to Errors,
-			// even if some XADDs in the batch may have succeeded. We never inspect per-command
-			// results — the overhead of iterating the response isn't worth the precision for
-			// a stress lab where partial pipeline failures are extremely rare.
-			w.Counters.Errors.Add(int64(depth))
+			// Pipeline has 2 commands per event: SET at index 2i, XADD at 2i+1.
+			// An event reaches connect only if its XADD succeeded. When SET succeeds
+			// but XADD fails the key is mutated in central Redis with no stream event —
+			// a permanent replication gap — so log it distinctly.
+			var sent, errs int64
+			for i := 0; i < depth && 2*i+1 < len(cmds); i++ {
+				if xErr := cmds[2*i+1].Err(); xErr != nil {
+					errs++
+					if cmds[2*i].Err() == nil && ctx.Err() == nil {
+						w.Counters.SetGaps.Add(1)
+						log.Printf("worker %d event %d: SET ok but XADD failed (replication gap): %v", w.ID, i, xErr)
+					}
+				} else {
+					sent++
+				}
+			}
+			w.Counters.Sent.Add(sent)
+			w.Counters.Errors.Add(errs)
 			if ctx.Err() == nil {
 				log.Printf("worker %d: pipeline error: %v", w.ID, err)
 			}

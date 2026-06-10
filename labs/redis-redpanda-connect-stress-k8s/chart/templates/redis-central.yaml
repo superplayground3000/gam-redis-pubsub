@@ -26,6 +26,8 @@ spec:
             - "no"
             - --save
             - ""
+            - --protected-mode
+            - "no"
           ports:
             - containerPort: 6379
           readinessProbe:

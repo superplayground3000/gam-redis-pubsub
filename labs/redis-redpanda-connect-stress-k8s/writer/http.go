@@ -36,10 +36,21 @@ func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) metrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+	sent := s.Counters.Sent.Load()
+	errors := s.Counters.Errors.Load()
+	// Each event issues 2 Redis commands (SET + XADD), so the actual Redis write
+	// throughput is 2× the event rate reported by stress_writer_sent_total.
+	redisCmds := (sent + errors) * 2
 	fmt.Fprintf(w, "# TYPE stress_writer_sent_total counter\n")
-	fmt.Fprintf(w, "stress_writer_sent_total %d\n", s.Counters.Sent.Load())
+	fmt.Fprintf(w, "stress_writer_sent_total %d\n", sent)
 	fmt.Fprintf(w, "# TYPE stress_writer_errors_total counter\n")
-	fmt.Fprintf(w, "stress_writer_errors_total %d\n", s.Counters.Errors.Load())
+	fmt.Fprintf(w, "stress_writer_errors_total %d\n", errors)
+	fmt.Fprintf(w, "# TYPE stress_writer_redis_cmds_total counter\n")
+	fmt.Fprintf(w, "# HELP stress_writer_redis_cmds_total Total Redis commands issued (2 per event: SET + XADD)\n")
+	fmt.Fprintf(w, "stress_writer_redis_cmds_total %d\n", redisCmds)
+	fmt.Fprintf(w, "# TYPE stress_writer_set_gaps_total counter\n")
+	fmt.Fprintf(w, "# HELP stress_writer_set_gaps_total Events where SET succeeded but XADD failed — key mutated in central Redis with no stream event (replication gap)\n")
+	fmt.Fprintf(w, "stress_writer_set_gaps_total %d\n", s.Counters.SetGaps.Load())
 	fmt.Fprintf(w, "# TYPE stress_writer_rate_target gauge\n")
 	fmt.Fprintf(w, "stress_writer_rate_target %d\n", s.Lim.Current())
 	fmt.Fprintf(w, "# TYPE stress_writer_inflight_pipelines gauge\n")

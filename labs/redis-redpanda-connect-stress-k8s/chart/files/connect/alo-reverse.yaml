@@ -1,7 +1,9 @@
 # QoS profile: at-least-once (ALO).
 # Consumes JetStream APP_EVENTS; for each delivery, fans out to region Redis:
-#   1. SET <key> <value>            (KV state replication, via cache output)
-#   2. XADD region-events ...        (delivery ledger, via redis_streams output)
+#   1. SET <key> <sha256-hash>      (KV state replication, via cache output)
+#        key   = lp:m2g:active:employee:<id>  or  lp:r2g:active:tkms:<rule>#<role>
+#        value = SHA-256 hex hash carried in the stream entry's "value" field
+#   2. XADD region-events ...       (delivery ledger, via redis_streams output)
 # Durable consumer + ack-explicit means a sink crash/restart replays unacked.
 
 http:
@@ -22,7 +24,7 @@ input:
 pipeline:
   threads: 2
   processors:
-    # Lift fields into metadata so the body is just the value JSON.
+    # Lift fields into metadata so the body is the SHA-256 hash string.
     - mapping: |
         meta key        = this.key
         meta event_id   = this.event_id
