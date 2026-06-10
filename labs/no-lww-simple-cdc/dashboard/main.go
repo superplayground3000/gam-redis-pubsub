@@ -1,3 +1,4 @@
+// $LAB/dashboard/main.go
 package main
 
 import (
@@ -71,31 +72,31 @@ func getenv(k, def string) string {
 }
 
 func main() {
+	centralAddr := getenv("CENTRAL_ADDR", "redis-central:6379")
 	regionAddr := getenv("REGION_ADDR", "redis-region:6379")
 	writerURL := getenv("WRITER_URL", "http://writer:8081")
 	sinkURL := getenv("CONNECT_SINK_URL", "http://connect-sink:4195")
 	listen := getenv("LISTEN_ADDR", ":8080")
-	event := getenv("KEYSPACE_EVENT", "__keyevent@0__:hset")
+	scanMatch := getenv("SCAN_MATCH", "lb:*")
 
+	central := redis.NewClient(&redis.Options{Addr: centralAddr})
 	region := redis.NewClient(&redis.Options{Addr: regionAddr})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	for i := 0; i < 30; i++ {
-		if region.Ping(ctx).Err() == nil {
+		if region.Ping(ctx).Err() == nil && central.Ping(ctx).Err() == nil {
 			break
 		}
 		time.Sleep(time.Second)
 	}
-	if err := region.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err(); err != nil {
-		log.Printf("config set notify-keyspace-events failed (continuing): %v", err)
-	}
+	_ = region.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err()
 
 	h := newHub()
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); subscribeApplied(ctx, region, event, h) }()
-	go func() { defer wg.Done(); pollStats(ctx, writerURL, sinkURL, h) }()
+	go func() { defer wg.Done(); subscribeChanges(ctx, region, h) }()
+	go func() { defer wg.Done(); pollLoop(ctx, central, region, writerURL, sinkURL, scanMatch, h) }()
 
 	upgrader := websocket.Upgrader{CheckOrigin: func(*http.Request) bool { return true }}
 	mux := http.NewServeMux()
@@ -132,20 +133,20 @@ func main() {
 		cancel()
 	}()
 
-	log.Printf("dashboard listening on %s (event=%s)", listen, event)
+	log.Printf("dashboard listening on %s (scan=%s)", listen, scanMatch)
 	if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
 	wg.Wait()
 	_ = region.Close()
+	_ = central.Close()
 }
 
-// subscribeApplied streams every applied write (key,ver,value) to the browser.
-func subscribeApplied(ctx context.Context, c *redis.Client, event string, h *hub) {
-	sub := c.PSubscribe(ctx, event)
+// subscribeChanges streams region key changes (set/del) to the browser.
+func subscribeChanges(ctx context.Context, c *redis.Client, h *hub) {
+	sub := c.PSubscribe(ctx, "__keyevent@0__:set", "__keyevent@0__:del")
 	defer func() { _ = sub.Close() }()
 	ch := sub.Channel()
-	log.Printf("subscribed keyspace event=%s", event)
 	for {
 		select {
 		case <-ctx.Done():
@@ -154,86 +155,96 @@ func subscribeApplied(ctx context.Context, c *redis.Client, event string, h *hub
 			if !ok {
 				return
 			}
-			key := msg.Payload // __keyevent@…__:hset payload is the key name
-			if !strings.HasPrefix(key, "lww:") {
+			key := msg.Payload
+			if !strings.HasPrefix(key, "lb:") {
 				continue
 			}
-			vals, err := c.HMGet(ctx, key, "ver", "val").Result()
-			if err != nil || len(vals) < 2 {
-				continue
+			op := "set"
+			if strings.HasSuffix(msg.Channel, ":del") {
+				op = "del"
 			}
-			ver, _ := toInt(vals[0])
-			val, _ := vals[1].(string)
+			val := ""
+			if op == "set" {
+				val, _ = c.Get(ctx, key).Result()
+			}
 			b, _ := json.Marshal(map[string]any{
-				"type": "event", "key": key, "ver": ver, "value": val,
-				"ts_ms": time.Now().UnixMilli(),
+				"type": "event", "op": op, "key": key, "value": val, "ts_ms": time.Now().UnixMilli(),
 			})
 			h.broadcast(b)
 		}
 	}
 }
 
-// pollStats polls writer /state and sink /metrics once a second.
-func pollStats(ctx context.Context, writerURL, sinkURL string, h *hub) {
+// scanAll loads every key matching pattern and its string value into a map.
+func scanAll(ctx context.Context, c *redis.Client, match string) map[string]string {
+	out := map[string]string{}
+	var cursor uint64
+	for {
+		keys, cur, err := c.Scan(ctx, cursor, match, 500).Result()
+		if err != nil {
+			return out
+		}
+		for _, k := range keys {
+			if v, err := c.Get(ctx, k).Result(); err == nil {
+				out[k] = v
+			}
+		}
+		cursor = cur
+		if cursor == 0 {
+			break
+		}
+	}
+	return out
+}
+
+func pollLoop(ctx context.Context, central, region *redis.Client, writerURL, sinkURL, match string, h *hub) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
-	var lastApplied int64
-	var lastAt = time.Now()
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			applied, stale, dup := scrapeLWW(ctx, sinkURL)
-			sourceKeys, sourceEpoch := scrapeState(ctx, writerURL)
-			dt := time.Since(lastAt).Seconds()
-			perSec := 0.0
-			if dt > 0 && applied >= lastApplied {
-				perSec = float64(applied-lastApplied) / dt
-			}
-			lastApplied, lastAt = applied, time.Now()
+			cmap := scanAll(ctx, central, match)
+			rmap := scanAll(ctx, region, match)
+			div := computeDivergence(cmap, rmap)
+			ops := scrapeApply(ctx, sinkURL)
+			epoch, writerOps := scrapeState(ctx, writerURL)
 			b, _ := json.Marshal(map[string]any{
-				"type": "stats", "applied": applied, "stale": stale, "duplicate": dup,
-				"applied_per_s": perSec, "source_keys": sourceKeys, "epoch": sourceEpoch,
+				"type": "stats", "divergence": div, "sink_apply": ops,
+				"writer_ops": writerOps, "epoch": epoch,
 			})
 			h.broadcast(b)
 		}
 	}
 }
 
-// scrapeLWW parses the connect-sink /metrics exposition for the lww_apply
-// counter. It matches ONLY the counter value series (`lww_apply{...}` or
-// `lww_apply_total{...}`) and explicitly skips the OpenMetrics
-// `lww_apply_created{...}` series (a unix-timestamp gauge), which neither
-// prefix matches — mirroring the verifier's safe scrape.
-func scrapeLWW(ctx context.Context, sinkURL string) (applied, stale, dup int64) {
+// scrapeApply parses connect-sink /metrics for cdc_apply{op="..."} counters.
+func scrapeApply(ctx context.Context, sinkURL string) map[string]int64 {
+	out := map[string]int64{"create": 0, "update": 0, "delete": 0, "rename": 0}
 	body := httpGet(ctx, sinkURL+"/metrics")
 	for _, ln := range strings.Split(body, "\n") {
-		// Value series only; excludes `lww_apply_created{...}`.
-		if !strings.HasPrefix(ln, "lww_apply{") && !strings.HasPrefix(ln, "lww_apply_total{") {
+		if !strings.HasPrefix(ln, "cdc_apply{") && !strings.HasPrefix(ln, "cdc_apply_total{") {
 			continue
 		}
-		v := trailingFloat(ln)
-		switch {
-		case strings.Contains(ln, `result="applied"`):
-			applied = int64(v)
-		case strings.Contains(ln, `result="stale"`):
-			stale = int64(v)
-		case strings.Contains(ln, `result="duplicate"`):
-			dup = int64(v)
+		v := int64(trailingFloat(ln))
+		for op := range out {
+			if strings.Contains(ln, `op="`+op+`"`) {
+				out[op] = v
+			}
 		}
 	}
-	return
+	return out
 }
 
-func scrapeState(ctx context.Context, writerURL string) (int, string) {
+func scrapeState(ctx context.Context, writerURL string) (string, map[string]int64) {
 	body := httpGet(ctx, writerURL+"/state")
 	var st struct {
-		DistinctKeys int    `json:"distinct_keys"`
-		Epoch        string `json:"epoch"`
+		Epoch string           `json:"epoch"`
+		Ops   map[string]int64 `json:"ops"`
 	}
 	_ = json.Unmarshal([]byte(body), &st)
-	return st.DistinctKeys, st.Epoch
+	return st.Epoch, st.Ops
 }
 
 func httpGet(ctx context.Context, url string) string {
@@ -254,13 +265,4 @@ func trailingFloat(line string) float64 {
 	}
 	v, _ := strconv.ParseFloat(f[len(f)-1], 64)
 	return v
-}
-
-func toInt(v any) (int64, bool) {
-	s, ok := v.(string)
-	if !ok {
-		return 0, false
-	}
-	n, err := strconv.ParseInt(s, 10, 64)
-	return n, err == nil
 }
