@@ -76,22 +76,3 @@ spec:
     - name: http
       port: 4195
       targetPort: 4195
----
-# Headless Service: clusterIP None makes DNS return an A record per READY sink pod
-# (not a single VIP). The verifier resolves this name to enumerate every sink pod
-# and SUM its per-pod lww_apply counters — a single-VIP scrape would round-robin to
-# one pod and undercount. publishNotReadyAddresses stays false so a not-yet-ready
-# pod (no traffic, zero counters) cannot dilute the baseline.
-apiVersion: v1
-kind: Service
-metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink-headless") }}
-  labels: { app: connect-sink }
-spec:
-  clusterIP: None
-  publishNotReadyAddresses: false
-  selector: { app: connect-sink }
-  ports:
-    - name: http
-      port: 4195
-      targetPort: 4195
