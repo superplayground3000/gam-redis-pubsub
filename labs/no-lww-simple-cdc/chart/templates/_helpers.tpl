@@ -130,14 +130,13 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 {{- end -}}
 
 {{/*
-rrcs.nats.stream.publishSubject — the subject connect-source publishes each
-message to. The per-message ".${! meta(\"pattern\") }" suffix is a Redpanda
-Connect interpolation, evaluated at publish time, not by Helm.
-Usage: {{ include "rrcs.nats.stream.publishSubject" . }}
+rrcs.nats.stream.publishSubject — subject connect-source publishes each CDC event
+to: <subjectPrefix>.<op>. The ".${! meta(\"op\") }" suffix is a Redpanda Connect
+interpolation evaluated at publish time, not by Helm.
 */}}
 {{- define "rrcs.nats.stream.publishSubject" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
-{{- printf "%s.${! meta(\"pattern\") }" $p -}}
+{{- printf "%s.${! meta(\"op\") }" $p -}}
 {{- end -}}
 
 {{- define "rrcs.nats.credsSecret.publisher" -}}
