@@ -1,0 +1,305 @@
+<mxfile host="app.diagrams.net">
+  <!-- ============================================================
+       PAGE 1 — Method A: Lease (client-go leader election)
+       ============================================================ -->
+  <diagram id="page-A" name="Method A — Lease">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1"
+                  connect="1" arrows="1" fold="1" page="1" pageScale="1"
+                  pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="2" value="Method A — Kubernetes Lease + client-go leader-election controller (this lab)"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=1;fontSize=18;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1089" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Lease object (the shared lock) -->
+        <mxCell id="3" value="&lt;b&gt;Kubernetes Lease&lt;/b&gt;&#10;coordination.k8s.io/v1&#10;holderIdentity = connect-pod-1&#10;Lease / Renew / Retry = 6s / 4s / 1s"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="455" y="90" width="260" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Pod 1 — LEADER ===== -->
+        <mxCell id="4" value="connect-pod-1   (LEADER / ACTIVE)"
+          style="swimlane;startSize=26;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="240" width="330" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="5" value="Redpanda Connect&#10;streams mode :4195&#10;&lt;b&gt;1 active stream&lt;/b&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;"
+          vertex="1" parent="4">
+          <mxGeometry x="15" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="6" value="elector sidecar&#10;(client-go)&#10;&lt;b&gt;LEADING&lt;/b&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;"
+          vertex="1" parent="4">
+          <mxGeometry x="175" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Pod 2 — standby ===== -->
+        <mxCell id="7" value="connect-pod-2   (standby)"
+          style="swimlane;startSize=26;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="420" y="240" width="330" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="8" value="Redpanda Connect&#10;streams mode&#10;&lt;b&gt;0 streams&lt;/b&gt; (fail-closed)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;"
+          vertex="1" parent="7">
+          <mxGeometry x="15" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="9" value="elector sidecar&#10;watching lease&#10;(retry to acquire)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;"
+          vertex="1" parent="7">
+          <mxGeometry x="175" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- ===== Pod 3 — standby ===== -->
+        <mxCell id="10" value="connect-pod-3   (standby)"
+          style="swimlane;startSize=26;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="800" y="240" width="330" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="Redpanda Connect&#10;streams mode&#10;&lt;b&gt;0 streams&lt;/b&gt; (fail-closed)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;"
+          vertex="1" parent="10">
+          <mxGeometry x="15" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="elector sidecar&#10;watching lease&#10;(retry to acquire)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;"
+          vertex="1" parent="10">
+          <mxGeometry x="175" y="40" width="140" height="75" as="geometry" />
+        </mxCell>
+
+        <!-- Redis stream -->
+        <mxCell id="13" value="redis-central&#10;stream  app.events"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="455" y="450" width="260" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Writer -->
+        <mxCell id="14" value="writer&#10;XADD"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="120" y="455" width="140" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- Best-effort callout -->
+        <mxCell id="15" value="&lt;b&gt;Best-effort active-gating — NOT fencing&lt;/b&gt;&#10;&#10;• SIGSTOP leader's elector → frozen leader still consumes while a standby wins → &lt;b&gt;dual-active OVERLAP&lt;/b&gt; (~5.6s measured)&#10;• force-kill leader → stream dies, Lease lingers to expiry → &lt;b&gt;zero-active GAP&lt;/b&gt; (~6.6s measured)&#10;&#10;Order &amp; uniqueness must NOT depend on the Lease."
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="760" y="440" width="370" height="170" as="geometry" />
+        </mxCell>
+
+        <!-- ============ EDGES ============ -->
+        <!-- elector1 -> Lease : holds + renews -->
+        <mxCell id="20" value="holds + renews"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.2;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;"
+          edge="1" source="6" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- elector2 -> Lease : watch/retry -->
+        <mxCell id="21" value="watch / retry"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;"
+          edge="1" source="9" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- elector3 -> Lease : watch/retry -->
+        <mxCell id="22" value="watch / retry"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.8;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;"
+          edge="1" source="12" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- elector1 -> connect1 : POST /streams -->
+        <mxCell id="23" value="POST /streams"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=1;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;"
+          edge="1" source="6" target="5" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- Redis -> connect1 : XREADGROUP (leader only) -->
+        <mxCell id="24" value="XREADGROUP (leader only)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.15;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;"
+          edge="1" source="13" target="5" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="205" y="410" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+        <!-- Writer -> Redis : XADD -->
+        <mxCell id="25" value="XADD"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;"
+          edge="1" source="14" target="13" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <!-- ============================================================
+       PAGE 2 — Method C: StatefulSet replicas: 1
+       ============================================================ -->
+  <diagram id="page-C" name="Method C — StatefulSet">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1"
+                  connect="1" arrows="1" fold="1" page="1" pageScale="1"
+                  pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="102" value="Method C — StatefulSet replicas: 1 (lowest-complexity alternative)"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=1;fontSize=18;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1089" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- StatefulSet controller -->
+        <mxCell id="103" value="&lt;b&gt;StatefulSet&lt;/b&gt;  replicas: 1&#10;stable identity + at-most-one semantics&#10;(no Lease, no sidecar, no RBAC)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="440" y="90" width="300" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- The single pod -->
+        <mxCell id="104" value="connect-0   (the only pod)"
+          style="swimlane;startSize=26;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="120" y="250" width="300" height="120" as="geometry" />
+        </mxCell>
+        <mxCell id="105" value="Redpanda Connect&#10;&lt;b&gt;active consumer&lt;/b&gt;&#10;pipeline baked in (no dynamic POST)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;"
+          vertex="1" parent="104">
+          <mxGeometry x="40" y="42" width="220" height="65" as="geometry" />
+        </mxCell>
+
+        <!-- Recreated pod on failure (ghost) -->
+        <mxCell id="106" value="connect-0   (re-created on failure)&#10;&#10;&lt;b&gt;cold start&lt;/b&gt;: reschedule → image pull → boot"
+          style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f5f5f5;strokeColor=#999999;fontSize=10;align=center;"
+          vertex="1" parent="1">
+          <mxGeometry x="800" y="250" width="300" height="120" as="geometry" />
+        </mxCell>
+
+        <!-- Redis stream -->
+        <mxCell id="107" value="redis-central&#10;stream  app.events"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="150" y="450" width="240" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Writer -->
+        <mxCell id="108" value="writer&#10;XADD"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="150" y="600" width="140" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- Required hardening callout -->
+        <mxCell id="109" value="&lt;b&gt;Required hardening (K8s gives identity, not correctness)&lt;/b&gt;&#10;&#10;• do NOT --force --grace-period=0 delete (bypasses graceful stop → dual-run window)&#10;• set terminationGracePeriodSeconds so in-flight batch + XACK flush&#10;• add a PodDisruptionBudget to block voluntary disruption&#10;• sink still idempotent (CAS); source still reclaims Redis PEL / JetStream pending"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="480" y="440" width="650" height="170" as="geometry" />
+        </mxCell>
+
+        <!-- ============ EDGES ============ -->
+        <!-- StatefulSet -> pod : ensures 1 -->
+        <mxCell id="120" value="ensures exactly 1"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.25;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;strokeColor=#9673a6;strokeWidth=2;fontSize=10;"
+          edge="1" source="103" target="104" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- StatefulSet -.-> recreated pod -->
+        <mxCell id="121" value="re-creates on Pod loss (cold)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;exitX=0.75;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;"
+          edge="1" source="103" target="106" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- Redis -> connect : XREADGROUP -->
+        <mxCell id="122" value="XREADGROUP"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;strokeColor=#82b366;strokeWidth=2;fontSize=10;"
+          edge="1" source="107" target="104" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <!-- Writer -> Redis : XADD -->
+        <mxCell id="123" value="XADD"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=0;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;"
+          edge="1" source="108" target="107" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <!-- ============================================================
+       PAGE 3 — Pros / Cons comparison
+       ============================================================ -->
+  <diagram id="page-cmp" name="Pros vs Cons">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1"
+                  connect="1" arrows="1" fold="1" page="1" pageScale="1"
+                  pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="202" value="Lease (Method A) vs StatefulSet replicas:1 (Method C) — trade-offs"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=1;fontSize=18;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1089" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- Column headers -->
+        <mxCell id="203" value="Method A — Lease + client-go elector"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontStyle=1;fontSize=13;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="80" width="535" height="40" as="geometry" />
+        </mxCell>
+        <mxCell id="204" value="Method C — StatefulSet replicas: 1"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontStyle=1;fontSize=13;"
+          vertex="1" parent="1">
+          <mxGeometry x="595" y="80" width="534" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- A — PROS -->
+        <mxCell id="205" value="&lt;b&gt;✔ PROS&lt;/b&gt;&#10;&#10;• Warm standbys — N-1 pods ready; fast failover within ~lease duration (6s/4s/1s, tunable)&#10;• No cold start / image pull on takeover&#10;• Election among many candidates (N ≥ 2); spreads risk across nodes&#10;• ReleaseOnCancel shrinks the dual-active window on graceful exit&#10;• Same algorithm scales to other coordinated work, not just 1 consumer"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="135" width="535" height="240" as="geometry" />
+        </mxCell>
+
+        <!-- A — CONS -->
+        <mxCell id="206" value="&lt;b&gt;✗ CONS&lt;/b&gt;&#10;&#10;• Most moving parts: elector sidecar per pod + Lease RBAC + streams REST state-sync&#10;• Dual-active OVERLAP window — frozen leader keeps consuming (~5.6s measured)&#10;• Zero-active GAP window on force-kill — Lease lingers to expiry (~6.6s measured)&#10;• Extra failure surfaces: POST/DELETE, lease renew, __POD__ templating&#10;• Best-effort only — order &amp; uniqueness must NOT depend on the Lease"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="390" width="535" height="250" as="geometry" />
+        </mxCell>
+
+        <!-- C — PROS -->
+        <mxCell id="207" value="&lt;b&gt;✔ PROS&lt;/b&gt;&#10;&#10;• Lowest complexity &amp; ops — no sidecar, no RBAC, no Lease, no REST sync&#10;• Stable identity + at-most-one semantics provided by Kubernetes&#10;• Fewest failure surfaces; nothing to mis-template or mis-renew&#10;• Honest single consumer under normal operation&#10;• Pipeline baked into the image — no dynamic POST/DELETE lifecycle"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="595" y="135" width="534" height="240" as="geometry" />
+        </mxCell>
+
+        <!-- C — CONS -->
+        <mxCell id="208" value="&lt;b&gt;✗ CONS&lt;/b&gt;&#10;&#10;• Slow failover — cold start (reschedule → image pull → boot); no warm standby&#10;• Single pod = throughput ceiling, no candidate pool&#10;• Still NOT a correctness guarantee — --force delete creates a dual-run window&#10;• Needs care: no force-delete, terminationGracePeriodSeconds, PodDisruptionBudget&#10;• Recovery hinges on the scheduler finding a node"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=top;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;spacingLeft=8;spacingTop=6;"
+          vertex="1" parent="1">
+          <mxGeometry x="595" y="390" width="534" height="250" as="geometry" />
+        </mxCell>
+
+        <!-- Footer — common truth -->
+        <mxCell id="209" value="&lt;b&gt;Common to both:&lt;/b&gt; single-active is &lt;b&gt;best-effort active-gating, NOT a correctness guarantee.&lt;/b&gt;  Real correctness lives below: Redis consumer-group PEL reclaim + JetStream dedup + sink CAS (idempotency).  Pick by need: A when you want fast, warm failover and already run coordinated work; C when &quot;usually one consumer&quot; with minimum ops is enough."
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;verticalAlign=middle;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;spacingLeft=10;spacingRight=10;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="660" width="1089" height="100" as="geometry" />
+        </mxCell>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
