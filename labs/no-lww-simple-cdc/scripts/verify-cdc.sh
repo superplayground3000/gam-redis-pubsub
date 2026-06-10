@@ -35,6 +35,9 @@ RESULT="$(kubectl -n "${NS}" logs job/"${JOB_FULL}" | sed -n 's/^RESULT_JSON://p
 if [[ -z "${RESULT}" ]]; then
   echo "[verify-cdc] FAIL — no RESULT_JSON from verifier Job"; exit 1
 fi
+# Emit the raw compact RESULT_JSON line so downstream tools (gen-report.sh) can
+# parse it, then a human-friendly summary.
+echo "RESULT_JSON:${RESULT}"
 echo "${RESULT}" | jq '{dedup_delta:.cdc.dedup_delta, ops_ok:.cdc.ops_ok, replay_ok:.cdc.replay_ok, verdict:.verdict}'
 PASS=$(echo "${RESULT}" | jq -r '.verdict.pass')
 if [[ "${PASS}" == "true" ]]; then
