@@ -22,6 +22,10 @@ func WaitQuiescent(ctx context.Context, central *RedisClient, sourceGroup, natsU
 			srcOK = true
 		}
 		sinkOK := false
+		// MaxPending is the max num_pending across the stream's JetStream consumers.
+		// For KV_CDC that equals the sink durable's pending because the stream has
+		// exactly one JetStream consumer (cdc_sink); the SOURCE side drains via a
+		// Redis consumer group (checked by GroupLag above), not a NATS consumer.
 		if snap, err := ScrapeJSZ(ctx, natsURL, stream); err == nil && snap.MaxPending == 0 {
 			sinkOK = true
 		}

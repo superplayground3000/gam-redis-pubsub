@@ -29,6 +29,12 @@ func (c *Checks) quiesce(ctx context.Context) bool {
 
 // Dedup: XADD the same event_id 5x; after the source drains, JetStream Messages
 // must have grown by exactly 1 (dedup within the duplicate window).
+//
+// Accepted assumptions for the delta==1 assertion (true for this lab's controlled
+// run): the stream is otherwise idle — the writer is paused and Dedup runs first,
+// so no other events inflate before/after; and JetStream `limits` retention
+// (1h / 256MB) will not evict the message during the few-second check, so Messages
+// only moves due to this op.
 func (c *Checks) Dedup(ctx context.Context, epoch string) (delta int64, ok bool, err error) {
 	before, err := ScrapeJSZ(ctx, c.NatsURL, c.Stream)
 	if err != nil {

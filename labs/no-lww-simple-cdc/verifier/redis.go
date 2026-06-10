@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -56,12 +57,18 @@ func (c *RedisClient) GetString(ctx context.Context, key string) (string, bool, 
 func (c *RedisClient) GroupLag(ctx context.Context, stream, group string) (int64, error) {
 	groups, err := c.rdb.XInfoGroups(ctx, stream).Result()
 	if err != nil {
-		return 0, nil // stream absent → nothing pending
+		// Only a missing stream means "nothing pending yet"; any other error must
+		// propagate so WaitQuiescent fails closed (keeps waiting / times out) rather
+		// than falsely reporting quiescence.
+		if strings.Contains(strings.ToLower(err.Error()), "no such key") {
+			return 0, nil
+		}
+		return 0, err
 	}
 	for _, g := range groups {
 		if g.Name == group {
 			return g.Lag, nil
 		}
 	}
-	return 0, nil
+	return 0, nil // stream exists but group not created yet
 }

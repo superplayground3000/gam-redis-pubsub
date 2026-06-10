@@ -16,6 +16,10 @@ func main() {
 	region := flag.String("redis-region", "redis-region:6379", "region Redis host:port")
 	natsURL := flag.String("nats", "http://nats:8222", "NATS monitoring URL")
 	stream := flag.String("nats-stream", "KV_CDC", "JetStream stream name")
+	// --nats-consumer is accepted (the verifier Job passes --nats-consumer=cdc_sink)
+	// but intentionally discarded: quiescence keys off stream-wide MaxPending, which
+	// equals the sink durable's pending because KV_CDC has exactly one JetStream
+	// consumer. The value is informational only — not an oversight.
 	_ = flag.String("nats-consumer", "cdc_sink", "sink durable name (informational)")
 	sourceGroup := flag.String("source-group", "cdc_propagator", "source consumer group")
 	quiesce := flag.Duration("quiesce-timeout", 15*time.Second, "per-op quiescence deadline")
