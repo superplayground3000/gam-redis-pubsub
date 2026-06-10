@@ -33,6 +33,15 @@ func main() {
 		Rename: envInt("OP_RENAME", 10),
 	}
 
+	// Validate config before doing any work. A rename op needs at least two
+	// distinct keys, and rand.Int63n(0) panics — so the key space must be >= 2.
+	if keySpaceSize < 2 {
+		log.Fatalf("KEY_SPACE_SIZE (%d) must be >= 2", keySpaceSize)
+	}
+	if !mix.Valid() {
+		log.Fatalf("op-mix invalid: each of OP_CREATE/UPDATE/DELETE/RENAME must be >= 0 and their sum > 0 (got %+v)", mix)
+	}
+
 	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: workers * 2})
 	defer rdb.Close()
 

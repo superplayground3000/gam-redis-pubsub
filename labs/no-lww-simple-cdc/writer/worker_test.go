@@ -24,3 +24,22 @@ func TestPickOpZeroWeightExcluded(t *testing.T) {
 		}
 	}
 }
+
+func TestOpMixValid(t *testing.T) {
+	cases := []struct {
+		name string
+		mix  OpMix
+		want bool
+	}{
+		{"normal", OpMix{Create: 40, Update: 40, Delete: 10, Rename: 10}, true},
+		{"single op", OpMix{Create: 1}, true},
+		{"all zero", OpMix{}, false},
+		{"negative create", OpMix{Create: -1, Update: 5}, false},
+		{"negative rename", OpMix{Create: 5, Rename: -3}, false},
+	}
+	for _, tc := range cases {
+		if got := tc.mix.Valid(); got != tc.want {
+			t.Fatalf("%s: Valid() = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 type Server struct {
@@ -77,6 +78,14 @@ func (s *Server) reset(w http.ResponseWriter, r *http.Request) {
 	if rq.Epoch == "" {
 		http.Error(w, "epoch required", http.StatusBadRequest)
 		return
+	}
+	// Quiesce workers so old-epoch in-flight batches do not record into the new
+	// epoch: drop the rate to 0, then wait (up to ~2s) for in-flight to drain.
+	// The caller restores the rate explicitly after /reset (matches prior behavior).
+	s.Lim.Set(0)
+	deadline := time.Now().Add(2 * time.Second)
+	for s.Counters.Inflight.Load() != 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
 	}
 	s.Counters.Reset()
 	s.State.SetEpoch(rq.Epoch)

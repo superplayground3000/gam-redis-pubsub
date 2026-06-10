@@ -15,6 +15,15 @@ type OpMix struct{ Create, Update, Delete, Rename int }
 
 func (m OpMix) total() int { return m.Create + m.Update + m.Delete + m.Rename }
 
+// Valid reports whether the mix is usable: no negative weight and at least one
+// op has positive weight (otherwise pick would have nothing to choose).
+func (m OpMix) Valid() bool {
+	if m.Create < 0 || m.Update < 0 || m.Delete < 0 || m.Rename < 0 {
+		return false
+	}
+	return m.total() > 0
+}
+
 // pick maps an arbitrary counter n into an op deterministically by weight.
 func (m OpMix) pick(n uint64) string {
 	t := m.total()
@@ -144,11 +153,11 @@ func (w *Worker) Run(ctx context.Context) {
 		w.Counters.Sent.Add(int64(len(batch)))
 		for _, e := range batch {
 			w.Counters.bump(e.Op)
-			key := e.KvKey
 			if e.Op == "rename" {
-				key = e.NewKey
+				w.State.RecordKeys(e.Op, e.OldKey, e.NewKey)
+			} else {
+				w.State.RecordKeys(e.Op, e.KvKey)
 			}
-			w.State.Record(e.Op, key)
 		}
 	}
 }

@@ -48,13 +48,21 @@ func (s *RunState) SetEpoch(name string) {
 	s.keys = map[string]struct{}{}
 }
 
-// Record tallies one applied op against a key.
+// Record tallies one applied op against a single key.
 func (s *RunState) Record(op, key string) {
+	s.RecordKeys(op, key)
+}
+
+// RecordKeys tallies one applied op (counted ONCE) and records each non-empty
+// key it touched. Rename touches two keys (old + new) but is still one op.
+func (s *RunState) RecordKeys(op string, keys ...string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.ops[op]++
-	if key != "" {
-		s.keys[key] = struct{}{}
+	for _, key := range keys {
+		if key != "" {
+			s.keys[key] = struct{}{}
+		}
 	}
 }
 

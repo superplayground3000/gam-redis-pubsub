@@ -31,3 +31,17 @@ func TestRunStateResetClearsCounts(t *testing.T) {
 		t.Fatalf("epoch swap did not reset: %+v", snap)
 	}
 }
+
+func TestRunStateRecordKeysRenameTwoKeysOneOp(t *testing.T) {
+	s := NewRunState()
+	s.SetEpoch("r")
+	// rename touches old + new key but is a single op.
+	s.RecordKeys("rename", "lb:company:standby:{employees:3}", "lb:company:active:{employees:3}")
+	snap := s.Snapshot()
+	if snap.Ops["rename"] != 1 {
+		t.Fatalf("rename op count = %d, want 1", snap.Ops["rename"])
+	}
+	if snap.DistinctKeys != 2 {
+		t.Fatalf("distinct keys = %d, want 2", snap.DistinctKeys)
+	}
+}
