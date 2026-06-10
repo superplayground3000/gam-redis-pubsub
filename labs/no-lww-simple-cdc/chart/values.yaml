@@ -1,6 +1,6 @@
 # Active QoS profile. Selects which connect config pair is mounted
 # (files/connect/<profile>-forward.yaml + <profile>-reverse.yaml).
-profile: lww
+profile: cdc
 
 # Prefix that the rrcs.name helper prepends to every chart-rendered
 # Kubernetes resource name (this chart renders: Deployments, Services,
@@ -50,28 +50,10 @@ nats:
   clientPort: 4222
   monitorPort: 8222
   stream:
-    name: APP_EVENTS
-    # Single source of truth for the NATS subject namespace. The stream binds
-    # to "<subjectPrefix>.>" and connect-source publishes to
-    # "<subjectPrefix>.${! meta(\"pattern\") }". The publisher user JWT minted
-    # by scripts/gen-nats-auth.sh also grants --allow-pub on "<subjectPrefix>.>".
-    #
-    # Changing this after first install:
-    #   1. scripts/gen-nats-auth.sh --force         # rotates publisher creds
-    #                                               # (the JWT pins the old prefix)
-    #   2. helm upgrade rrcs ./chart ...            # init Job re-runs (its name is
-    #                                               # hash-derived from .Values.nats.stream)
-    #                                               # and reconciles the stream's
-    #                                               # bound subjects via
-    #                                               # `nats stream edit --subjects=...`
-    #   3. kubectl rollout restart \                # ConfigMaps update but Connect
-    #        deployment/connect-source \            # pods do not auto-reload; bounce
-    #        deployment/connect-sink                # them so the new subject is in use
-    # Bundled mode automates step 2 via the init Job; external mode requires
-    # the operator to reconcile the stream out-of-band.
-    subjectPrefix: "app.events"
+    name: KV_CDC
+    subjectPrefix: "kv.cdc"
     consumer:
-      durable: "region-writer"
+      durable: "cdc_sink"
     maxAge: "1h"
     maxBytes: "256MB"
     maxMsgSize: "1MB"
@@ -95,31 +77,25 @@ natsBox:
 
 connect:
   image: hpdevelop/connect:4.92.0-claudefix
-  # Multi-instance is the whole point of this lab: source + sink run N>1 so that
-  # reordering is INTER-pod (parallel stream consumption at the source; concurrent
-  # same-key CAS at the sink), not just intra-pod threads. The LWW fence must hold
-  # regardless. >=2 each is required to exercise the property; 3 is the default.
   source:
-    replicas: 3
+    replicas: 1
   sink:
-    replicas: 3
+    replicas: 1
 
 writer:
   image: redis-rrcs/writer:dev
-  pullPolicy: ""            # "" => inherit images.pullPolicy
+  pullPolicy: ""
   env:
     STREAM_MAXLEN: "100000"
     WORKERS: "8"
     PIPELINE_DEPTH: "50"
-    # Small keyspace ON PURPOSE: same-key messages must fall within the pipeline's
-    # in-flight windows (connect-source max_in_flight=256, connect-sink threads=4) to
-    # actually reorder — which is what the LWW fence must survive. At KEY_SPACE_SIZE=32
-    # same-key messages are ~32 apart in the stream (<< 256), so reordering is the
-    # common case and the verifier reliably observes stale>0. Larger values (e.g. 1000)
-    # space same-key messages beyond the in-flight window → no reorder → inconclusive.
-    KEY_SPACE_SIZE: "32"
+    KEY_SPACE_SIZE: "1000"
     PAYLOAD_BYTES: "200"
     MAX_RATE: "20000"
+    OP_CREATE: "40"
+    OP_UPDATE: "40"
+    OP_DELETE: "10"
+    OP_RENAME: "10"
 
 dashboard:
   image: redis-rrcs/dashboard:dev
