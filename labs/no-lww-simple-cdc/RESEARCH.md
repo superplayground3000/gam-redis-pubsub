@@ -81,8 +81,34 @@ is a Kubernetes lab; `verify-cdc.sh` exit 0 is the validation.
 
 ## Validated result
 
-> Pending first validated kind run (Phase 8 fills this in verbatim from the
-> verifier `RESULT_JSON` — no numbers are asserted here before that run).
+Validated on a `kind` cluster (`cdc`, namespace `cdc-k8s`, `profile=cdc`),
+`scripts/verify-cdc.sh` exit 0. All three order-insensitive checks pass — verbatim
+verifier `RESULT_JSON`:
+
+```json
+{"cdc":{"epoch":"run-1781068485","dedup_delta":1,"dedup_ok":true,"create_ok":true,"update_ok":true,"rename_ok":true,"delete_ok":true,"ops_ok":true,"replay_ok":true},"verdict":{"pass":true}}
+```
+
+- **Dedup:** the same `event_id` ×5 grew the JetStream stream by exactly 1
+  (`dedup_delta=1`).
+- **Per-op under quiescence:** create→update→rename→delete each materialized
+  correctly in region Redis after the pipeline drained.
+- **Idempotent replay:** a rename re-delivered left region terminal state
+  unchanged.
+
+Under a ~800 msg/s continuous 4-op load (op-mix 40/40/10/10), the writer emitted
+create 4160 / update 3950 / delete 970 / rename 970 and the sink applied
+create 4167 / update 3957 / delete 973 / rename 979 (`cdc_apply` by op) — full
+four-op propagation end to end. Central `lb:*` held 2459 keys vs region's 2466:
+the **central-vs-region divergence is real and visible** — the expected, accepted
+no-LWW stale-overwrite / delete-resurrection cost under fence-free concurrent
+writes, surfaced live in the dashboard and the HTML report.
+
+> Note (quiescence): the verifier's first kind run exposed a false-positive
+> quiescence bug — `XINFO GROUPS` `lag` drops to 0 the instant an entry is
+> delivered to the source consumer's PEL, before it is published to NATS and
+> ACKed, so the per-op assertions raced. Fixed to require `lag==0 AND pending==0`
+> (PEL empty) plus sink `MaxPending==0`, stable across consecutive polls.
 
 ## Further reading
 
