@@ -9,17 +9,12 @@ Hierarchy:
 - Users:    publisher, subscriber, admin
 
 Stream/durable/subject prefix bound into the user JWT permissions:
-- Stream:         APP_EVENTS
-- Durable:        region-writer
-- Subject prefix: app.events  (publisher --allow-pub app.events.>)
+- Stream:         KV_CDC
+- Durable:        cdc_sink
+- Subject prefix: kv.cdc  (publisher --allow-pub kv.cdc.>)
 
 To rotate or change stream/durable/prefix: rerun with --force.
 
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets
 out-of-band — that's exactly what the chart's external-mode consumes.
-
-When the chart is installed with a non-default `resourcePrefix`, the
-deployed Secrets reflect that prefix (e.g. `tenant-a-publisher-creds`),
-but the fixture `.creds` files themselves are operator-controlled
-content and stay un-prefixed in this directory.
