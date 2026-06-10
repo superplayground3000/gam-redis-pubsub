@@ -25,17 +25,13 @@ spec:
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.verifier.pullPolicy) }}
           args:
             - --epoch={{ .Values.verifier.epoch }}
-            - --rate={{ .Values.verifier.rate }}
-            - --duration={{ .Values.verifier.durationS }}s
-            - --warmup={{ .Values.verifier.warmupS }}s
-            - --drain={{ .Values.verifier.drainS }}s
-            - --writer=http://{{ include "rrcs.name" (dict "root" $ "base" "writer") }}:8081
-            - --connect-sink-dns={{ include "rrcs.name" (dict "root" $ "base" "connect-sink-headless") }}
-            - --connect-sink-port=4195
             - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
             - --redis-region={{ include "rrcs.redis.region.hostPort" . }}
             - --nats={{ include "rrcs.nats.monitorUrl" . }}
             - --nats-stream={{ .Values.nats.stream.name }}
+            - --nats-consumer={{ .Values.nats.stream.consumer.durable }}
+            - --source-group=cdc_propagator
+            - --quiesce-timeout=15s
           resources:
             {{- toYaml .Values.resources.verifier | nindent 12 }}
 {{- end }}
