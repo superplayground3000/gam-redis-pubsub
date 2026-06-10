@@ -31,7 +31,9 @@ while (( $(date +%s) < deadline )); do
   sleep 3
 done
 
-RESULT="$(kubectl -n "${NS}" logs job/"${JOB_FULL}" | sed -n 's/^RESULT_JSON://p' | tail -n1)"
+# `|| true` so a failed `kubectl logs` (e.g. job pod evicted) doesn't abort under
+# `set -e` before the empty-RESULT diagnostic below can report it.
+RESULT="$(kubectl -n "${NS}" logs job/"${JOB_FULL}" 2>/dev/null | sed -n 's/^RESULT_JSON://p' | tail -n1 || true)"
 if [[ -z "${RESULT}" ]]; then
   echo "[verify-cdc] FAIL — no RESULT_JSON from verifier Job"; exit 1
 fi

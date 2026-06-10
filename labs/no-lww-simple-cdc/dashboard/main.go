@@ -230,7 +230,10 @@ func scrapeApply(ctx context.Context, sinkURL string) map[string]int64 {
 		v := int64(trailingFloat(ln))
 		for op := range out {
 			if strings.Contains(ln, `op="`+op+`"`) {
-				out[op] = v
+				// Accumulate: Prometheus may expose the same op across multiple
+				// series (e.g. differing `path` labels); sum them rather than
+				// keeping only the last line.
+				out[op] += v
 			}
 		}
 	}
