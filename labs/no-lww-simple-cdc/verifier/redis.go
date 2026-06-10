@@ -72,3 +72,26 @@ func (c *RedisClient) GroupLag(ctx context.Context, stream, group string) (int64
 	}
 	return 0, nil // stream exists but group not created yet
 }
+
+// GroupBacklog returns the consumer group's lag (entries added but not yet
+// delivered) AND pending (entries delivered but not yet ACKed — the PEL depth).
+// True source quiescence requires BOTH to be 0: `lag` alone drops to 0 the moment
+// an entry is delivered to the consumer's PEL, well before the source connect pod
+// has processed/published/ACKed it — so checking only lag reports quiescence while
+// the source is still in flight. Fails closed (propagates errors) except a missing
+// stream.
+func (c *RedisClient) GroupBacklog(ctx context.Context, stream, group string) (lag, pending int64, err error) {
+	groups, err := c.rdb.XInfoGroups(ctx, stream).Result()
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "no such key") {
+			return 0, 0, nil
+		}
+		return 0, 0, err
+	}
+	for _, g := range groups {
+		if g.Name == group {
+			return g.Lag, g.Pending, nil
+		}
+	}
+	return 0, 0, nil // stream exists but group not created yet
+}
