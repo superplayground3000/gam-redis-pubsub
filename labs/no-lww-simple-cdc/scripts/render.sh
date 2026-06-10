@@ -9,7 +9,7 @@ LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${LAB_DIR}"
 
 NS="${RRCS_NS:-rrcs-k8s}"
-PROFILE="lww"
+PROFILE="cdc"
 VALUES=""
 EXTRA=()
 for arg in "$@"; do
