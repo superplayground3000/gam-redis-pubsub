@@ -41,6 +41,10 @@ spec:
             - { name: KEY_SPACE_SIZE, value: "{{ .Values.writer.env.KEY_SPACE_SIZE }}" }
             - { name: PAYLOAD_BYTES,  value: "{{ .Values.writer.env.PAYLOAD_BYTES }}" }
             - { name: MAX_RATE,       value: "{{ .Values.writer.env.MAX_RATE }}" }
+            - { name: OP_CREATE, value: "{{ .Values.writer.env.OP_CREATE }}" }
+            - { name: OP_UPDATE, value: "{{ .Values.writer.env.OP_UPDATE }}" }
+            - { name: OP_DELETE, value: "{{ .Values.writer.env.OP_DELETE }}" }
+            - { name: OP_RENAME, value: "{{ .Values.writer.env.OP_RENAME }}" }
           ports:
             - containerPort: 8081
           readinessProbe:
