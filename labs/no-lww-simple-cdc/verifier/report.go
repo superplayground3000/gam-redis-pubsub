@@ -13,6 +13,9 @@ type CDCResult struct {
 	DeleteOK   bool   `json:"delete_ok"`
 	OpsOK      bool   `json:"ops_ok"`
 	ReplayOK   bool   `json:"replay_ok"`
+	// RenameParityOK: after a value-preserving rename, central and region hold the
+	// same new_key value (dual-write convergence).
+	RenameParityOK bool `json:"rename_parity_ok"`
 }
 
 type Verdict struct {
@@ -33,6 +36,8 @@ func ComputeVerdict(r CDCResult) Verdict {
 		return Verdict{false, fmt.Sprintf("per-op failed: create=%v update=%v rename=%v delete=%v", r.CreateOK, r.UpdateOK, r.RenameOK, r.DeleteOK)}
 	case !r.ReplayOK:
 		return Verdict{false, "replay not idempotent: rename re-delivery changed terminal state"}
+	case !r.RenameParityOK:
+		return Verdict{false, "rename parity failed: central and region diverged after a value-preserving rename"}
 	default:
 		return Verdict{true, ""}
 	}

@@ -40,7 +40,7 @@ type Event struct {
     OldKey  string // rename source key
     NewKey  string // rename destination key
     TsMs    int64  // event time (ms)
-    Body    string // JSON snapshot; "" for delete
+    Body    string // opaque JSON value (no key embedded); "" for delete AND rename
 }
 ```
 
@@ -88,7 +88,7 @@ So a single stream entry looks like (Redis `XRANGE` view):
   old_key   (empty)
   new_key   (empty)
   ts        1718000000000
-  body      {"id":"lb:general:active:{items:42}","ts":1718000000000,"pad":"xxxx…"}
+  body      {"vid":"a3f…-uuid","ts":1718000000000,"pad":"xxxx…"}   # opaque; does NOT embed the key
 ```
 
 That is the **input** to connect-source.
@@ -171,7 +171,7 @@ The `redis_streams` input splits each XADD entry into two surfaces:
   **metadata** entries, readable with `meta("…")`.
 
 So immediately after the input, one Connect message =
-`content = {"id":…,"ts":…,"pad":…}` and
+`content = {"vid":…,"ts":…,"pad":…}` and
 `metadata = {event_id, op, kv_key, old_key, new_key, ts}`.
 
 ### 3.2 Pipeline — rebuild a self-contained envelope, re-derive routing keys
@@ -350,7 +350,7 @@ message content with the Redis reply."*)
             command: eval
             args_mapping: |
               let script = "<contents of cdc_rename.lua>"
-              root = [ $script, 2, meta("old_key"), meta("new_key"), meta("body") ]   # EVAL DEL old + SET new
+              root = [ $script, 2, meta("old_key"), meta("new_key") ]   # EVAL guarded RENAME (no body)
         - metric: { type: counter, name: cdc_apply, labels: { op: "rename" } }
 
     - processors:                                                         # default: unknown op
@@ -363,25 +363,36 @@ is *destructured* back into a native Redis write:
 
 | `op` | Redis command formed | Effect on region KV |
 |---|---|---|
-| `create` / `update` | `SET kv_key body` | key now holds the JSON snapshot |
+| `create` / `update` | `SET kv_key body` | key now holds the opaque JSON value |
 | `delete` | `DEL kv_key` | key removed |
-| `rename` | `EVAL cdc_rename.lua 2 old_key new_key body` | atomic `DEL old` + `SET new` |
+| `rename` | `EVAL cdc_rename.lua 2 old_key new_key` | **value-preserving** `RENAME old→new` (no body) |
 | anything else | `throw(...)` | processor error → nack (see §4.3) |
 
 The rename is a Lua script (`chart/files/connect/cdc_rename.lua`) embedded into the config at
-Helm-render time (`{{ .Files.Get … | toJson }}`):
+Helm-render time (`{{ .Files.Get … | toJson }}`). It uses native Redis `RENAME` so the new key
+**inherits old_key's existing value verbatim** — no body is carried in a rename event:
 
 ```lua
--- KEYS[1]=old_key  KEYS[2]=new_key  ARGV[1]=body(json snapshot)
-redis.call('DEL', KEYS[1])
-redis.call('SET', KEYS[2], ARGV[1])
+-- KEYS[1]=old_key  KEYS[2]=new_key   (no ARGV: value is NOT carried)
+if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('RENAME', KEYS[1], KEYS[2])
+end
 return 1
 ```
 
-It is **replay-idempotent**: unlike Redis `RENAME`, it never errors when `old_key` is already
-gone (a second delivery), so JetStream redelivery is safe. The `2` in the args is the Redis
-EVAL `numkeys`; `old_key`/`new_key` share a `{…}` hash tag (set by the writer's key patterns)
-so both land in one slot on Redis Cluster, keeping the EVAL atomic.
+The `EXISTS` guard makes it **replay-idempotent**: bare `RENAME` raises `ERR no such key` when
+`old_key` is already gone (a second JetStream delivery, or a reordered delete/rename that ran
+first) — which would nack and redeliver forever. Guarded, that second delivery is a clean
+no-op. The `2` is the Redis EVAL `numkeys`; `old_key`/`new_key` share a `{…}` hash tag (set by
+the writer's key patterns) so both land in one slot on Redis Cluster, keeping the EVAL atomic.
+
+> **Value-preserving rename works because the value is opaque to the key.** The writer's
+> payload (`snapshot()`) deliberately does NOT embed the Redis key — it carries a random `vid`,
+> matching production where a value never contains its own key. So moving the value to a new
+> key with `RENAME` changes nothing inside it, and `new_key` is correct without re-sending a
+> body. The authoritative central store applies the *same* guarded `RENAME` (writer
+> `applyCentral`), so central and region converge — the verifier's `rename_parity` check
+> asserts `central[new] == region[new]` after a rename.
 
 ### 4.3 Output — ack/nack is the whole contract
 
@@ -413,14 +424,14 @@ Following the bytes from writer → central stream → JetStream → region Redi
 ### create / update
 ```
 writer XADD app.events:  event_id=U1 op=update kv_key=lb:general:active:{items:42}
-                         old_key= new_key= ts=T body={"id":"…:42","ts":T,"pad":"xx…"}
+                         old_key= new_key= ts=T body={"vid":"…","ts":T,"pad":"xx…"}
   └─ source pipeline ─► envelope {op:update, kv_key:…:42, body:"{…}", …}
   └─ source output  ─► SUBJECT kv.cdc.update   HEADER Nats-Msg-Id=U1   DATA <envelope>
 JetStream KV_CDC: persisted (dedup-keyed on U1)
   └─ sink input    ─► content=<envelope>;  stash op/kv_key/body to meta
-  └─ sink switch   ─► SET lb:general:active:{items:42} "{…snapshot…}"  on redis-region
+  └─ sink switch   ─► SET lb:general:active:{items:42} "{…opaque value…}"  on redis-region
   └─ sink output   ─► ack U1
-RESULT: region key lb:general:active:{items:42} = the JSON snapshot
+RESULT: region key lb:general:active:{items:42} = the opaque JSON value (no key embedded)
 ```
 
 ### delete
@@ -434,11 +445,11 @@ RESULT: region key removed
 ### rename
 ```
 writer XADD: op=rename old_key=lb:company:standby:{employees:7}
-                      new_key=lb:company:active:{employees:7} body={…snapshot of new…}
-  source ─► SUBJECT kv.cdc.rename  HEADER Nats-Msg-Id=U3  DATA {op:rename, old_key:…, new_key:…, body:"{…}"}
-  sink   ─► EVAL cdc_rename.lua 2 <old> <new> <body>  ⇒ DEL old + SET new
+                      new_key=lb:company:active:{employees:7} body=""   (no body carried)
+  source ─► SUBJECT kv.cdc.rename  HEADER Nats-Msg-Id=U3  DATA {op:rename, old_key:…, new_key:…, body:""}
+  sink   ─► EVAL cdc_rename.lua 2 <old> <new>  ⇒ if EXISTS old then RENAME old→new
   sink   ─► ack
-RESULT: standby key gone, active key holds the snapshot — atomically, same slot
+RESULT: standby key gone, active key holds standby's ORIGINAL opaque value — atomically, same slot
 ```
 
 ### unknown op (failure path)
@@ -461,7 +472,7 @@ JetStream delivers a message whose op is, say, "patch"
 | Source pipeline | rebuilt | envelope + meta | envelope + meta | envelope | envelope | envelope | envelope | envelope (embeds content) |
 | **JetStream msg** | — | **Nats-Msg-Id header** + payload | **subject suffix** + payload | payload | payload | payload | payload | payload |
 | Sink input | content | in JSON | in JSON | in JSON | in JSON | in JSON | in JSON | in JSON |
-| Sink pipeline | stashed | (unused) | meta (switch) | meta (SET/DEL arg) | meta (Lua KEYS[1]) | meta (Lua KEYS[2]) | (unused) | meta (SET/Lua value) |
+| Sink pipeline | stashed | (unused) | meta (switch) | meta (SET/DEL arg) | meta (Lua KEYS[1]) | meta (Lua KEYS[2]) | (unused) | meta (SET value; **unused by rename**) |
 | Region Redis | KV | (dropped) | (drives command) | the key | DEL'd key | new key | (dropped) | the value |
 
 Two fields cross into the JetStream **envelope of control** (subject + header) rather than
@@ -482,6 +493,11 @@ the payload and is reconstructed by the sink.
   failure nacks and redelivers. Idempotent SET/DEL/Lua make redelivery harmless.
 - **No version fence (no-LWW).** Reordered/late same-key arrivals overwrite. This is the
   behavior the lab exists to study — the cost of *not* doing last-write-wins.
+- **Value-preserving rename, opaque value.** `rename` carries no body: both the sink and the
+  authoritative central store apply a guarded native `RENAME`, so `new_key` inherits
+  `old_key`'s value verbatim. This is correct precisely because the value is **opaque to the
+  key** — the writer's payload never embeds the Redis key (it carries a random `vid`), matching
+  production. The `rename_parity` verifier check asserts `central[new] == region[new]`.
 - **Single hash slot per multi-key op.** Writer key patterns embed `{entity:id}` hash tags so
-  the rename Lua's two keys stay in one Redis Cluster slot, keeping EVAL atomic.
+  the rename Lua's two keys stay in one Redis Cluster slot, keeping the `RENAME` EVAL atomic.
 ```

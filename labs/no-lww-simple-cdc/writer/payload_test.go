@@ -28,9 +28,12 @@ func TestDeleteEventEmptyBody(t *testing.T) {
 }
 
 func TestRenameEventKeys(t *testing.T) {
-	e := NewRenameEvent("lb:company:standby:{employees:3}", "lb:company:active:{employees:3}", 32)
-	if e.Op != "rename" || e.OldKey == "" || e.NewKey == "" || e.Body == "" {
+	e := NewRenameEvent("lb:company:standby:{employees:3}", "lb:company:active:{employees:3}")
+	if e.Op != "rename" || e.OldKey == "" || e.NewKey == "" {
 		t.Fatalf("bad rename event: %+v", e)
+	}
+	if e.Body != "" {
+		t.Fatalf("value-preserving rename must carry empty body: %+v", e)
 	}
 	if e.KvKey != "" {
 		t.Fatalf("rename must not set kv_key: %+v", e)

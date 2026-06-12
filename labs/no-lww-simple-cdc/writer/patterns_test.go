@@ -1,7 +1,10 @@
 // $LAB/writer/patterns_test.go
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestActiveKeyHashTagged(t *testing.T) {
 	got := Patterns[0].ActiveKey(55688)
@@ -11,13 +14,31 @@ func TestActiveKeyHashTagged(t *testing.T) {
 	}
 }
 
-func TestStandbyKeyOnlyCompany(t *testing.T) {
-	// Only the company/employees pattern has a standby->active rename flow.
+func hashTag(s string) string {
+	i, j := strings.Index(s, "{"), strings.Index(s, "}")
+	if i < 0 || j < 0 || j < i {
+		return ""
+	}
+	return s[i : j+1]
+}
+
+func TestStandbyActiveSameSlotAllPatterns(t *testing.T) {
+	// Every pattern must expose a standby form whose {entity:id} hash tag matches
+	// its active form, so the standby->active RENAME stays in one Redis slot.
 	if Patterns[0].StandbyKey(55688) != "lb:company:standby:{employees:55688}" {
 		t.Fatalf("company standby key wrong: %q", Patterns[0].StandbyKey(55688))
 	}
-	if Patterns[0].ActiveKey(1) == Patterns[0].StandbyKey(1) {
-		t.Fatal("active and standby must differ")
+	for _, p := range Patterns {
+		if !p.HasStandby() {
+			t.Fatalf("pattern %q must have a standby form for the rename flow", p.Name)
+		}
+		active, standby := p.ActiveKey(7), p.StandbyKey(7)
+		if active == standby {
+			t.Fatalf("pattern %q: active and standby must differ", p.Name)
+		}
+		if ta, ts := hashTag(active), hashTag(standby); ta == "" || ta != ts {
+			t.Fatalf("pattern %q: active/standby must share a hash tag: %q vs %q", p.Name, ta, ts)
+		}
 	}
 }
 

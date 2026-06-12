@@ -52,6 +52,27 @@ func (c *RedisClient) GetString(ctx context.Context, key string) (string, bool, 
 	return v, true, nil
 }
 
+// Set writes a string value (no expiry). Used by RenameParity to reproduce the
+// writer's authoritative central-apply for create/update without running the writer.
+func (c *RedisClient) Set(ctx context.Context, key, val string) error {
+	return c.rdb.Set(ctx, key, val, 0).Err()
+}
+
+// renamePreserveScript MUST stay identical to chart/files/connect/cdc_rename.lua
+// (the sink) and writer.renamePreserveScript: value-preserving, EXISTS-guarded so
+// a missing old_key is a no-op rather than a "no such key" error.
+const renamePreserveScript = `if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('RENAME', KEYS[1], KEYS[2])
+end
+return 1`
+
+// RenamePreserve applies the writer's authoritative value-preserving rename to KV,
+// so the verifier can reproduce the central side of the dual write and assert it
+// converges with the region (which the sink renames the same way).
+func (c *RedisClient) RenamePreserve(ctx context.Context, oldKey, newKey string) error {
+	return c.rdb.Eval(ctx, renamePreserveScript, []string{oldKey, newKey}).Err()
+}
+
 // GroupLag returns unread entries for a consumer group on a stream (0 if the
 // stream or group does not exist yet).
 func (c *RedisClient) GroupLag(ctx context.Context, stream, group string) (int64, error) {

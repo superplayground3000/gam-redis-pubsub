@@ -1,7 +1,39 @@
 // $LAB/writer/worker_test.go
 package main
 
-import "testing"
+import (
+	"math/rand"
+	"strings"
+	"testing"
+)
+
+// TestBuildEventOpKeyMapping locks the draft→publish lifecycle: create/update
+// write the standby (draft) key, delete removes active, rename promotes
+// standby→active in one slot. The update→standby rule is the rollback fix —
+// active is written ONLY by promotion, so a late rename cannot clobber a newer
+// active value.
+func TestBuildEventOpKeyMapping(t *testing.T) {
+	mk := func(mix OpMix) Event {
+		w := &Worker{Mix: mix, KeySpaceSize: 100, rng: rand.New(rand.NewSource(1))}
+		return w.buildEvent(0)
+	}
+	if e := mk(OpMix{Create: 1}); !strings.Contains(e.KvKey, ":standby:") {
+		t.Fatalf("create must target standby, got %q", e.KvKey)
+	}
+	if e := mk(OpMix{Update: 1}); !strings.Contains(e.KvKey, ":standby:") {
+		t.Fatalf("update must target standby (rollback fix), got %q", e.KvKey)
+	}
+	if e := mk(OpMix{Delete: 1}); !strings.Contains(e.KvKey, ":active:") {
+		t.Fatalf("delete must target active, got %q", e.KvKey)
+	}
+	e := mk(OpMix{Rename: 1})
+	if !strings.Contains(e.OldKey, ":standby:") || !strings.Contains(e.NewKey, ":active:") {
+		t.Fatalf("rename must be standby->active, got %q -> %q", e.OldKey, e.NewKey)
+	}
+	if hashTag(e.OldKey) == "" || hashTag(e.OldKey) != hashTag(e.NewKey) {
+		t.Fatalf("rename keys must share a hash tag: %q vs %q", e.OldKey, e.NewKey)
+	}
+}
 
 func TestPickOpCoversAll(t *testing.T) {
 	mix := OpMix{Create: 40, Update: 40, Delete: 10, Rename: 10}

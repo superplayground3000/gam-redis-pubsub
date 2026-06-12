@@ -1,6 +1,7 @@
 # cdc-reverse.yaml — single durable pull consumer; switch on op:
 #   create/update -> SET kv_key body ; delete -> DEL kv_key ;
-#   rename -> EVAL cdc_rename.lua (DEL old + SET new) ; unknown -> throw -> nack.
+#   rename -> EVAL cdc_rename.lua (native RENAME old->new, value-preserving) ;
+#   unknown -> throw -> nack.
 # No version fence: reordered/late same-key arrivals overwrite (no-LWW).
 # reject_errored drop: success acks JetStream; processor failure nacks -> redelivery
 # (absorbed by SET/DEL/Lua idempotency).
@@ -57,7 +58,7 @@ pipeline:
                 command: eval
                 args_mapping: |
                   let script = {{ .Files.Get "files/connect/cdc_rename.lua" | toJson }}
-                  root = [ $script, 2, meta("old_key"), meta("new_key"), meta("body") ]
+                  root = [ $script, 2, meta("old_key"), meta("new_key") ]
             - metric: { type: counter, name: cdc_apply, labels: { op: "rename" } }
         - processors:
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'

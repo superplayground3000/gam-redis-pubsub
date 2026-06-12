@@ -62,24 +62,44 @@ type Worker struct {
 
 // buildEvent picks an op and a key (any key in [0,KeySpaceSize) across a random
 // pattern — multiple workers may collide on the same key, which is allowed).
+//
+// Op→key mapping models lab-requirements.md "Key update behavior" as a
+// draft→publish lifecycle:
+//   create → SET    standby:{id}  (stage a new draft, not enabled yet)
+//   update → SET    standby:{id}  (edit the staged draft)
+//   rename → RENAME standby:{id} → active:{id}  (publish/promote when ready)
+//   delete → DEL    active:{id}   (remove the live entity)
+// standby and active share the {entity:id} hash tag, so the rename is a single-slot
+// value-preserving RENAME. The rename source (standby) is real because create/update
+// write it; an unstaged/already-promoted standby makes the EXISTS-guarded RENAME a
+// safe no-op. Crucially, `active` is written ONLY by promotion — no create/update
+// ever writes active directly — so a late rename can never roll back a newer active
+// value (there is no independent newer active write to lose).
 func (w *Worker) buildEvent(seq uint64) Event {
 	p := Patterns[w.rng.Intn(len(Patterns))]
 	id := w.rng.Int63n(w.KeySpaceSize)
 	switch w.Mix.pick(seq) {
 	case "create":
-		return NewCreateEvent(p.ActiveKey(id), w.PayloadBytes)
+		return NewCreateEvent(p.StandbyKey(id), w.PayloadBytes)
 	case "update":
-		return NewUpdateEvent(p.ActiveKey(id), w.PayloadBytes)
+		return NewUpdateEvent(p.StandbyKey(id), w.PayloadBytes)
 	case "delete":
 		return NewDeleteEvent(p.ActiveKey(id))
-	default: // rename: company uses standby->active; others active(id)->active(id+offset)
-		if p.HasStandby() {
-			return NewRenameEvent(p.StandbyKey(id), p.ActiveKey(id), w.PayloadBytes)
-		}
-		other := (id + 1) % w.KeySpaceSize
-		return NewRenameEvent(p.ActiveKey(id), p.ActiveKey(other), w.PayloadBytes)
+	default: // rename: promote standby->active for the same entity (same slot)
+		return NewRenameEvent(p.StandbyKey(id), p.ActiveKey(id))
 	}
 }
+
+// renamePreserveScript mirrors chart/files/connect/cdc_rename.lua (the sink) and
+// verifier RenamePreserve: value-preserving, replay-idempotent rename. Guarded by
+// EXISTS because bare RENAME raises "ERR no such key" when old_key is absent —
+// common here since keys are random and old_key may never have been created — and
+// in a pipeline that error would fail the whole batch Exec. Keep all three copies
+// of this script identical.
+const renamePreserveScript = `if redis.call('EXISTS', KEYS[1]) == 1 then
+  redis.call('RENAME', KEYS[1], KEYS[2])
+end
+return 1`
 
 // applyCentral applies the op to the central KV (the authoritative intent of
 // record) within the same pipeline as the XADD (dual write; not atomic — that
@@ -91,8 +111,10 @@ func applyCentral(pipe redis.Pipeliner, ctx context.Context, e Event) {
 	case "delete":
 		pipe.Del(ctx, e.KvKey)
 	case "rename":
-		pipe.Del(ctx, e.OldKey)
-		pipe.Set(ctx, e.NewKey, e.Body, 0)
+		// Value-preserving rename (new_key inherits old_key's central value),
+		// matching the sink. EXISTS-guarded so a missing old_key is a no-op
+		// instead of erroring the pipeline. See renamePreserveScript.
+		pipe.Eval(ctx, renamePreserveScript, []string{e.OldKey, e.NewKey})
 	}
 }
 

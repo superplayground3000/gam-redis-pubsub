@@ -23,10 +23,14 @@ type Event struct {
 
 func nowMs() int64 { return time.Now().UnixMilli() }
 
-// snapshot builds a JSON body of roughly padBytes size for a key.
-func snapshot(key string, padBytes int) string {
+// snapshot builds an opaque JSON body of roughly padBytes size. The body is
+// INDEPENDENT of the Redis key it lives under: production values never embed their
+// own key, so neither does this synthetic payload. It carries its own random value
+// id (vid), not the key. This independence is exactly what makes a value-preserving
+// rename correct — moving the opaque value to a new key changes nothing inside it.
+func snapshot(padBytes int) string {
 	b, _ := json.Marshal(map[string]any{
-		"id":  key,
+		"vid": uuid.NewString(),
 		"ts":  nowMs(),
 		"pad": strings.Repeat("x", padBytes),
 	})
@@ -34,19 +38,22 @@ func snapshot(key string, padBytes int) string {
 }
 
 func NewCreateEvent(kvKey string, padBytes int) Event {
-	return Event{EventID: uuid.NewString(), Op: "create", KvKey: kvKey, TsMs: nowMs(), Body: snapshot(kvKey, padBytes)}
+	return Event{EventID: uuid.NewString(), Op: "create", KvKey: kvKey, TsMs: nowMs(), Body: snapshot(padBytes)}
 }
 
 func NewUpdateEvent(kvKey string, padBytes int) Event {
-	return Event{EventID: uuid.NewString(), Op: "update", KvKey: kvKey, TsMs: nowMs(), Body: snapshot(kvKey, padBytes)}
+	return Event{EventID: uuid.NewString(), Op: "update", KvKey: kvKey, TsMs: nowMs(), Body: snapshot(padBytes)}
 }
 
 func NewDeleteEvent(kvKey string) Event {
 	return Event{EventID: uuid.NewString(), Op: "delete", KvKey: kvKey, TsMs: nowMs(), Body: ""}
 }
 
-func NewRenameEvent(oldKey, newKey string, padBytes int) Event {
-	return Event{EventID: uuid.NewString(), Op: "rename", OldKey: oldKey, NewKey: newKey, TsMs: nowMs(), Body: snapshot(newKey, padBytes)}
+// NewRenameEvent carries NO body: rename is value-preserving end-to-end (both the
+// central apply and the sink use RENAME, so new_key inherits old_key's existing
+// value). The empty Body is intentional — there is nothing to snapshot.
+func NewRenameEvent(oldKey, newKey string) Event {
+	return Event{EventID: uuid.NewString(), Op: "rename", OldKey: oldKey, NewKey: newKey, TsMs: nowMs()}
 }
 
 // StreamValues returns the XADD field list as an ordered slice (NOT a map —
