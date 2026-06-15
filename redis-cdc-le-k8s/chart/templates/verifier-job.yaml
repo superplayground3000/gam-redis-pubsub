@@ -1,0 +1,37 @@
+{{- if .Values.verifier.run }}
+{{- $base := .Values.verifier.jobName | default (printf "verifier-%s" .Values.verifier.epoch) -}}
+{{- $name := include "rrcs.name" (dict "root" $ "base" $base) -}}
+{{- if gt (len $name) 57 -}}
+{{- fail (printf "verifier Job name %q (%d chars) exceeds 57-char budget. Shorten resourcePrefix or verifier.epoch." $name (len $name)) -}}
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ $name }}
+  labels: { app: verifier }
+spec:
+  backoffLimit: 0
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels: { app: verifier }
+    spec:
+      restartPolicy: Never
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      containers:
+        - name: verifier
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.verifier.image) }}
+          imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.verifier.pullPolicy) }}
+          args:
+            - --epoch={{ .Values.verifier.epoch }}
+            - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
+            - --redis-region={{ include "rrcs.redis.region.hostPort" . }}
+            - --nats={{ include "rrcs.nats.monitorUrl" . }}
+            - --nats-stream={{ .Values.nats.stream.name }}
+            - --nats-consumer={{ .Values.nats.stream.consumer.durable }}
+            - --source-group=cdc_propagator
+            - --quiesce-timeout=15s
+          resources:
+            {{- toYaml .Values.resources.verifier | nindent 12 }}
+{{- end }}

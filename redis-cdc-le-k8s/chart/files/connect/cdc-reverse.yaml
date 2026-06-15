@@ -1,0 +1,72 @@
+# cdc-reverse.yaml — single durable pull consumer; switch on op:
+#   create/update -> SET kv_key body ; delete -> DEL kv_key ;
+#   rename -> EVAL cdc_rename.lua (native RENAME old->new, value-preserving) ;
+#   unknown -> throw -> nack.
+# No version fence: reordered/late same-key arrivals overwrite (no-LWW).
+# reject_errored drop: success acks JetStream; processor failure nacks -> redelivery
+# (absorbed by SET/DEL/Lua idempotency).
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+
+input:
+  label: jetstream_source
+  nats_jetstream:
+    urls: ["{{ include "rrcs.nats.url" . }}"]
+    auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
+    subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
+    stream: {{ .Values.nats.stream.name | quote }}
+    durable: {{ .Values.nats.stream.consumer.durable | quote }}
+    deliver: all
+    ack_wait: 30s
+    max_ack_pending: 1024
+
+pipeline:
+  threads: 4
+  processors:
+    # Stash the envelope fields into metadata FIRST: the `redis` processor below
+    # REPLACES message content with the Redis reply, so any field needed by a
+    # later processor (the metric label) or by args_mapping must live in metadata.
+    - mapping: |
+        meta op      = this.op
+        meta kv_key  = this.kv_key
+        meta old_key = this.old_key
+        meta new_key = this.new_key
+        meta body    = this.body
+    - switch:
+        - check: meta("op") == "create" || meta("op") == "update"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: set
+                args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
+            - metric: { type: counter, name: cdc_apply, labels: { op: "${! meta(\"op\") }" } }
+        - check: meta("op") == "delete"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: del
+                args_mapping: 'root = [ meta("kv_key") ]'
+            - metric: { type: counter, name: cdc_apply, labels: { op: "delete" } }
+        - check: meta("op") == "rename"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: simple
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/cdc_rename.lua" | toJson }}
+                  root = [ $script, 2, meta("old_key"), meta("new_key") ]
+            - metric: { type: counter, name: cdc_apply, labels: { op: "rename" } }
+        - processors:
+            - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
+
+output:
+  reject_errored:
+    drop: {}
+
+logger: { level: INFO, format: json, add_timestamp: true }
+metrics:
+  prometheus: { use_histogram_timing: true }

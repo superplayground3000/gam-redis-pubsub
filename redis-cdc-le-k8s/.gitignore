@@ -1,0 +1,9 @@
+# Built Go binaries
+writer/writer
+verifier/verifier
+dashboard/dashboard
+collector/collector
+# Rendered manifests
+out/
+# Local run output (HTML report, JSON, etc.)
+reports/
