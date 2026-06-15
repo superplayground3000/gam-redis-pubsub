@@ -1,0 +1,53 @@
+{{/*
+RBAC for the elector sidecars. Each connect leg (source, sink) runs its own
+client-go leader election against a coordination.k8s.io Lease, so each leg gets
+its own ServiceAccount + Role + RoleBinding. The verbs below are exactly what
+client-go's LeaseLock needs: get/create the Lease, then watch/update/patch it to
+renew. Without this grant the elector cannot acquire leadership and every pod
+stays a fail-closed standby (no stream).
+*/}}
+{{- range $leg := list "connect-source" "connect-sink" }}
+{{- $sa := printf "%s-elector" $leg }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  labels:
+    app: {{ $leg }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  labels:
+    app: {{ $leg }}
+rules:
+  - apiGroups:
+      - coordination.k8s.io
+    resources:
+      - leases
+    verbs:
+      - get
+      - list
+      - watch
+      - create
+      - update
+      - patch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  labels:
+    app: {{ $leg }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+{{- if ne $leg "connect-sink" }}
+---
+{{- end }}
+{{- end }}

@@ -7,7 +7,9 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"net"
 	"net/http"
+	neturl "net/url"
 	"os"
 	"os/signal"
 	"strconv"
@@ -220,22 +222,58 @@ func pollLoop(ctx context.Context, central, region *redis.Client, writerURL, sin
 }
 
 // scrapeApply parses connect-sink /metrics for cdc_apply{op="..."} counters.
+// With leader-election active/standby the sink runs N replicas behind a headless
+// Service, but only the Lease holder runs the pipeline and increments cdc_apply;
+// standbys expose no such series. We resolve every pod IP behind the Service host
+// and sum across them, so the totals reflect the active leader no matter which
+// pod DNS round-robin would have handed us.
 func scrapeApply(ctx context.Context, sinkURL string) map[string]int64 {
 	out := map[string]int64{"create": 0, "update": 0, "delete": 0, "rename": 0}
-	body := httpGet(ctx, sinkURL+"/metrics")
-	for _, ln := range strings.Split(body, "\n") {
-		if !strings.HasPrefix(ln, "cdc_apply{") && !strings.HasPrefix(ln, "cdc_apply_total{") {
-			continue
-		}
-		v := int64(trailingFloat(ln))
-		for op := range out {
-			if strings.Contains(ln, `op="`+op+`"`) {
-				// Accumulate: Prometheus may expose the same op across multiple
-				// series (e.g. differing `path` labels); sum them rather than
-				// keeping only the last line.
-				out[op] += v
+	for _, ep := range sinkEndpoints(sinkURL) {
+		body := httpGet(ctx, ep+"/metrics")
+		for _, ln := range strings.Split(body, "\n") {
+			if !strings.HasPrefix(ln, "cdc_apply{") && !strings.HasPrefix(ln, "cdc_apply_total{") {
+				continue
+			}
+			v := int64(trailingFloat(ln))
+			for op := range out {
+				if strings.Contains(ln, `op="`+op+`"`) {
+					// Accumulate: Prometheus may expose the same op across multiple
+					// series (e.g. differing `path` labels) and across multiple
+					// pods; sum them rather than keeping only the last line.
+					out[op] += v
+				}
 			}
 		}
+	}
+	return out
+}
+
+// sinkEndpoints expands sinkURL into one base URL per backing pod IP. A headless
+// Service resolves to all ready pod IPs; if resolution yields nothing usable
+// (a single ClusterIP, an IP literal, or an external host) we fall back to the
+// URL as given so non-headless / single-replica deployments work unchanged.
+func sinkEndpoints(sinkURL string) []string {
+	u, err := neturl.Parse(sinkURL)
+	if err != nil || u.Host == "" {
+		return []string{sinkURL}
+	}
+	host := u.Hostname()
+	if net.ParseIP(host) != nil { // already an IP literal — nothing to expand
+		return []string{sinkURL}
+	}
+	ips, err := net.LookupHost(host)
+	if err != nil || len(ips) == 0 {
+		return []string{sinkURL}
+	}
+	port := u.Port()
+	out := make([]string, 0, len(ips))
+	for _, ip := range ips {
+		hostport := ip
+		if port != "" {
+			hostport = net.JoinHostPort(ip, port)
+		}
+		out = append(out, u.Scheme+"://"+hostport)
 	}
 	return out
 }

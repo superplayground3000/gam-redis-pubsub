@@ -1,8 +1,22 @@
-no-lww-simple-cdc (fence-free CDC) installed in namespace {{ .Release.Namespace }}.
+redis-cdc-le-k8s installed in namespace {{ .Release.Namespace }}.
 
-Profile           : {{ .Values.profile }}   (op switch at connect-sink; NO version fence)
+Fence-free CDC (no version fence; op switch at connect-sink) with K8s-Lease
+leader election on BOTH connect legs (active/standby) and a pre-created NATS
+JetStream PULL consumer.
+
+Profile           : {{ .Values.profile }}
 NATS stream       : {{ .Values.nats.stream.name }}  subjects {{ .Values.nats.stream.subjectPrefix }}.>
+Pull consumer     : {{ .Values.nats.stream.consumer.durable }}  (bind:true; created by the nats-init Job)
 Dedup window      : {{ .Values.nats.stream.dupeWindow }}  (Nats-Msg-Id = event_id)
+
+Leader election:
+  connect-source : {{ .Values.connect.source.replicas }} replicas, Lease {{ include "rrcs.name" (dict "root" $ "base" .Values.connect.source.lease.name) }}, stream id {{ .Values.connect.source.streamID }}
+  connect-sink   : {{ .Values.connect.sink.replicas }} replicas, Lease {{ include "rrcs.name" (dict "root" $ "base" .Values.connect.sink.lease.name) }}, stream id {{ .Values.connect.sink.streamID }}
+  Only the Lease holder per leg POSTs its pipeline; standbys hold no stream.
+  Inspect:  kubectl -n {{ .Release.Namespace }} get lease
+
+Pre-create the pull consumer manually (external NATS, or after `nats consumer rm`):
+  scripts/create-consumer.sh            # prints the command; RUN=1 to execute
 
 Run the validation (dedup + per-op-under-quiescence + idempotent replay):
   RRCS_NS={{ .Release.Namespace }} RRCS_RELEASE={{ .Release.Name }} scripts/verify-cdc.sh

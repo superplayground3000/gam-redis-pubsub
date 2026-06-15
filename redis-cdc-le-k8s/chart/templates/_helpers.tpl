@@ -28,6 +28,22 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
+rrcs.podLabels — pod-template labels for a workload: the mandatory `app`
+selector label plus any user-supplied common labels from .Values.podLabels.
+`app` is emitted first; podLabels cannot override it because each workload's
+selector.matchLabels pins `app` and the selector is immutable after install.
+Usage (at template.metadata.labels indent):
+  labels:
+    {{- include "rrcs.podLabels" (dict "root" $ "app" "writer") | nindent 8 }}
+*/}}
+{{- define "rrcs.podLabels" -}}
+app: {{ .app }}
+{{- with omit .root.Values.podLabels "app" }}
+{{ toYaml . | trim }}
+{{- end }}
+{{- end -}}
+
+{{/*
 rrcs.scheduling — global nodeSelector / tolerations / affinity for every pod.
 Usage (at pod-spec indent): {{- include "rrcs.scheduling" . | nindent 6 }}
 */}}

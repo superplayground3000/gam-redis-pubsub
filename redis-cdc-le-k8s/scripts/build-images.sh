@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the writer, verifier and dashboard images. Push and kind-load are opt-in.
+# Builds the writer, verifier, dashboard and elector images. Push and kind-load are opt-in.
 # Usage:
 #   scripts/build-images.sh                                   # build-only, tag :dev
 #   scripts/build-images.sh --base-registry=corp.io/mirror/   # redirect Dockerfile FROM
@@ -39,6 +39,7 @@ prefix=""
 WRITER_IMG="${prefix}redis-rrcs/writer:${TAG}"
 VERIFIER_IMG="${prefix}redis-rrcs/verifier:${TAG}"
 DASHBOARD_IMG="${prefix}redis-rrcs/dashboard:${TAG}"
+ELECTOR_IMG="${prefix}redis-rrcs/elector:${TAG}"
 
 build_one() {
   local ctx="$1" img="$2"
@@ -49,12 +50,14 @@ build_one() {
 build_one writer    "${WRITER_IMG}"
 build_one verifier  "${VERIFIER_IMG}"
 build_one dashboard "${DASHBOARD_IMG}"
+build_one elector   "${ELECTOR_IMG}"
 
 if (( KIND )); then
   echo "[kind] loading images into cluster '${KIND_NAME}'"
   kind load docker-image "${WRITER_IMG}"    --name "${KIND_NAME}"
   kind load docker-image "${VERIFIER_IMG}"  --name "${KIND_NAME}"
   kind load docker-image "${DASHBOARD_IMG}" --name "${KIND_NAME}"
+  kind load docker-image "${ELECTOR_IMG}"   --name "${KIND_NAME}"
 fi
 
 if (( PUSH )); then
@@ -66,9 +69,11 @@ if (( PUSH )); then
   docker push "${WRITER_IMG}"
   docker push "${VERIFIER_IMG}"
   docker push "${DASHBOARD_IMG}"
+  docker push "${ELECTOR_IMG}"
 else
   echo "[push] skipped (no --push). Built locally:"
   echo "  ${WRITER_IMG}"
   echo "  ${VERIFIER_IMG}"
   echo "  ${DASHBOARD_IMG}"
+  echo "  ${ELECTOR_IMG}"
 fi

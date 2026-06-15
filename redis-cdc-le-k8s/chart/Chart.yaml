@@ -1,6 +1,6 @@
 apiVersion: v2
-name: redis-connect-lww-k8s
-description: Kubernetes fork of the Redis -> Redpanda Connect -> NATS JetStream stress lab
+name: redis-cdc-le-k8s
+description: Redis -> Redpanda Connect -> NATS JetStream CDC chart with K8s-Lease leader election (active/standby) on both connect legs and a pre-created pull consumer
 type: application
 version: 0.1.0
 appVersion: "1.0.0"

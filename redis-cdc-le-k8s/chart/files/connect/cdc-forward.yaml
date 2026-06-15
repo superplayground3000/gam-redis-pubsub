@@ -1,21 +1,24 @@
-# cdc-forward.yaml — reads central app.events stream; publishes each CDC event to
-# NATS JetStream on <subjectPrefix>.<op> with Nats-Msg-Id=event_id for dedup.
-# XADD fields (event_id/op/kv_key/old_key/new_key/ts) arrive as metadata; the body
-# arrives as content (body_key=body). We republish a self-contained JSON ENVELOPE
-# in the PAYLOAD (op/keys/body inside it) so the sink never depends on NATS
-# header->metadata mapping — the same proven shape the parent used.
-http:
-  address: 0.0.0.0:4195
-  enabled: true
-
+# cdc-forward.yaml — STREAMS-MODE stream config (input/pipeline/output only).
+# Reads central app.events stream; publishes each CDC event to NATS JetStream on
+# <subjectPrefix>.<op> with Nats-Msg-Id=event_id for dedup. XADD fields
+# (event_id/op/kv_key/old_key/new_key/ts) arrive as metadata; the body arrives as
+# content (body_key=body). We republish a self-contained JSON ENVELOPE in the
+# PAYLOAD (op/keys/body inside it) so the sink never depends on NATS
+# header->metadata mapping.
+#
+# This file is POSTed verbatim by the source elector once it wins the Lease (the
+# http/logger/metrics blocks live in observability.yaml). The streams REST API
+# does NOT expand environment variables, so client_id uses the __POD__ token,
+# which the elector replaces with the pod name before POSTing.
 input:
   label: redis_source
   redis_streams:
     url: {{ include "rrcs.redis.central.url" . }}
     kind: simple
-    streams: [app.events]
+    streams:
+      - app.events
     consumer_group: cdc_propagator
-    client_id: ${HOSTNAME:rpconnect-cdc-forward}
+    client_id: __POD__
     body_key: body
     create_streams: true
     start_from_oldest: false
@@ -45,14 +48,12 @@ pipeline:
 output:
   label: jetstream_sink
   nats_jetstream:
-    urls: ["{{ include "rrcs.nats.url" . }}"]
-    auth: { user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }} }
+    urls:
+      - "{{ include "rrcs.nats.url" . }}"
+    auth:
+      user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }}
     subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
     headers:
       Nats-Msg-Id: ${! meta("event_id") }
       Content-Type: application/json
     max_in_flight: 256
-
-logger: { level: INFO, format: json, add_timestamp: true }
-metrics:
-  prometheus: { use_histogram_timing: true }

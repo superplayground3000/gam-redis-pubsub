@@ -5,13 +5,15 @@ metadata:
   # Hash-suffixed so a changed stream config or image yields a NEW Job name
   # rather than failing `helm upgrade` on the immutable completed Job (spec §5.2).
   name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) | sha256sum | trunc 8))) }}
-  labels: { app: nats-init }
+  labels:
+    app: nats-init
 spec:
   backoffLimit: 6
   ttlSecondsAfterFinished: 600
   template:
     metadata:
-      labels: { app: nats-init }
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "nats-init") | nindent 8 }}
     spec:
       restartPolicy: OnFailure
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}

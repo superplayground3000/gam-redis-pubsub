@@ -8,13 +8,15 @@ apiVersion: batch/v1
 kind: Job
 metadata:
   name: {{ $name }}
-  labels: { app: verifier }
+  labels:
+    app: verifier
 spec:
   backoffLimit: 0
   ttlSecondsAfterFinished: 600
   template:
     metadata:
-      labels: { app: verifier }
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "verifier") | nindent 8 }}
     spec:
       restartPolicy: Never
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}

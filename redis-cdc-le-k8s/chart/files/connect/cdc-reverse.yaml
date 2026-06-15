@@ -1,25 +1,32 @@
-# cdc-reverse.yaml — single durable pull consumer; switch on op:
+# cdc-reverse.yaml — STREAMS-MODE stream config (input/pipeline/output only).
+# Binds to a pre-created durable PULL consumer; switch on op:
 #   create/update -> SET kv_key body ; delete -> DEL kv_key ;
 #   rename -> EVAL cdc_rename.lua (native RENAME old->new, value-preserving) ;
 #   unknown -> throw -> nack.
 # No version fence: reordered/late same-key arrivals overwrite (no-LWW).
 # reject_errored drop: success acks JetStream; processor failure nacks -> redelivery
 # (absorbed by SET/DEL/Lua idempotency).
-http:
-  address: 0.0.0.0:4195
-  enabled: true
-
+#
+# This file is POSTed verbatim by the sink elector once it wins the Lease (the
+# http/logger/metrics blocks live in observability.yaml). With active/standby
+# leader election only the leader binds the pull consumer, so exactly one
+# instance consumes at a time -> strict ordering is preserved.
 input:
   label: jetstream_source
   nats_jetstream:
-    urls: ["{{ include "rrcs.nats.url" . }}"]
-    auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
-    subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
+    urls:
+      - "{{ include "rrcs.nats.url" . }}"
+    auth:
+      user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
     durable: {{ .Values.nats.stream.consumer.durable | quote }}
-    deliver: all
-    ack_wait: 30s
-    max_ack_pending: 1024
+    # bind:true => attach to the EXISTING pull consumer the nats-init Job (or
+    # scripts/create-consumer.sh) created server-side. Without bind, this input
+    # would instead create a durable PUSH consumer. In pull(bind) mode Redpanda
+    # Connect derives the subject from the consumer's FilterSubject and IGNORES
+    # deliver / ack_wait / max_ack_pending here — those are set on
+    # `nats consumer add` (see values nats.stream.consumer.*).
+    bind: true
 
 pipeline:
   threads: 4
@@ -41,7 +48,11 @@ pipeline:
                 kind: simple
                 command: set
                 args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
-            - metric: { type: counter, name: cdc_apply, labels: { op: "${! meta(\"op\") }" } }
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  op: '${! meta("op") }'
         - check: meta("op") == "delete"
           processors:
             - redis:
@@ -49,7 +60,11 @@ pipeline:
                 kind: simple
                 command: del
                 args_mapping: 'root = [ meta("kv_key") ]'
-            - metric: { type: counter, name: cdc_apply, labels: { op: "delete" } }
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  op: delete
         - check: meta("op") == "rename"
           processors:
             - redis:
@@ -59,14 +74,14 @@ pipeline:
                 args_mapping: |
                   let script = {{ .Files.Get "files/connect/cdc_rename.lua" | toJson }}
                   root = [ $script, 2, meta("old_key"), meta("new_key") ]
-            - metric: { type: counter, name: cdc_apply, labels: { op: "rename" } }
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  op: rename
         - processors:
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
 
 output:
   reject_errored:
     drop: {}
-
-logger: { level: INFO, format: json, add_timestamp: true }
-metrics:
-  prometheus: { use_histogram_timing: true }

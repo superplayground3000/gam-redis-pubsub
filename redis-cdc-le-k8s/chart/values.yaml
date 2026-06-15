@@ -4,7 +4,7 @@ profile: cdc
 
 # Prefix that the rrcs.name helper prepends to every chart-rendered
 # Kubernetes resource name (this chart renders: Deployments, Services,
-# ConfigMaps, Secrets, Jobs, and one optional PVC). Empty string
+# ConfigMaps, Secrets, Jobs, RBAC objects, and one optional PVC). Empty string
 # disables prefixing for back-compat with any existing values overrides
 # that reference the unprefixed names.
 #
@@ -23,8 +23,23 @@ images:
   pullPolicy: IfNotPresent  # global default; public images need this on kind.
   pullSecrets: []           # list of { name: <secret-name> }
 
+# Extra labels merged into spec.template.metadata.labels of EVERY workload
+# (all Deployments + the nats-init / verifier Jobs). The mandatory `app`
+# label is always added by the chart and cannot be overridden here — the
+# per-workload selector pins it and selectors are immutable after install.
+# Add team/owner/cost-center/etc. labels for policy, billing, or NetworkPolicy
+# selection. Block style keeps it easy to hand-edit:
+#   podLabels:
+#     team: payments
+#     app.kubernetes.io/part-of: rrcs
+podLabels: {}
+
 redis:
   image: redis:7.4-alpine          # used only in bundled mode
+  # Bundled redis-central / redis-region boot with --protected-mode no so the
+  # in-cluster writer/verifier/connect clients can reach them without an ACL
+  # password (these are throwaway lab Redises on a private Service, never public).
+  protectedMode: "no"
   central:
     external:
       enabled: false
@@ -54,6 +69,14 @@ nats:
     subjectPrefix: "kv.cdc"
     consumer:
       durable: "cdc_sink"
+      # Server-side pull-consumer settings. In pull(bind) mode Redpanda
+      # Connect ignores deliver/ack_wait/max_ack_pending in the input YAML and
+      # uses whatever the durable was created with — so these live here and are
+      # applied by the nats-init Job's `nats consumer add` (and by the manual
+      # scripts/create-consumer.sh).
+      ackWait: "30s"        # redelivery timeout if the sink hasn't acked
+      maxAckPending: 1024    # max un-acked msgs in flight (sink throughput knob)
+      maxDeliver: -1         # -1 = redeliver forever until acked
     maxAge: "1h"
     maxBytes: "256MB"
     maxMsgSize: "1MB"
@@ -75,12 +98,31 @@ nats:
 natsBox:
   image: natsio/nats-box:0.14.5
 
+# Each connect leg runs in streams mode (empty boot) with an elector sidecar.
+# replicas>1 gives active/standby HA: only the Lease holder POSTs the leg's
+# pipeline; standbys idle. One Lease + stream id + ServiceAccount per leg.
 connect:
   image: hpdevelop/connect:4.92.0-claudefix
   source:
-    replicas: 1
+    replicas: 2
+    streamID: forward_leg          # streams-mode stream id the elector POSTs
+    lease:
+      name: connect-source-elector # Lease object name (run through rrcs.name)
+      duration: 6s
+      renewDeadline: 4s
+      retryPeriod: 1s
   sink:
-    replicas: 1
+    replicas: 2
+    streamID: reverse_leg
+    lease:
+      name: connect-sink-elector
+      duration: 6s
+      renewDeadline: 4s
+      retryPeriod: 1s
+
+elector:
+  image: redis-rrcs/elector:dev
+  pullPolicy: ""            # "" => inherit images.pullPolicy
 
 writer:
   image: redis-rrcs/writer:dev
@@ -119,20 +161,51 @@ scheduling:
 
 resources:
   redis:
-    requests: { cpu: 250m, memory: 128Mi }
-    limits:   { cpu: "2",  memory: 512Mi }
+    requests:
+      cpu: 250m
+      memory: 128Mi
+    limits:
+      cpu: "2"
+      memory: 512Mi
   nats:
-    requests: { cpu: 250m, memory: 256Mi }
-    limits:   { cpu: "2",  memory: 1Gi }
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
   connect:
-    requests: { cpu: 500m, memory: 256Mi }
-    limits:   { cpu: "2",  memory: 1Gi }
+    requests:
+      cpu: 500m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+  elector:
+    requests:
+      cpu: 50m
+      memory: 32Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
   writer:
-    requests: { cpu: 250m, memory: 64Mi }
-    limits:   { cpu: "2",  memory: 256Mi }
+    requests:
+      cpu: 250m
+      memory: 64Mi
+    limits:
+      cpu: "2"
+      memory: 256Mi
   verifier:
-    requests: { cpu: 100m, memory: 64Mi }
-    limits:   { cpu: 500m, memory: 128Mi }
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
   dashboard:
-    requests: { cpu: 100m, memory: 64Mi }
-    limits:   { cpu: 500m, memory: 128Mi }
+    requests:
+      cpu: 100m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi

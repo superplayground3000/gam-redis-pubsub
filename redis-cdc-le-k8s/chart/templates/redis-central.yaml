@@ -3,14 +3,17 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "redis-central") }}
-  labels: { app: redis-central }
+  labels:
+    app: redis-central
 spec:
   replicas: 1
   selector:
-    matchLabels: { app: redis-central }
+    matchLabels:
+      app: redis-central
   template:
     metadata:
-      labels: { app: redis-central }
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "redis-central") | nindent 8 }}
     spec:
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
       {{- include "rrcs.scheduling" . | nindent 6 }}
@@ -20,6 +23,8 @@ spec:
           imagePullPolicy: {{ .Values.images.pullPolicy }}
           args:
             - redis-server
+            - --protected-mode
+            - {{ .Values.redis.protectedMode | quote }}
             - --notify-keyspace-events
             - ""
             - --appendonly
@@ -29,12 +34,18 @@ spec:
           ports:
             - containerPort: 6379
           readinessProbe:
-            exec: { command: ["redis-cli", "ping"] }
+            exec:
+              command:
+                - redis-cli
+                - ping
             periodSeconds: 2
             timeoutSeconds: 2
             failureThreshold: 15
           livenessProbe:
-            exec: { command: ["redis-cli", "ping"] }
+            exec:
+              command:
+                - redis-cli
+                - ping
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 6
@@ -45,9 +56,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "redis-central") }}
-  labels: { app: redis-central }
+  labels:
+    app: redis-central
 spec:
-  selector: { app: redis-central }
+  selector:
+    app: redis-central
   ports:
     - name: redis
       port: 6379

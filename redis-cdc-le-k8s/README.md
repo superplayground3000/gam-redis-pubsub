@@ -1,22 +1,37 @@
-# no-lww-simple-cdc
+# redis-cdc-le-k8s
+
+Redpanda Connect CDC chart = the fence-free CDC relay of `../labs/no-lww-simple-cdc`
+**plus** Kubernetes-Lease leader election (active/standby) on both connect legs,
+from `../labs/redis-connect-leader-election-k8s`.
 
 ## What this demonstrates
 
-A fence-free CDC relay: a writer dual-writes each `create`/`update`/`delete`/
-`rename` to **central** Redis KV and emits a CDC envelope to a Redis Stream;
-**one** Redpanda Connect source publishes to NATS JetStream (with `Nats-Msg-Id`
-dedup); **one** Connect sink switches on `op` and applies `SET`/`DEL`/rename-Lua
-to **region** Redis KV — with **no last-write-wins fence**. Stale overwrites and
-delete-resurrection are accepted and shown live as central-vs-region divergence.
+A fence-free CDC relay: a writer emits each `create`/`update`/`delete`/`rename`
+as a CDC envelope on a central Redis Stream; a Redpanda Connect **source** leg
+publishes to NATS JetStream (with `Nats-Msg-Id` dedup); a Connect **sink** leg
+binds a durable **pull consumer**, switches on `op`, and applies
+`SET`/`DEL`/rename-Lua to **region** Redis KV — with **no last-write-wins fence**.
 
-Kubernetes/Helm fork of `../redis-connect-lww-multi-k8s` with the LWW fence
-removed and the topology reduced to single-source/single-sink.
+What this fork adds:
+
+- **Leader election on both legs.** Each connect leg runs `replicas: 2` in
+  *streams mode* (empty boot) with an **elector sidecar**. Only the holder of the
+  leg's coordination.k8s.io **Lease** POSTs the consuming pipeline to its local
+  connect over the streams REST API; standbys hold no stream (`/ready` is 200 —
+  healthy but idle). Exactly one active consumer per leg ⇒ strict ordering.
+- **RBAC** granting each elector get/list/watch/create/update/patch on `leases`.
+- **Pull-consumer by default** (`bind: true`): the durable consumer is
+  pre-created server-side (the `nats-init` Job, or `scripts/create-consumer.sh`),
+  because the `nats_jetstream` input only *attaches*, never creates.
+- Redis defaults to `--protected-mode no` (`redis.protectedMode`).
+
+See `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` for the design.
 
 ## Run it (kind)
 
 ```bash
 kind create cluster --name cdc
-scripts/build-images.sh --kind --kind-name=cdc        # build writer/verifier/dashboard, load into kind
+scripts/build-images.sh --kind --kind-name=cdc   # writer/verifier/dashboard/elector → kind
 # NATS auth fixtures are committed; regenerate only on a fresh checkout if missing:
 #   scripts/gen-nats-auth.sh --force
 RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh
@@ -26,15 +41,30 @@ RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh
 0 only when all three checks pass (dedup, per-op-under-quiescence, idempotent
 replay).
 
+## Inspect leader election
+
+```bash
+kubectl -n cdc-k8s get lease                       # holderIdentity = active pod per leg
+kubectl -n cdc-k8s get pods -l app=connect-sink    # 2 replicas; 1 active, 1 standby
+```
+
+## Pre-create the pull consumer by hand
+
+The bundled `nats-init` Job creates/reconciles the durable pull consumer
+automatically. For an **external** NATS (or after `nats consumer rm`), form the
+command manually — it never auto-runs unless you set `RUN=1`:
+
+```bash
+scripts/create-consumer.sh                         # prints `nats consumer add … --pull …`
+NATS_CLI="nats --server nats://nats-1:4222 --creds /path/admin.creds" RUN=1 \
+  scripts/create-consumer.sh                       # actually create it
+```
+
 ## Drive it by hand
 
 `scripts/insert-msgs.sh` **prints** ready-to-run `redis-cli XADD` commands (one
 per op + a 5× dedup test) — copy and run them yourself; the script never executes
-them:
-
-```bash
-scripts/insert-msgs.sh
-```
+them.
 
 ## Watch central vs region live
 
@@ -42,9 +72,9 @@ scripts/insert-msgs.sh
 scripts/dashboard-forward.sh        # binds 0.0.0.0; open http://<host>:8080
 ```
 
-The dashboard shows central key count, region key count, and divergence
-(only-central / only-region / differing), per-op sink applies, and a live region
-key-change feed.
+The dashboard shows central/region key counts, divergence, per-op sink applies
+(summed across all sink pods, so the active leader's counts are always reflected),
+and a live region key-change feed.
 
 ## HTML report
 
@@ -58,12 +88,6 @@ This is a Kubernetes lab, so the research-lab skill's `validate_lab.sh`
 (docker-compose) does not apply. `scripts/verify-cdc.sh` is the validation: exit
 0 requires dedup + per-op + replay all green.
 
-## Expected output
-
-`verify-cdc.sh` prints a `RESULT_JSON` line; its `.cdc` object carries
-`dedup_delta`, `ops_ok`, `replay_ok`, and `.verdict`. Actual numbers come from
-your run — see `RESEARCH.md` → Validated result once the lab has been run on kind.
-
 ## Teardown
 
 ```bash
@@ -73,5 +97,7 @@ kind delete cluster --name cdc
 
 ## Further reading
 
-- `RESEARCH.md` — the property, wire contract, and order-insensitive PASS bar.
-- `../redis-connect-lww-multi-k8s/` — the parent (LWW) lab.
+- `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` — this fork's design.
+- `RESEARCH.md` — the property, wire contract, and order-insensitive PASS bar (base).
+- `../labs/no-lww-simple-cdc/` — the CDC base lab.
+- `../labs/redis-connect-leader-election-k8s/` — the leader-election base lab.

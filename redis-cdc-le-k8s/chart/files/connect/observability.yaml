@@ -1,0 +1,14 @@
+# Streams-mode bootstrap config (passed via `connect streams -o`). Holds the
+# http/logger/metrics that a run-mode pipeline would carry at its top level.
+# The actual stream (input/pipeline/output) is POSTed at runtime by the elector
+# sidecar over the streams REST API on :4195.
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
+metrics:
+  prometheus:
+    use_histogram_timing: true
