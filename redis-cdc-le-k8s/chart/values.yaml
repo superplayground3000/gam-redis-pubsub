@@ -104,7 +104,9 @@ natsBox:
 connect:
   image: hpdevelop/connect:4.92.0-claudefix
   source:
-    replicas: 2
+    # Minimum 3 for HA: one active leader + two standbys, so leadership survives
+    # a node/pod loss without dropping to a single point of failure mid-failover.
+    replicas: 3
     streamID: forward_leg          # streams-mode stream id the elector POSTs
     lease:
       name: connect-source-elector # Lease object name (run through rrcs.name)
@@ -112,7 +114,7 @@ connect:
       renewDeadline: 4s
       retryPeriod: 1s
   sink:
-    replicas: 2
+    replicas: 3
     streamID: reverse_leg
     lease:
       name: connect-sink-elector

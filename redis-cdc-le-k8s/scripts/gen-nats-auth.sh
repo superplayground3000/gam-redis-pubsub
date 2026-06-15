@@ -143,6 +143,10 @@ nsc add user --account "${ACCOUNT_NAME}" --name publisher \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user subscriber"
+# The sink (cdc-reverse) binds to a server-side PULL consumer (bind:true), so it
+# must publish pull requests to $JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>.
+# CONSUMER.*CREATE.* remain only for back-compat with non-bind (push) configs;
+# in pull/bind mode the consumer is created by the nats-init Job (admin creds).
 nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
   --allow-pub '$JS.ACK.'"${STREAM_NAME}"'.'"${DURABLE_NAME}"'.>' \
   --allow-pub '$JS.API.STREAM.INFO.'"${STREAM_NAME}" \
@@ -150,6 +154,7 @@ nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
   --allow-pub '$JS.API.CONSUMER.CREATE.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
   --allow-pub '$JS.API.CONSUMER.CREATE.'"${STREAM_NAME}"'.'"${DURABLE_NAME}"'.>' \
   --allow-pub '$JS.API.CONSUMER.INFO.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
+  --allow-pub '$JS.API.CONSUMER.MSG.NEXT.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user admin"
