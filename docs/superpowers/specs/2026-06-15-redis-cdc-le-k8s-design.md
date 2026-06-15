@@ -58,7 +58,11 @@ What changes: each connect leg becomes an **active/standby set**.
   Only the Lease holder POSTs the leg's pipeline to its local connect via the
   streams REST API (`POST /streams/<id>`); on losing the lease it DELETEs the
   stream. Standbys hold zero streams (`/ready` still returns 200 → healthy but
-  idle). Result: exactly one active consumer per leg → strict ordering preserved.
+  idle). Result: exactly one active pod consumes per leg → clean active/standby
+  failover and no cross-pod double-processing. (The active sink pod still runs
+  `pipeline.threads` concurrently, so same-key ops within one fetched batch may
+  reorder — accepted by this no-LWW lab; set sink `threads: 1` for strict per-key
+  ordering.)
 - Per leg: its own Lease, stream ID, and pipeline ConfigMap.
   - source leg: Lease `connect-source-elector`, stream id `forward_leg`.
   - sink leg:   Lease `connect-sink-elector`,   stream id `reverse_leg`.

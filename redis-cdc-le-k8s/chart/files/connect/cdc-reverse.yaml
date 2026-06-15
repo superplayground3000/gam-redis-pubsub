@@ -9,8 +9,12 @@
 #
 # This file is POSTed verbatim by the sink elector once it wins the Lease (the
 # http/logger/metrics blocks live in observability.yaml). With active/standby
-# leader election only the leader binds the pull consumer, so exactly one
-# instance consumes at a time -> strict ordering is preserved.
+# leader election only the leader binds the pull consumer, so exactly one POD
+# consumes at a time -> clean active/standby failover and no cross-pod
+# double-processing. NOTE: within the active pod `pipeline.threads` below still
+# processes each fetched batch CONCURRENTLY, so same-key ops within one batch may
+# apply out of order — accepted by this lab's no-LWW, order-insensitive design
+# (SET/DEL/rename-Lua are idempotent). Set threads: 1 for strict per-key ordering.
 input:
   label: jetstream_source
   nats_jetstream:

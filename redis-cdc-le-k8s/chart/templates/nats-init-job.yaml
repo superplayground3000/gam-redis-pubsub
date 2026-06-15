@@ -27,7 +27,9 @@ spec:
         - name: wait-nats
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["/bin/sh", "-c"]
+          command:
+            - /bin/sh
+            - -c
           args:
             - |
               until nats --server {{ include "rrcs.nats.url" . }} --creds /etc/nats-creds/admin/user.creds rtt >/dev/null 2>&1; do
@@ -41,7 +43,9 @@ spec:
         - name: create-stream
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
-          command: ["/bin/sh", "-c"]
+          command:
+            - /bin/sh
+            - -c
           args:
             - |
               set -e

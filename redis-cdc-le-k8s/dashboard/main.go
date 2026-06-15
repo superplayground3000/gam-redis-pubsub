@@ -289,6 +289,11 @@ func scrapeState(ctx context.Context, writerURL string) (string, map[string]int6
 }
 
 func httpGet(ctx context.Context, url string) string {
+	// Bound each scrape: sinkEndpoints fans out to every sink pod IP, so an
+	// unreachable/terminating pod must not stall the whole poll loop on the OS
+	// TCP timeout. A short per-request deadline caps the worst case.
+	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
+	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {

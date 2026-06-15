@@ -14,11 +14,15 @@ binds a durable **pull consumer**, switches on `op`, and applies
 
 What this fork adds:
 
-- **Leader election on both legs.** Each connect leg runs `replicas: 2` in
-  *streams mode* (empty boot) with an **elector sidecar**. Only the holder of the
-  leg's coordination.k8s.io **Lease** POSTs the consuming pipeline to its local
-  connect over the streams REST API; standbys hold no stream (`/ready` is 200 —
-  healthy but idle). Exactly one active consumer per leg ⇒ strict ordering.
+- **Leader election on both legs.** Each connect leg runs `replicas: 3`
+  (1 active + 2 standbys — HA quorum) in *streams mode* (empty boot) with an
+  **elector sidecar**. Only the holder of the leg's coordination.k8s.io **Lease**
+  POSTs the consuming pipeline to its local connect over the streams REST API;
+  standbys hold no stream (`/ready` is 200 — healthy but idle). Exactly one active
+  pod consumes per leg ⇒ clean active/standby failover and no cross-pod
+  double-processing. (Within the active sink pod, `pipeline.threads` still
+  processes a batch concurrently, so same-key ops in one batch may reorder — fine
+  for this no-LWW lab; set sink `threads: 1` for strict per-key ordering.)
 - **RBAC** granting each elector get/list/watch/create/update/patch on `leases`.
 - **Pull-consumer by default** (`bind: true`): the durable consumer is
   pre-created server-side (the `nats-init` Job, or `scripts/create-consumer.sh`),
@@ -45,7 +49,7 @@ replay).
 
 ```bash
 kubectl -n cdc-k8s get lease                       # holderIdentity = active pod per leg
-kubectl -n cdc-k8s get pods -l app=connect-sink    # 2 replicas; 1 active, 1 standby
+kubectl -n cdc-k8s get pods -l app=connect-sink    # 3 replicas; 1 active, 2 standby
 ```
 
 ## Pre-create the pull consumer by hand
