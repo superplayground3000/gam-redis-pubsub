@@ -6,7 +6,9 @@ package main
 
 import (
 	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 
 	"redis-cdc-le-k8s/internal/dashboard"
 	"redis-cdc-le-k8s/internal/elector"
@@ -15,17 +17,22 @@ import (
 	"redis-cdc-le-k8s/internal/writer"
 )
 
-func usage() {
-	fmt.Fprint(os.Stderr, "usage: app <mode> [args]\n\nmodes:\n"+
-		"  writer\n  verifier\n  elector\n  latency-calculator\n  dashboard\n")
+func usage(w io.Writer) {
+	prog := filepath.Base(os.Args[0])
+	fmt.Fprintf(w, "usage: %s <mode> [args]\n\nmodes:\n"+
+		"  writer\n  verifier\n  elector\n  latency-calculator\n  dashboard\n", prog)
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		usage()
+		usage(os.Stderr)
 		os.Exit(2)
 	}
 	mode, args := os.Args[1], os.Args[2:]
+	if mode == "help" || mode == "-h" || mode == "--help" {
+		usage(os.Stdout)
+		return
+	}
 	switch mode {
 	case "writer":
 		writer.Run(args)
@@ -39,7 +46,7 @@ func main() {
 		dashboard.Run(args)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown mode %q\n", mode)
-		usage()
+		usage(os.Stderr)
 		os.Exit(2)
 	}
 }
