@@ -1,0 +1,66 @@
+{{- if .Values.latencyCalculator.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator") }}
+  labels:
+    app: latency-calculator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: latency-calculator
+  template:
+    metadata:
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "latency-calculator") | nindent 8 }}
+    spec:
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      containers:
+        - name: latency-calculator
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
+          imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.latencyCalculator.pullPolicy) }}
+          command: ["/usr/local/bin/latency-calculator"]
+          env:
+            - name: REGION_ADDR
+              value: {{ include "rrcs.redis.region.hostPort" . | quote }}
+            - name: STREAM
+              value: {{ .Values.latencyCalculator.stream | quote }}
+            - name: WINDOW_SEC
+              value: {{ .Values.latencyCalculator.windowSec | quote }}
+            - name: INTERVAL_SEC
+              value: {{ .Values.latencyCalculator.intervalSec | quote }}
+            - name: REPORT_PATH
+              value: {{ .Values.latencyCalculator.reportPath | quote }}
+          volumeMounts:
+            - name: reports
+              mountPath: /reports
+          resources:
+            {{- toYaml .Values.resources.latencyCalculator | nindent 12 }}
+      volumes:
+        - name: reports
+          {{- if .Values.latencyCalculator.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator-reports") }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+{{- if .Values.latencyCalculator.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator-reports") }}
+  labels:
+    app: latency-calculator
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.latencyCalculator.persistence.size | quote }}
+  {{- with .Values.latencyCalculator.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+{{- end }}
+{{- end }}
