@@ -744,13 +744,15 @@ go build ./...
 go test ./...
 go vet ./...
 ```
-Expected: `go mod tidy` writes `go.sum`; build and tests PASS; vet clean.
+Expected: `go mod tidy` writes `go.sum` (locally); build and tests PASS; vet clean.
+
+**Important:** `go.sum` is **gitignored repo-wide** (root `.gitignore` has `go.sum`) — every module regenerates it at build time and it is NEVER committed. Do not `git add` any `go.sum` (git will refuse an ignored path). The same applies to `go.work.sum` (see Task 6).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 cd redis-cdc-le-k8s
-git add latency-calculator/consumer.go latency-calculator/main.go latency-calculator/go.mod latency-calculator/go.sum
+git add latency-calculator/consumer.go latency-calculator/main.go latency-calculator/go.mod
 git commit -m "latency-calculator: redis consumer + main wiring"
 ```
 
@@ -759,8 +761,9 @@ git commit -m "latency-calculator: redis consumer + main wiring"
 ## Task 6: `go.work` workspace
 
 **Files:**
-- Create: `redis-cdc-le-k8s/go.work`
-- Create: `redis-cdc-le-k8s/go.work.sum` (generated)
+- Create: `redis-cdc-le-k8s/go.work` (committed)
+- Create: `redis-cdc-le-k8s/go.work.sum` (generated locally, **gitignored** — not committed)
+- Modify: root `.gitignore`
 
 - [ ] **Step 1: Initialize the workspace**
 
@@ -792,14 +795,22 @@ go work sync
 go build ./...
 go test ./...
 ```
-Expected: `go.work.sum` is created; all five modules build; all tests PASS.
+Expected: `go.work.sum` is created locally; all five modules build; all tests PASS.
 
-- [ ] **Step 3: Commit**
+- [ ] **Step 3: Gitignore `go.work.sum`** (consistent with the repo's gitignored `go.sum`)
+
+Append to the **root** `.gitignore` (the file at repo root, under its `# Go` section):
+```
+go.work.sum
+```
+Verify it is ignored: `git check-ignore redis-cdc-le-k8s/go.work.sum` prints the path.
+
+- [ ] **Step 4: Commit**
 
 ```bash
 cd redis-cdc-le-k8s
-git add go.work go.work.sum
-git commit -m "redis-cdc-le-k8s: add go.work over all five Go modules"
+git add go.work ../.gitignore
+git commit -m "redis-cdc-le-k8s: add go.work over all five Go modules (go.work.sum gitignored)"
 ```
 
 ---
@@ -820,8 +831,12 @@ git commit -m "redis-cdc-le-k8s: add go.work over all five Go modules"
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}golang:1.25-alpine AS build
 WORKDIR /src
+# go.sum / go.work.sum are gitignored repo-wide and never copied in; -mod=mod lets
+# `go build` download deps and (re)generate the sums in-layer, mirroring how the
+# old per-module Dockerfiles relied on `go mod download` to regenerate go.sum.
+ENV GOFLAGS=-mod=mod
 # Workspace + all module sources (BuildKit cache mounts handle module/build cache).
-COPY go.work go.work.sum ./
+COPY go.work ./
 COPY writer/ ./writer/
 COPY verifier/ ./verifier/
 COPY elector/ ./elector/
