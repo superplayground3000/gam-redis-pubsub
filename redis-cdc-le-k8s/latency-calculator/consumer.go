@@ -3,18 +3,29 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log"
 
 	"github.com/redis/go-redis/v9"
 )
 
+// pageSize bounds each XRANGE read; Poll loops until a short page is returned.
+const pageSize = 1000
+
+// streamReader is the narrow slice of *redis.Client the consumer needs, so Poll
+// and Seek can be unit-tested against a fake (a *redis.Client satisfies it).
+type streamReader interface {
+	XRangeN(ctx context.Context, stream, start, stop string, count int64) *redis.XMessageSliceCmd
+	XRevRangeN(ctx context.Context, stream, start, stop string, count int64) *redis.XMessageSliceCmd
+}
+
 type Consumer struct {
-	rdb    *redis.Client
+	rdb    streamReader
 	stream string
 	lastID string
 }
 
-func NewConsumer(rdb *redis.Client, stream string) *Consumer {
+func NewConsumer(rdb streamReader, stream string) *Consumer {
 	return &Consumer{rdb: rdb, stream: stream, lastID: "0-0"}
 }
 
@@ -23,7 +34,7 @@ func NewConsumer(rdb *redis.Client, stream string) *Consumer {
 func (c *Consumer) Seek(ctx context.Context) error {
 	msgs, err := c.rdb.XRevRangeN(ctx, c.stream, "+", "-", 1).Result()
 	if err != nil {
-		return err
+		return fmt.Errorf("xrevrange %s: %w", c.stream, err)
 	}
 	if len(msgs) > 0 {
 		c.lastID = msgs[0].ID
@@ -32,13 +43,16 @@ func (c *Consumer) Seek(ctx context.Context) error {
 }
 
 // Poll drains all parseable samples after the cursor, advancing it. Entries that
-// fail to parse are logged and skipped (best-effort telemetry).
+// fail to parse are logged and skipped (best-effort telemetry). The cursor is
+// advanced per delivered entry, so any samples accumulated before an error are
+// returned alongside that error (callers must consume them).
 func (c *Consumer) Poll(ctx context.Context) ([]Sample, error) {
 	var out []Sample
 	for {
-		msgs, err := c.rdb.XRangeN(ctx, c.stream, "("+c.lastID, "+", 1000).Result()
+		cursor := "(" + c.lastID
+		msgs, err := c.rdb.XRangeN(ctx, c.stream, cursor, "+", pageSize).Result()
 		if err != nil {
-			return out, err
+			return out, fmt.Errorf("xrange %s after %s: %w", c.stream, cursor, err)
 		}
 		if len(msgs) == 0 {
 			break
@@ -58,7 +72,7 @@ func (c *Consumer) Poll(ctx context.Context) ([]Sample, error) {
 			}
 			out = append(out, s)
 		}
-		if len(msgs) < 1000 {
+		if len(msgs) < pageSize {
 			break
 		}
 	}

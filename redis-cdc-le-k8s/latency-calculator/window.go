@@ -36,6 +36,13 @@ func (w *Window) Evict(nowMs int64) {
 			kept = append(kept, s)
 		}
 	}
+	// Release the (possibly large) backing array once it is mostly empty, so a
+	// burst of samples does not pin memory after eviction shrinks the window.
+	if cap(kept) > 4*len(kept) {
+		ns := make([]Sample, len(kept))
+		copy(ns, kept)
+		kept = ns
+	}
 	w.samples = kept
 }
 

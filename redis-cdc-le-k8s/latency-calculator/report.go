@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"time"
 )
@@ -67,12 +68,15 @@ func BuildReport(w *Window, nowMs int64, cfg ConfigMeta) Report {
 func WriteReportAtomic(path string, r Report) error {
 	b, err := json.MarshalIndent(r, "", "  ")
 	if err != nil {
-		return err
+		return fmt.Errorf("marshal report: %w", err)
 	}
 	b = append(b, '\n')
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, b, 0o644); err != nil {
-		return err
+		return fmt.Errorf("write %s: %w", tmp, err)
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return fmt.Errorf("rename %s -> %s: %w", tmp, path, err)
+	}
+	return nil
 }

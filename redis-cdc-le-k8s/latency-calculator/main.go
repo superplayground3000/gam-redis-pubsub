@@ -45,8 +45,20 @@ func main() {
 	defer rdb.Close()
 
 	cons := NewConsumer(rdb, stream)
-	if err := cons.Seek(ctx); err != nil {
-		log.Printf("seek (continuing from 0-0): %v", err)
+	// Block until Seek succeeds so we start at the live tail; a transient error
+	// must not leave the cursor at 0-0 (which replays the whole backlog and
+	// skews percentiles).
+	for {
+		if err := cons.Seek(ctx); err == nil {
+			break
+		} else {
+			log.Printf("seek failed, retrying: %v", err)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(2 * time.Second):
+		}
 	}
 	win := NewWindow(int64(windowSec) * 1000)
 	cfg := ConfigMeta{IntervalSec: intervalSec, WindowSec: windowSec, Stream: stream}
@@ -56,27 +68,40 @@ func main() {
 
 	ticker := time.NewTicker(time.Duration(intervalSec) * time.Second)
 	defer ticker.Stop()
+	failures := 0
 	for {
 		select {
 		case <-ctx.Done():
 			log.Print("shutting down")
 			return
 		case t := <-ticker.C:
+			// Consume returned samples even on error: Poll advances its cursor
+			// per delivered entry, so dropping them on error would lose them.
 			samples, err := cons.Poll(ctx)
-			if err != nil {
-				log.Printf("poll: %v", err)
-				continue
-			}
 			for _, s := range samples {
 				win.Add(s)
+			}
+			tickErr := false
+			if err != nil {
+				log.Printf("poll: %v", err)
+				tickErr = true
+				// fall through: still evict + write a report with what we have
 			}
 			nowMs := t.UnixMilli()
 			win.Evict(nowMs)
 			rep := BuildReport(win, nowMs, cfg)
 			if err := WriteReportAtomic(reportPath, rep); err != nil {
 				log.Printf("write report: %v", err)
+				tickErr = true
+			}
+			if tickErr {
+				failures++
+				if failures >= 10 {
+					log.Fatalf("too many consecutive failures, exiting for restart")
+				}
 				continue
 			}
+			failures = 0
 			log.Printf("report: count=%d p50=%d p95=%d p99=%d dropped_neg=%d",
 				rep.Overall.Count, rep.Overall.P50Ms, rep.Overall.P95Ms,
 				rep.Overall.P99Ms, rep.Overall.DroppedNegative)
