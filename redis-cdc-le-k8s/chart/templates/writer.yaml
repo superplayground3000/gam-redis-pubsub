@@ -37,7 +37,7 @@ spec:
         - name: writer
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.writer.pullPolicy) }}
-          command: ["/usr/local/bin/writer"]
+          command: ["/usr/local/bin/app", "writer"]
           env:
             - name: REDIS_ADDR
               value: {{ include "rrcs.redis.central.hostPort" . | quote }}
