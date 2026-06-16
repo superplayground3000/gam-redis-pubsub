@@ -21,7 +21,7 @@ spec:
         - name: latency-calculator
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.latencyCalculator.pullPolicy) }}
-          command: ["/usr/local/bin/latency-calculator"]
+          command: ["/usr/local/bin/app", "latency-calculator"]
           env:
             - name: REGION_ADDR
               value: {{ include "rrcs.redis.region.hostPort" . | quote }}

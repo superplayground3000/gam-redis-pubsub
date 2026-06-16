@@ -1,27 +1,22 @@
 # syntax=docker/dockerfile:1.7
 # Single image for ALL lab Go programs. Default entrypoint idles on `sleep
-# infinity`; each k8s manifest overrides `command:` to run a specific binary.
+# infinity`; each k8s manifest overrides `command:` to run `/usr/local/bin/app <mode>`.
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}golang:1.25-alpine AS build
 WORKDIR /src
-# go.sum / go.work.sum are gitignored repo-wide and never copied in. In workspace
-# mode `-mod=mod` is illegal, so `go work sync` (re)generates go.work.sum in-layer
-# before the readonly workspace build, mirroring how the old per-module Dockerfiles
-# relied on `go mod download` to regenerate go.sum.
-# Workspace + all module sources (BuildKit cache mounts handle module/build cache).
-COPY go.work ./
-COPY writer/ ./writer/
-COPY verifier/ ./verifier/
-COPY elector/ ./elector/
-COPY dashboard/ ./dashboard/
-COPY latency-calculator/ ./latency-calculator/
+# Single module → single binary. go.sum is gitignored and never copied in, so we
+# regenerate the full module graph's checksums in-layer with `go mod download all`
+# (the module-mode analog of the old `go work sync`; a plain `go build` or no-arg
+# `go mod download` fails on missing go.sum entries). Download is its own layer so
+# source-only edits don't re-resolve deps. BuildKit cache mounts reuse caches.
+COPY go.mod ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download all
+COPY main.go ./
+COPY internal/ ./internal/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    set -eux; \
-    go work sync; \
-    for app in writer verifier elector dashboard latency-calculator; do \
-      CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/$app ./$app; \
-    done
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
 
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}alpine:3.20
@@ -30,6 +25,6 @@ FROM ${BASE_REGISTRY}alpine:3.20
 RUN apk add --no-cache ca-certificates tini wget \
  && adduser -D -u 10001 app
 USER app
-COPY --from=build /out/ /usr/local/bin/
+COPY --from=build /out/app /usr/local/bin/app
 # Idle by default; manifests MUST set `command:` to run a real binary.
 ENTRYPOINT ["sleep", "infinity"]

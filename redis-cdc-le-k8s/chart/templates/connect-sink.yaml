@@ -81,7 +81,7 @@ spec:
         - name: elector
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.elector.pullPolicy) }}
-          command: ["/sbin/tini", "--", "/usr/local/bin/elector"]
+          command: ["/sbin/tini", "--", "/usr/local/bin/app", "elector"]
           env:
             - name: POD_NAME
               valueFrom:
