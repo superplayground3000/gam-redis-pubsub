@@ -32,5 +32,6 @@ pip-delete-this-directory.txt
 *.test
 *.out
 go.sum
+go.work.sum
 vendor/
 /.worktrees
