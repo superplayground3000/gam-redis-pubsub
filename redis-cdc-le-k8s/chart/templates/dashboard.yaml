@@ -18,8 +18,9 @@ spec:
       {{- include "rrcs.scheduling" . | nindent 6 }}
       containers:
         - name: dashboard
-          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.dashboard.image) }}
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.dashboard.pullPolicy) }}
+          command: ["/usr/local/bin/dashboard"]
           env:
             - name: CENTRAL_ADDR
               value: {{ include "rrcs.redis.central.hostPort" . | quote }}

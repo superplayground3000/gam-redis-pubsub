@@ -75,8 +75,9 @@ spec:
           resources:
             {{- toYaml .Values.resources.connect | nindent 12 }}
         - name: elector
-          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.elector.image) }}
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.elector.pullPolicy) }}
+          command: ["/sbin/tini", "--", "/usr/local/bin/elector"]
           env:
             - name: POD_NAME
               valueFrom:

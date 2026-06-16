@@ -23,8 +23,9 @@ spec:
       {{- include "rrcs.scheduling" . | nindent 6 }}
       containers:
         - name: verifier
-          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.verifier.image) }}
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
           imagePullPolicy: {{ include "rrcs.pullPolicy" (dict "root" $ "override" .Values.verifier.pullPolicy) }}
+          command: ["/usr/local/bin/verifier"]
           args:
             - --epoch={{ .Values.verifier.epoch }}
             - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
