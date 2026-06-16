@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Builds the writer, verifier, dashboard and elector images. Push and kind-load are opt-in.
+# Builds the single consolidated app image (writer/verifier/elector/dashboard/latency-calculator). Push and kind-load are opt-in.
 # Usage:
 #   scripts/build-images.sh                                   # build-only, tag :dev
 #   scripts/build-images.sh --base-registry=corp.io/mirror/   # redirect Dockerfile FROM
@@ -32,32 +32,18 @@ for arg in "$@"; do
   esac
 done
 
-# Image refs. REGISTRY (if set) prefixes the local name; must match values
-# images.registry so the chart pulls what we built.
+# Single consolidated image holding every Go binary. REGISTRY (if set) prefixes
+# the local name; must match values images.registry so the chart pulls what we built.
 prefix=""
 [[ -n "${REGISTRY}" ]] && prefix="${REGISTRY%/}/"
-WRITER_IMG="${prefix}redis-rrcs/writer:${TAG}"
-VERIFIER_IMG="${prefix}redis-rrcs/verifier:${TAG}"
-DASHBOARD_IMG="${prefix}redis-rrcs/dashboard:${TAG}"
-ELECTOR_IMG="${prefix}redis-rrcs/elector:${TAG}"
+APP_IMG="${prefix}redis-rrcs/cdc-apps:${TAG}"
 
-build_one() {
-  local ctx="$1" img="$2"
-  echo "[build] ${img} (BASE_REGISTRY='${BASE_REGISTRY}')"
-  docker build --build-arg "BASE_REGISTRY=${BASE_REGISTRY}" -t "${img}" "${ctx}"
-}
-
-build_one writer    "${WRITER_IMG}"
-build_one verifier  "${VERIFIER_IMG}"
-build_one dashboard "${DASHBOARD_IMG}"
-build_one elector   "${ELECTOR_IMG}"
+echo "[build] ${APP_IMG} (BASE_REGISTRY='${BASE_REGISTRY}')"
+DOCKER_BUILDKIT=1 docker build --build-arg "BASE_REGISTRY=${BASE_REGISTRY}" -t "${APP_IMG}" .
 
 if (( KIND )); then
-  echo "[kind] loading images into cluster '${KIND_NAME}'"
-  kind load docker-image "${WRITER_IMG}"    --name "${KIND_NAME}"
-  kind load docker-image "${VERIFIER_IMG}"  --name "${KIND_NAME}"
-  kind load docker-image "${DASHBOARD_IMG}" --name "${KIND_NAME}"
-  kind load docker-image "${ELECTOR_IMG}"   --name "${KIND_NAME}"
+  echo "[kind] loading image into cluster '${KIND_NAME}'"
+  kind load docker-image "${APP_IMG}" --name "${KIND_NAME}"
 fi
 
 if (( PUSH )); then
@@ -66,14 +52,8 @@ if (( PUSH )); then
     exit 2
   fi
   echo "[push] pushing to ${REGISTRY}"
-  docker push "${WRITER_IMG}"
-  docker push "${VERIFIER_IMG}"
-  docker push "${DASHBOARD_IMG}"
-  docker push "${ELECTOR_IMG}"
+  docker push "${APP_IMG}"
 else
   echo "[push] skipped (no --push). Built locally:"
-  echo "  ${WRITER_IMG}"
-  echo "  ${VERIFIER_IMG}"
-  echo "  ${DASHBOARD_IMG}"
-  echo "  ${ELECTOR_IMG}"
+  echo "  ${APP_IMG}"
 fi
