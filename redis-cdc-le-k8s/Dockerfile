@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 # Single image for ALL lab Go programs. Default entrypoint idles on `sleep
-# infinity`; each k8s manifest overrides `command:` to run a specific binary.
+# infinity`; each k8s manifest overrides `command:` to run `/usr/local/bin/app <mode>`.
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}golang:1.25-alpine AS build
 WORKDIR /src

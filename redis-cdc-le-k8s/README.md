@@ -101,12 +101,16 @@ kubectl -n <ns> exec deploy/<prefix>latency-calculator -- cat /reports/latency-r
 carry no body/ts). A persistently rising `dropped_negative` indicates central/region
 clock drift (NTP), not a CDC bug.
 
-### One image for all Go programs
+### One module, one binary, one image
 
-`writer`, `verifier`, `elector`, `dashboard`, and `latency-calculator` are built
-into a single image (`redis-rrcs/cdc-apps`) from one root `Dockerfile` + `go.work`.
-Its entrypoint is `sleep infinity`; every workload sets `command:` to pick its
-binary. Build with `scripts/build-images.sh [--kind --kind-name=...]`.
+All workloads live in a single Go module (`redis-cdc-le-k8s`): a `main.go`
+dispatcher plus `internal/{writer,verifier,elector,latency,dashboard}` subpackages.
+One `go build` produces a single binary `app` (no `go.work`) that selects its
+behavior by subcommand: `app writer`, `app verifier`, `app elector`,
+`app latency-calculator`, `app dashboard`. That binary ships in a single image
+(`redis-rrcs/cdc-apps`) whose entrypoint idles on `sleep infinity`; every k8s
+workload overrides `command:` to `["/usr/local/bin/app","<mode>"]` to pick its
+mode. Build with `scripts/build-images.sh [--kind --kind-name=...]`.
 
 ## Validation note
 
