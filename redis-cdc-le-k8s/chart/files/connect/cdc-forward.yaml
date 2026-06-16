@@ -8,8 +8,9 @@
 #
 # This file is POSTed verbatim by the source elector once it wins the Lease (the
 # http/logger/metrics blocks live in observability.yaml). The streams REST API
-# does NOT expand environment variables, so client_id uses the __POD__ token,
-# which the elector replaces with the pod name before POSTing.
+# does NOT expand environment variables, so client_id and output.label use the
+# __POD__ token, which the elector replaces with the pod name before POSTing
+# (Connect accepts hyphenated labels, so the raw pod name is used verbatim).
 input:
   label: redis_source
   redis_streams:
@@ -46,7 +47,7 @@ pipeline:
         meta event_id = $eid                          # used for the Nats-Msg-Id header
 
 output:
-  label: jetstream_sink
+  label: __POD__
   nats_jetstream:
     urls:
       - "{{ include "rrcs.nats.url" . }}"
