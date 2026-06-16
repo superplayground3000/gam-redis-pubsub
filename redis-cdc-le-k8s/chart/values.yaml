@@ -20,6 +20,7 @@ resourcePrefix: "lab-"
 
 images:
   registry: ""              # prepended to every image ref. "" => use ref as-is.
+  app: redis-rrcs/cdc-apps:dev   # single image for ALL Go programs (command: per workload)
   pullPolicy: IfNotPresent  # global default; public images need this on kind.
   pullSecrets: []           # list of { name: <secret-name> }
 
@@ -123,11 +124,9 @@ connect:
       retryPeriod: 1s
 
 elector:
-  image: redis-rrcs/elector:dev
   pullPolicy: ""            # "" => inherit images.pullPolicy
 
 writer:
-  image: redis-rrcs/writer:dev
   pullPolicy: ""
   env:
     STREAM_MAXLEN: "100000"
@@ -142,11 +141,9 @@ writer:
     OP_RENAME: "10"
 
 dashboard:
-  image: redis-rrcs/dashboard:dev
   pullPolicy: ""            # "" => inherit images.pullPolicy
 
 verifier:
-  image: redis-rrcs/verifier:dev
   pullPolicy: ""
   run: false           # harness renders the Job
   jobName: ""
@@ -155,6 +152,25 @@ verifier:
   durationS: 30
   warmupS: 5
   drainS: 10
+
+latencyCalculator:
+  enabled: false           # off by default, like other optional components
+  pullPolicy: ""           # "" => inherit images.pullPolicy
+  # Sidecar stream the sink writes to and the calculator reads. These exist even
+  # when enabled=false, because the sink emits the stream unconditionally so
+  # enabling the calculator later still finds data.
+  stream: "cdc:latency"
+  # Rate-dependent: set to at least ~2x the peak XADD rate per intervalSec so the
+  # approximate MAXLEN ~ trim cannot evict entries before the calculator reads
+  # them (lost samples only, never lost CDC).
+  streamMaxLen: 50000
+  windowSec: 60            # rolling window for percentiles
+  intervalSec: 10          # report write cadence
+  reportPath: /reports/latency-report.json
+  persistence:
+    enabled: false         # false => emptyDir at /reports; true => PVC
+    size: 1Gi
+    storageClass: ""
 
 scheduling:
   nodeSelector: {}
@@ -210,4 +226,11 @@ resources:
       memory: 64Mi
     limits:
       cpu: 500m
+      memory: 128Mi
+  latencyCalculator:
+    requests:
+      cpu: 25m
+      memory: 32Mi
+    limits:
+      cpu: 250m
       memory: 128Mi
