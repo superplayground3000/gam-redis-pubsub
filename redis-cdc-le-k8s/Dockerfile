@@ -4,24 +4,18 @@
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}golang:1.25-alpine AS build
 WORKDIR /src
-# go.sum / go.work.sum are gitignored repo-wide and never copied in. In workspace
-# mode `-mod=mod` is illegal, so `go work sync` (re)generates go.work.sum in-layer
-# before the readonly workspace build, mirroring how the old per-module Dockerfiles
-# relied on `go mod download` to regenerate go.sum.
-# Workspace + all module sources (BuildKit cache mounts handle module/build cache).
-COPY go.work ./
-COPY writer/ ./writer/
-COPY verifier/ ./verifier/
-COPY elector/ ./elector/
-COPY dashboard/ ./dashboard/
-COPY latency-calculator/ ./latency-calculator/
+# Single module → single binary. go.sum is gitignored and never copied in, so we
+# regenerate the full module graph's checksums in-layer with `go mod download all`
+# (the module-mode analog of the old `go work sync`) before the readonly build —
+# a plain `go build`/`go mod download` would otherwise fail on missing go.sum
+# entries. BuildKit cache mounts reuse the module + build cache across builds.
+COPY go.mod ./
+COPY main.go ./
+COPY internal/ ./internal/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    set -eux; \
-    go work sync; \
-    for app in writer verifier elector dashboard latency-calculator; do \
-      CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/$app ./$app; \
-    done
+    go mod download all && \
+    CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
 
 ARG BASE_REGISTRY=""
 FROM ${BASE_REGISTRY}alpine:3.20
