@@ -15,6 +15,12 @@ Hard constraint: the calculator runs in the **region** cluster and may access
 **only region Redis**. It must NOT depend on central Redis or NATS JetStream
 (they are in a different cluster and unreachable).
 
+This spec also folds in a **build-packaging change** (Component 4): all Go
+programs in the lab — `writer`, `verifier`, `elector`, `dashboard`, and the new
+`latency-calculator` — are consolidated into a **single image** built from one
+Dockerfile and a `go.work` workspace, with `sleep infinity` as the default
+entrypoint and per-workload `command:` overrides.
+
 ## Measurement model
 
 The writer already stamps `body.ts` (central write time, unix-millis) inside
@@ -177,8 +183,10 @@ CDC bug — documented in the README section.
 
 ## Component 3 — chart wiring
 
-- `latency-calculator/Dockerfile` (multi-stage Go build, matches the other
-  components' Dockerfiles).
+- The calculator is built into the **single consolidated image** (see "Component
+  4 — build & packaging"); there is no per-component Dockerfile. Its manifest
+  sets `command: ["/usr/local/bin/latency-calculator"]` over the image's idle
+  `sleep infinity` entrypoint.
 - `chart/templates/latency-calculator.yaml` — a Deployment (1 replica), gated
   behind `latencyCalculator.enabled` (default **off**, like other optional
   components). The template **always mounts a volume at `/reports`** — an
@@ -189,7 +197,8 @@ CDC bug — documented in the README section.
 - `chart/values.yaml` — new `latencyCalculator` block:
   `enabled`, `stream: cdc:latency`, `streamMaxLen: 50000`, `windowSec: 60`,
   `intervalSec: 10`, `reportPath: /reports/latency-report.json`,
-  `persistence: { enabled: false, size, storageClass }`, `resources`, `image`.
+  `persistence: { enabled: false, size, storageClass }`, `resources`. The image
+  is the shared `images.app` ref (no per-component `image:`).
   Region Redis URL reuses `rrcs.redis.region.url`. The `streamMaxLen` comment
   notes it is rate-dependent: set it to at least ~2× the peak XADD rate per
   `intervalSec` so approximate `MAXLEN ~` trimming cannot evict entries before
@@ -198,9 +207,73 @@ CDC bug — documented in the README section.
   `latencyCalculator.streamMaxLen` (single source of truth) so the sink emits
   the sidecar stream even when the calculator Deployment is disabled — enabling
   the calculator later still finds data.
-- `scripts/build-images.sh` builds/loads the new image alongside the others.
 - README + `docs/nats-jetstream-and-redis-kv-message-flow.md` get a short
   "latency calculator" section.
+
+## Component 4 — build & packaging: single multi-binary image + `go.work`
+
+Per the consolidation requirement, all Go programs ship in **one image** built
+from **one Dockerfile**, with a Go workspace tying the modules together. This
+replaces the four existing per-component Dockerfiles
+(`writer`/`verifier`/`elector`/`dashboard`) and folds in `latency-calculator`.
+
+### `go.work` (lab root, committed)
+```
+go 1.25
+use (
+  ./writer
+  ./verifier
+  ./elector
+  ./dashboard
+  ./latency-calculator
+)
+```
+The five modules keep their existing simple module names and independent
+`go.mod`/`go.sum` (they do not import each other); the workspace only unifies
+local builds (`go build ./...`). `go.work.sum` is generated and committed for
+reproducible Docker builds.
+
+### Single Dockerfile (lab root, build context = lab root)
+- **Build stage** (`golang:1.25-alpine`): COPY `go.work` + each module's
+  `go.mod`/`go.sum` first and warm the module cache, then COPY sources and
+  `go build -trimpath -ldflags="-s -w"` each binary into `/out/<name>`
+  (dashboard's `go:embed static/` is covered by copying its full source).
+- **Runtime stage** (`alpine:3.20`): install the **union** of runtime deps the
+  separate images needed (`ca-certificates`, `tini` for the elector,
+  `wget` for the writer's probe), add the non-root `app` user (uid 10001), COPY
+  all `/out/*` binaries to `/usr/local/bin/`, and set
+  **`ENTRYPOINT ["sleep", "infinity"]`** (verified to work on alpine BusyBox).
+
+The image idles by default; **every Go workload MUST set `command:`** in its
+manifest (otherwise it just sleeps). This is the single biggest behavioral change
+and is called out in NOTES.txt / README.
+
+### Manifest `command:` overrides (one image, five entrypoints)
+| Workload | `command:` |
+|---|---|
+| writer (Deployment) | `["/usr/local/bin/writer"]` |
+| verifier (Job) | `["/usr/local/bin/verifier"]` |
+| dashboard (Deployment) | `["/usr/local/bin/dashboard"]` |
+| latency-calculator (Deployment) | `["/usr/local/bin/latency-calculator"]` |
+| elector (sidecar ×2 in connect-source/connect-sink) | `["/sbin/tini","--","/usr/local/bin/elector"]` |
+
+The elector keeps its **tini-as-PID1** wrapper via the `command:` override so the
+SIGSTOP/SIGCONT leader-election failover proof still acts on the elector child —
+a correctness property that must not regress in the consolidation.
+
+### values + helper
+- `values.yaml`: replace the four per-component `image:` refs with a single
+  `images.app: redis-rrcs/cdc-apps:dev`. Per-component `pullPolicy` overrides
+  stay. Existing `images.registry` prefixing via `rrcs.image` is reused (the
+  helper now joins `images.registry` + `images.app`).
+- Args/env that each component already receives stay as-is; only the container
+  entrypoint moves from image `ENTRYPOINT` to manifest `command:`.
+
+### `scripts/build-images.sh`
+Collapses the four `docker build` calls into **one** build of the consolidated
+image (context = lab root), and the kind-load / push / retag logic operates on
+that single ref. `latency-calculator` needs no new build step — it is already a
+binary in the image.
 
 ## Testing
 
@@ -213,9 +286,18 @@ Go unit tests (no live Redis required):
 - report JSON serialization (golden shape);
 - stream-entry parsing (well-formed, missing field, non-numeric ts).
 
+Build / packaging:
+- `go build ./...` under the workspace compiles all five binaries;
+- the consolidated image builds and contains `/usr/local/bin/{writer,verifier,
+  elector,dashboard,latency-calculator}`; with no `command:` it stays up on
+  `sleep infinity`; `helm template` shows every Go workload sets `command:`.
+
 Manual / lab:
-- enable `latencyCalculator.enabled=true` in the kind lab, run the writer,
-  `kubectl exec` into the calculator pod and `cat /reports/latency-report.json`;
+- `scripts/build-images.sh --kind` builds the one image and loads it; the full
+  `verify-cdc.sh` run still passes (every component resolves its binary via
+  `command:`, elector failover proof intact);
+- enable `latencyCalculator.enabled=true`, run the writer, `kubectl exec` into
+  the calculator pod and `cat /reports/latency-report.json`;
 - confirm the verifier still passes (value bytes unchanged).
 
 ## Assumptions & caveats
