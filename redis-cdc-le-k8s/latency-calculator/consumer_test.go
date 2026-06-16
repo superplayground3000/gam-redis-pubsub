@@ -14,12 +14,18 @@ type xrangeResult struct {
 	err  error
 }
 
-// fakeReader serves canned XRevRangeN (Seek) and a queue of XRangeN pages.
+// fakeReader serves canned XRevRangeN (Seek) and a queue of XRangeN pages. It
+// also records the args of the FIRST XRangeN call so tests can lock in the
+// exclusive-cursor contract ("(" + lastID, "+", pageSize).
 type fakeReader struct {
 	revMsgs []redis.XMessage // tail entry for Seek
 	revErr  error
 	pages   []xrangeResult // consumed in order by successive XRangeN calls
 	calls   int            // XRangeN call count
+
+	firstStart string // start arg of the first XRangeN call
+	firstStop  string // stop arg of the first XRangeN call
+	firstCount int64  // count arg of the first XRangeN call
 }
 
 func (f *fakeReader) XRevRangeN(ctx context.Context, stream, start, stop string, count int64) *redis.XMessageSliceCmd {
@@ -33,6 +39,9 @@ func (f *fakeReader) XRevRangeN(ctx context.Context, stream, start, stop string,
 }
 
 func (f *fakeReader) XRangeN(ctx context.Context, stream, start, stop string, count int64) *redis.XMessageSliceCmd {
+	if f.calls == 0 {
+		f.firstStart, f.firstStop, f.firstCount = start, stop, count
+	}
 	cmd := redis.NewXMessageSliceCmd(ctx)
 	if f.calls >= len(f.pages) {
 		// No more canned pages: behave like an empty stream.
@@ -116,6 +125,11 @@ func TestPollSinglePageDrains(t *testing.T) {
 	}
 	if c.lastID != "3-0" {
 		t.Errorf("cursor=%q want 3-0", c.lastID)
+	}
+	// Lock in the exclusive-cursor contract: first read starts at "(" + lastID
+	// (exclusive of the seeded 0-0), reads to "+", with pageSize count.
+	if f.firstStart != "(0-0" || f.firstStop != "+" || f.firstCount != pageSize {
+		t.Errorf("XRangeN args=(%q,%q,%d) want (\"(0-0\",\"+\",%d)", f.firstStart, f.firstStop, f.firstCount, pageSize)
 	}
 }
 

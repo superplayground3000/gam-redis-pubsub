@@ -1,6 +1,6 @@
 {{/*
 rrcs.image — join the global registry prefix with a per-image ref.
-Usage: {{ include "rrcs.image" (dict "root" $ "ref" .Values.writer.image) }}
+Usage: {{ include "rrcs.image" (dict "root" $ "ref" .Values.images.app) }}
 */}}
 {{- define "rrcs.image" -}}
 {{- printf "%s%s" .root.Values.images.registry .ref -}}

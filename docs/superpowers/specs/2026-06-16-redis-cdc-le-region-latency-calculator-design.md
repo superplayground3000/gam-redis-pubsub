@@ -229,9 +229,11 @@ use (
 )
 ```
 The five modules keep their existing simple module names and independent
-`go.mod`/`go.sum` (they do not import each other); the workspace only unifies
-local builds (`go build ./...`). `go.work.sum` is generated and committed for
-reproducible Docker builds.
+`go.mod` (they do not import each other); the workspace only unifies local
+builds. Per the repo convention, `go.sum` is **gitignored** and regenerated at
+build time; `go.work.sum` is likewise generated locally and **gitignored** (the
+Docker build regenerates sums in-layer via `go work sync`), so neither sum file
+is committed.
 
 ### Single Dockerfile (lab root, build context = lab root)
 - **Build stage** (`golang:1.25-alpine`): COPY `go.work` + each module's
