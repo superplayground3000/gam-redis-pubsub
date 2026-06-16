@@ -58,10 +58,26 @@ The calculator touches **only region Redis** — never central, never NATS.
 
 ## Component 1 — sink change (`chart/files/connect/cdc-reverse.yaml`)
 
-In the existing `create`/`update` switch branch, **after** the `SET` (value
-unchanged) and the existing `cdc_apply` metric, append a **best-effort** latency
-emit. Exact processor shape (all expressions below are empirically verified
-against the chart's `connect:4.92.0` image — see "External review & verification"):
+In the `create`/`update` switch branch, emit the latency record **first** (as a
+**best-effort** step), then do the existing `SET` and `cdc_apply` metric.
+
+> **Ordering is load-bearing — branch order: `try:[ switch → redis xadd ]` →
+> `catch:[ log ]` → `redis set` → `metric`.** A Redpanda Connect `catch` clears
+> the error flag on **any** message that reaches it errored, regardless of which
+> processor set it (empirically confirmed). So a `catch` placed *after* the `SET`
+> would swallow a genuine `SET` failure, causing `output.reject_errored` to ACK
+> (drop) instead of nack — a **silently lost CDC apply**. Putting the best-effort
+> XADD + its `catch` **before** the `SET` guarantees the `catch` only ever clears
+> XADD-path errors; a later `SET` failure stays flagged → nack → redelivery, as
+> today. (Trade-off: the sample is recorded ~microseconds before the apply; on the
+> rare SET-fails-then-redelivers path the XADD may record one duplicate/early
+> sample — acceptable for best-effort telemetry.) The `try`/`catch` is the first
+> thing in the branch, so the only error it could see other than the XADD's is one
+> from the shared pre-`switch` meta-stash `mapping`, which does not throw (the
+> existing pipeline already relies on that).
+
+Exact processor expressions (all empirically verified against the chart's
+`connect:4.92.0` image — see "External review & verification"):
 
 - `writer_ts` = `meta("body").parse_json().ts.or(0)`. The sink stashes the body
   as a raw JSON **string** in `meta body`, so it MUST be `parse_json()`-ed before
@@ -86,14 +102,13 @@ against the chart's `connect:4.92.0` image — see "External review & verificati
              "sink_ts", now().ts_unix_milli().string() ]
   ```
 - **Best-effort isolation:** wrap *only* the guarded XADD in a `try:` processor,
-  followed by a sibling `catch:` that `log`s a WARN and clears the error. `try`
-  and `catch` are real Redpanda Connect processors (Codex mislabeled `catch` as
-  fictional; it exists and is the correct mechanism). Because `catch` clears the
-  error flag, a failed telemetry XADD leaves the message un-errored, so the
-  sink's `output.reject_errored` does NOT nack it → no redelivery, no double
-  SET. The earlier `SET` is OUTSIDE this try/catch, so a real apply failure still
-  nacks and redelivers as today. Ordering in the branch: `set` → `metric` →
-  `try:[ switch → redis xadd ]` → `catch:[ log ]`.
+  followed by a sibling `catch:` that `log`s a WARN and clears the error — placed
+  **before** the `SET` (see the ordering box above for why). `try` and `catch`
+  are real Redpanda Connect processors. Because `catch` clears the error flag, a
+  failed telemetry XADD leaves the message un-errored → `output.reject_errored`
+  does NOT nack it → no redelivery, no double SET. The `SET` runs *after* the
+  catch and is NOT wrapped, so a real apply failure stays flagged → nack →
+  redelivery, as today.
 
 delete and rename branches are unchanged (unmeasured).
 
@@ -229,8 +244,13 @@ chart's `hpdevelop/connect:4.92.0-claudefix` image:
   correctly via `command: xadd` on 4.92 — kept the simple form, no Lua eval.
 - **C3 — best-effort wrapper** (valid intent). Adopted real `try:`/`catch:`
   processors wrapping only the XADD (`catch` is a real processor; clears the
-  error so `reject_errored` does not nack). Ordering pinned: set → metric →
-  try → catch.
+  error so `reject_errored` does not nack).
+- **C3-followup — `catch` placement** (Codex stop-time review, valid & verified).
+  Verified that a `catch` clears errors from **earlier** processors too, so a
+  `catch` after the `SET` would swallow a real `SET` failure and silently ACK a
+  lost apply. **Fixed:** the best-effort XADD + `catch` now run **before** the
+  `SET`; branch order is `try:[switch→xadd]` → `catch:[log]` → `set` → `metric`.
+  Confirmed a post-catch `SET` failure stays errored (→ nack/redelivery).
 - **S1 — millis expression** (valid). Verified `now().ts_unix_milli()` returns
   unix-millis; chosen explicitly.
 - **S2/S3/S5, N1/N2/N4** — folded in as the cold-start undercount note,
