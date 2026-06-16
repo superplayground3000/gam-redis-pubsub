@@ -6,15 +6,16 @@ FROM ${BASE_REGISTRY}golang:1.25-alpine AS build
 WORKDIR /src
 # Single module → single binary. go.sum is gitignored and never copied in, so we
 # regenerate the full module graph's checksums in-layer with `go mod download all`
-# (the module-mode analog of the old `go work sync`) before the readonly build —
-# a plain `go build`/`go mod download` would otherwise fail on missing go.sum
-# entries. BuildKit cache mounts reuse the module + build cache across builds.
+# (the module-mode analog of the old `go work sync`; a plain `go build` or no-arg
+# `go mod download` fails on missing go.sum entries). Download is its own layer so
+# source-only edits don't re-resolve deps. BuildKit cache mounts reuse caches.
 COPY go.mod ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download all
 COPY main.go ./
 COPY internal/ ./internal/
 RUN --mount=type=cache,target=/go/pkg/mod \
     --mount=type=cache,target=/root/.cache/go-build \
-    go mod download all && \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
 
 ARG BASE_REGISTRY=""
@@ -24,6 +25,6 @@ FROM ${BASE_REGISTRY}alpine:3.20
 RUN apk add --no-cache ca-certificates tini wget \
  && adduser -D -u 10001 app
 USER app
-COPY --from=build /out/ /usr/local/bin/
+COPY --from=build /out/app /usr/local/bin/app
 # Idle by default; manifests MUST set `command:` to run a real binary.
 ENTRYPOINT ["sleep", "infinity"]
