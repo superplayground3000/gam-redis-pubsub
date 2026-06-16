@@ -29,3 +29,7 @@ Watch central vs region live:
 
 Tear down:
   helm uninstall {{ .Release.Name }} -n {{ .Release.Namespace }}
+
+All Go components share one image ({{ .Values.images.app }}) whose default
+entrypoint is `sleep infinity`. Each workload overrides `command:` to run its
+binary. If you add a new Go workload, you MUST set `command:` or the pod will idle.

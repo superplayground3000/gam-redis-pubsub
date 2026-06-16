@@ -415,6 +415,17 @@ This is the "no-LWW" part: there is **no version fence**. If a later, reordered 
 event is redelivered or arrives late, it simply overwrites — last *delivered* wins, not last
 *written*. The lab's whole point is to study that looseness.
 
+### 4.4 Sidecar `cdc:latency` stream (best-effort telemetry)
+
+On each create/update the sink also XADDs a best-effort `cdc:latency` record to
+**region** Redis, carrying `op`/`kv_key`/`writer_ts` (the event's `ts`) and
+`sink_ts` (the apply wall-clock). It is emitted *before* the authoritative `SET`
+and wrapped in `try`/`catch`, so a telemetry failure is logged and ignored —
+it never affects the applied KV value, and the `set` that follows is unwrapped so
+a real apply error still nacks/redelivers. The stream is consumed only by the
+optional region-side latency-calculator (`latency_ms = sink_ts - writer_ts`);
+nothing in the apply path reads it, so the convergence verifier is unaffected.
+
 ---
 
 ## 5. Worked end-to-end examples (one per op)

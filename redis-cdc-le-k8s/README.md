@@ -86,6 +86,28 @@ and a live region key-change feed.
 RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/gen-report.sh   # writes reports/cdc-report.html
 ```
 
+## Latency calculator (optional)
+
+The sink leg emits a best-effort `cdc:latency` record (`op,kv_key,writer_ts,sink_ts`)
+to **region** Redis after each create/update. Enable the region-side calculator to
+turn that into a rolling p50/p95/p99 report:
+
+```bash
+helm upgrade ... --set latencyCalculator.enabled=true
+kubectl -n <ns> exec deploy/<prefix>latency-calculator -- cat /reports/latency-report.json
+```
+
+`latency_ms = sink_ts - writer_ts`. Only create/update are measured (delete/rename
+carry no body/ts). A persistently rising `dropped_negative` indicates central/region
+clock drift (NTP), not a CDC bug.
+
+### One image for all Go programs
+
+`writer`, `verifier`, `elector`, `dashboard`, and `latency-calculator` are built
+into a single image (`redis-rrcs/cdc-apps`) from one root `Dockerfile` + `go.work`.
+Its entrypoint is `sleep infinity`; every workload sets `command:` to pick its
+binary. Build with `scripts/build-images.sh [--kind --kind-name=...]`.
+
 ## Validation note
 
 This is a Kubernetes lab, so the research-lab skill's `validate_lab.sh`
