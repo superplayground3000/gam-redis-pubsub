@@ -267,10 +267,14 @@ git commit -m "redis-cdc-le-k8s: consolidate 5 Go modules into one mono binary (
 In `redis-cdc-le-k8s/Dockerfile`, replace the build-stage body (the `COPY go.work` line through the end of the `RUN ... go build` loop) with:
 
 ```dockerfile
-# Single module → single binary. go.sum is gitignored and never copied in, so the
-# build runs in module mode and resolves/verifies deps in-layer (BuildKit cache
-# mounts reuse the module + build cache across builds).
+# Single module → single binary. go.sum is gitignored and never copied in, so we
+# regenerate the full module graph's checksums in-layer with `go mod download all`
+# (the module-mode analog of the old `go work sync`; a plain `go build` or no-arg
+# `go mod download` fails on missing go.sum entries). Download is its own layer so
+# source-only edits don't re-resolve deps. BuildKit cache mounts reuse caches.
 COPY go.mod ./
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download all
 COPY main.go ./
 COPY internal/ ./internal/
 RUN --mount=type=cache,target=/go/pkg/mod \
@@ -278,11 +282,20 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/app .
 ```
 
-The header comment block referencing `go work sync` / per-module Dockerfiles is now stale — replace it with the two-line comment above.
+The header comment block referencing `go work sync` / per-module Dockerfiles is now stale — replace it with the comment above.
+
+> **Build note (verified during execution):** the original draft of this step
+> used a bare `go build` with the claim that module mode resolves deps in-layer.
+> That is wrong — without a committed `go.sum`, `go build` (and no-arg
+> `go mod download`) fail with "missing go.sum entry". `go mod download all`
+> regenerates the full module-graph checksums in-layer and is required.
 
 - [ ] **Step 2: Confirm the runtime stage ships one binary**
 
-The runtime stage already does `COPY --from=build /out/ /usr/local/bin/`, which now copies only `app`. Leave the `apk add ... ca-certificates tini wget`, the `app` user, and `ENTRYPOINT ["sleep", "infinity"]` unchanged. No edit needed if the COPY line is `/out/` → `/usr/local/bin/`; verify it reads exactly that.
+The runtime stage copies only the single binary. Narrow the artifact copy to
+`COPY --from=build /out/app /usr/local/bin/app`. Leave the
+`apk add ... ca-certificates tini wget`, the `app` user, and
+`ENTRYPOINT ["sleep", "infinity"]` unchanged.
 
 - [ ] **Step 3: Build the image**
 
