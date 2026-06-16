@@ -1,9 +1,5 @@
-# Built Go binaries
-writer/writer
-verifier/verifier
-dashboard/dashboard
-collector/collector
-latency-calculator/latency-calculator
+# Built Go binary
+/app
 # Rendered manifests
 out/
 # Local run output (HTML report, JSON, etc.)
