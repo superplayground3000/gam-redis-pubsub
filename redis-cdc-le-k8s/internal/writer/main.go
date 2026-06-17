@@ -12,11 +12,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"redis-cdc-le-k8s/internal/rediscfg"
 )
 
 func Run(args []string) {
 	addr := envStr("REDIS_ADDR", "redis-central:6379")
+	cluster := rediscfg.EnvBool("REDIS_CLUSTER")
 	streamKey := envStr("STREAM_KEY", "app.events")
 	streamMaxLen := envInt("STREAM_MAXLEN", 100_000)
 	workers := envInt("WORKERS", 8)
@@ -42,7 +43,7 @@ func Run(args []string) {
 		log.Fatalf("op-mix invalid: each of OP_CREATE/UPDATE/DELETE/RENAME must be >= 0 and their sum > 0 (got %+v)", mix)
 	}
 
-	rdb := redis.NewClient(&redis.Options{Addr: addr, PoolSize: workers * 2})
+	rdb := rediscfg.New(rediscfg.Options{Addr: addr, Cluster: cluster, PoolSize: workers * 2})
 	defer rdb.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())

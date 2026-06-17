@@ -47,7 +47,7 @@ func (m OpMix) pick(n uint64) string {
 
 type Worker struct {
 	ID            int
-	RDB           *redis.Client // central Redis (KV + app.events stream)
+	RDB           redis.UniversalClient // central Redis (KV + app.events stream)
 	StreamKey     string
 	StreamMaxLen  int64
 	PipelineDepth int
