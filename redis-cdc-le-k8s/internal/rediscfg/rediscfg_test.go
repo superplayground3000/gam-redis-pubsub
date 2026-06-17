@@ -2,6 +2,7 @@ package rediscfg
 
 import (
 	"context"
+	"os"
 	"testing"
 
 	"github.com/redis/go-redis/v9"
@@ -29,7 +30,25 @@ func TestNewCluster(t *testing.T) {
 	}
 }
 
+func TestNewClusterEmptySeedsFiltered(t *testing.T) {
+	// Trailing comma and whitespace-only entries (common in env vars) must not
+	// inject empty addresses into the seed list.
+	c := New(Options{Addr: "a:6379, ,b:6379,   ,", Cluster: true})
+	defer c.Close()
+	cc, ok := c.(*redis.ClusterClient)
+	if !ok {
+		t.Fatalf("Cluster=true: want *redis.ClusterClient, got %T", c)
+	}
+	opt := cc.Options()
+	if len(opt.Addrs) != 2 || opt.Addrs[0] != "a:6379" || opt.Addrs[1] != "b:6379" {
+		t.Fatalf("empty/whitespace seeds not filtered: %#v", opt.Addrs)
+	}
+}
+
 func TestEnvBool(t *testing.T) {
+	// Ensure the "unset" var is genuinely unset regardless of the ambient
+	// environment, then restore it on cleanup.
+	os.Unsetenv("RDSCFG_UNSET_VAR")
 	if EnvBool("RDSCFG_UNSET_VAR") != false {
 		t.Fatal("unset var should be false")
 	}

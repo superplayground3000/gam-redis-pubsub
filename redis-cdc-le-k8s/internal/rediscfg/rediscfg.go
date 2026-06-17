@@ -31,9 +31,11 @@ type Options struct {
 // redis.UniversalClient.
 func New(opt Options) redis.UniversalClient {
 	if opt.Cluster {
-		seeds := strings.Split(opt.Addr, ",")
-		for i := range seeds {
-			seeds[i] = strings.TrimSpace(seeds[i])
+		var seeds []string
+		for _, s := range strings.Split(opt.Addr, ",") {
+			if s = strings.TrimSpace(s); s != "" {
+				seeds = append(seeds, s)
+			}
 		}
 		return redis.NewClusterClient(&redis.ClusterOptions{Addrs: seeds, PoolSize: opt.PoolSize})
 	}
