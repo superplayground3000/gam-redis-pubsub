@@ -23,12 +23,17 @@ toggle, while leaving existing single-node deployments behavior-identical.
 ## Scope
 
 ### In scope
-- A shared client-construction helper used by all Redis-using components.
+- A shared client-construction helper used by all Redis-using Go components.
 - Cluster support in the four Redis-using workloads: `latency`, `writer`,
   `verifier`, `dashboard`.
 - Dashboard multi-node correctness (cluster-wide `SCAN`, keyspace subscription,
   and `CONFIG SET`).
-- Helm chart wiring of the per-address cluster toggles.
+- Cluster support in the **Redis Connect data plane** — the source
+  (`cdc-forward.yaml`) and sink (`cdc-reverse.yaml`) pipelines, which read/write
+  the same external Redis via redpanda-connect's `redis_streams`/`redis`
+  components (currently hardcoded `kind: simple`).
+- Helm chart wiring of the per-address cluster toggles (Go env/flags + connect
+  `kind`).
 - Unit tests for the new helper; existing tests stay green.
 
 ### Out of scope
@@ -78,6 +83,8 @@ toggle, while leaving existing single-node deployments behavior-identical.
 | `writer` | pipelined `XADD` + `SET`/`DEL`/`EVAL`(rename) | client swap only — `ClusterClient` pipeline auto-splits commands per node; rename keys already hash-tagged |
 | `verifier` | `XADD`/`GET`/`SET`/`EVAL`/`XINFO` (central + region) | client swap only — rename keys hash-tagged |
 | `dashboard` | `SCAN`, keyspace `PSUBSCRIBE`, `CONFIG SET`, per-key `GET` (central + region) | client swap **+ fan-out across masters** |
+| connect source (`cdc-forward`) | `redis_streams` input on central `app.events` | template `kind: simple` → `cluster` |
+| connect sink (`cdc-reverse`) | `redis` `xadd`/`set`/`del`/`eval`(rename) on region | template `kind: simple` → `cluster` |
 
 ### 1. Shared helper: `internal/rediscfg`
 
@@ -176,7 +183,35 @@ Three node-local operations become master fan-outs via `rediscfg.ForEachMaster`:
 In single-node mode `ForEachMaster` runs the closure exactly once against the one
 client, so non-cluster dashboards behave exactly as today.
 
-### 5. Chart wiring
+### 5. Redis Connect data plane (source/sink)
+
+The CDC data plane is not Go — it is two redpanda-connect (Benthos) streams
+configs whose Redis components currently hardcode `kind: simple`:
+
+- **source** `files/connect/cdc-forward.yaml:16-18` — `redis_streams` input on the
+  central `app.events` stream (url `rrcs.redis.central.url`).
+- **sink** `files/connect/cdc-reverse.yaml:56-103` — four `redis` processors
+  (`xadd` to the region `cdc:latency` stream, `set`, `del`, `eval` rename) on the
+  region Redis (url `rrcs.redis.region.url`).
+
+redpanda-connect's Redis components accept `kind: simple | cluster | failover`;
+`simple` against a cluster hits the same `MOVED` redirect. The fix is to template
+the `kind` field from the same per-address toggle:
+
+- source → central toggle (`redis.central.external.cluster`).
+- sink (all four processors) → region toggle (`redis.region.external.cluster`).
+
+The `url` is unchanged — a single seed URL is sufficient; the connector's cluster
+mode discovers the rest. The `eval` rename stays single-slot via the existing
+hash tags (§Background), so no `CROSSSLOT`. Only the `cdc` profile exists
+(`values.yaml:3`), so only `cdc-forward.yaml`/`cdc-reverse.yaml` change; the
+templating keys off `.Values.profile` as today.
+
+**Unaffected:** the `redis-cli ... ping` readiness init-containers in
+`writer.yaml`, `connect-source.yaml`, and `connect-sink.yaml` — `PING` is not
+slot-routed and succeeds against any cluster seed node, so they need no change.
+
+### 6. Chart wiring
 
 The chart already models an externally-provided Redis under
 `redis.{central,region}.external` (`enabled` + `url`), and every component's
@@ -212,18 +247,27 @@ Wiring:
   `.Values.redis.region.external.cluster`.
 - `chart/templates/verifier-job.yaml` — add `-redis-central-cluster=` /
   `-redis-region-cluster=` args from the same two values.
-- The address envs/flags are **unchanged** — they keep using the existing
-  `rrcs.redis.*.hostPort` helpers, which now resolve to the external cluster's
-  seed `host:port` when `external.enabled=true`.
+- `files/connect/cdc-forward.yaml` — `kind:` (source) from the central toggle;
+  `files/connect/cdc-reverse.yaml` — `kind:` on all four `redis` processors from
+  the region toggle (§5).
+- The address envs/flags/URLs are **unchanged** — they keep using the existing
+  `rrcs.redis.*.hostPort` / `rrcs.redis.*.url` helpers, which resolve to the
+  external cluster's seed when `external.enabled=true`.
 
-**Fail-closed guard:** setting `external.cluster=true` while `external.enabled=false`
-points a `ClusterClient` at the bundled single-node Redis, which fails on
-`CLUSTER SLOTS`. A new helper `rrcs.redis.{central,region}.cluster` resolves the
-cluster bool and `fail`s with a clear message when `cluster=true` but
-`enabled=false`. Templates source the toggle through this helper (mirroring the
-existing `rediss://`-rejection guard in the `hostPort` helpers) rather than
-reading the value directly, so the misconfiguration is caught at
-`helm template`/install time instead of crash-looping the pod.
+**Helpers (single source of truth + fail-closed guard):** setting
+`external.cluster=true` while `external.enabled=false` points a cluster client at
+the bundled single-node Redis, which fails on `CLUSTER SLOTS`. Two new helpers
+encapsulate the toggle and `fail` with a clear message in that case:
+- `rrcs.redis.{central,region}.cluster` → `"true"`/`"false"` for the Go
+  components' env/flags.
+- `rrcs.redis.{central,region}.connectKind` → `"cluster"`/`"simple"` for the
+  connect configs (wraps the same guarded bool).
+
+Templates source the toggle through these helpers (mirroring the existing
+`rediss://`-rejection guard in the `hostPort` helpers) rather than reading the
+value directly, so the misconfiguration is caught at `helm template`/install time
+instead of crash-looping the pod. The Go components parse their `*_CLUSTER` env
+as a bool (`strconv.ParseBool`).
 
 The chart does not deploy a clustered Redis; documented in the values comments.
 
@@ -262,11 +306,13 @@ Modified (Go):
 - `internal/dashboard/main.go`
 
 Modified (chart):
-- `chart/templates/_helpers.tpl` — new `rrcs.redis.{central,region}.cluster`
-  helpers (resolve the cluster bool; fail-closed when `cluster=true` &
-  `enabled=false`)
+- `chart/templates/_helpers.tpl` — new `rrcs.redis.{central,region}.cluster` and
+  `rrcs.redis.{central,region}.connectKind` helpers (resolve the cluster toggle;
+  fail-closed when `cluster=true` & `enabled=false`)
 - `chart/templates/latency-calculator.yaml`
 - `chart/templates/writer.yaml`
 - `chart/templates/dashboard.yaml`
 - `chart/templates/verifier-job.yaml`
+- `chart/files/connect/cdc-forward.yaml` — source `redis_streams` `kind`
+- `chart/files/connect/cdc-reverse.yaml` — sink `redis` processors `kind`
 - `chart/values.yaml` — add `redis.{central,region}.external.cluster: false`
