@@ -41,6 +41,8 @@ spec:
           env:
             - name: REDIS_ADDR
               value: {{ include "rrcs.redis.central.hostPort" . | quote }}
+            - name: REDIS_CLUSTER
+              value: {{ include "rrcs.redis.central.cluster" . | quote }}
             - name: STREAM_KEY
               value: "app.events"
             - name: INITIAL_RATE

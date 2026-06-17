@@ -30,6 +30,8 @@ spec:
             - --epoch={{ .Values.verifier.epoch }}
             - --redis-central={{ include "rrcs.redis.central.hostPort" . }}
             - --redis-region={{ include "rrcs.redis.region.hostPort" . }}
+            - --redis-central-cluster={{ include "rrcs.redis.central.cluster" . }}
+            - --redis-region-cluster={{ include "rrcs.redis.region.cluster" . }}
             - --nats={{ include "rrcs.nats.monitorUrl" . }}
             - --nats-stream={{ .Values.nats.stream.name }}
             - --nats-consumer={{ .Values.nats.stream.consumer.durable }}

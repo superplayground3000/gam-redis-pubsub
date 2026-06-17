@@ -25,6 +25,8 @@ spec:
           env:
             - name: REGION_ADDR
               value: {{ include "rrcs.redis.region.hostPort" . | quote }}
+            - name: REGION_CLUSTER
+              value: {{ include "rrcs.redis.region.cluster" . | quote }}
             - name: STREAM
               value: {{ .Values.latencyCalculator.stream | quote }}
             - name: WINDOW_SEC

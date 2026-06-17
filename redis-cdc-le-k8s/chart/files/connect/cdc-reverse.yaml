@@ -55,7 +55,7 @@ pipeline:
                       processors:
                         - redis:
                             url: {{ include "rrcs.redis.region.url" . }}
-                            kind: simple
+                            kind: {{ include "rrcs.redis.region.connectKind" . }}
                             command: xadd
                             args_mapping: |
                               root = [
@@ -73,7 +73,7 @@ pipeline:
             # Authoritative apply. NOT wrapped — a SET failure must nack/redeliver.
             - redis:
                 url: {{ include "rrcs.redis.region.url" . }}
-                kind: simple
+                kind: {{ include "rrcs.redis.region.connectKind" . }}
                 command: set
                 args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
             - metric:
@@ -85,7 +85,7 @@ pipeline:
           processors:
             - redis:
                 url: {{ include "rrcs.redis.region.url" . }}
-                kind: simple
+                kind: {{ include "rrcs.redis.region.connectKind" . }}
                 command: del
                 args_mapping: 'root = [ meta("kv_key") ]'
             - metric:
@@ -97,7 +97,7 @@ pipeline:
           processors:
             - redis:
                 url: {{ include "rrcs.redis.region.url" . }}
-                kind: simple
+                kind: {{ include "rrcs.redis.region.connectKind" . }}
                 command: eval
                 args_mapping: |
                   let script = {{ .Files.Get "files/connect/cdc_rename.lua" | toJson }}

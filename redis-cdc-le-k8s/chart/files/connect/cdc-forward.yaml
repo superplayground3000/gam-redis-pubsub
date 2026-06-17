@@ -15,7 +15,7 @@ input:
   label: redis_source
   redis_streams:
     url: {{ include "rrcs.redis.central.url" . }}
-    kind: simple
+    kind: {{ include "rrcs.redis.central.connectKind" . }}
     streams:
       - app.events
     consumer_group: cdc_propagator

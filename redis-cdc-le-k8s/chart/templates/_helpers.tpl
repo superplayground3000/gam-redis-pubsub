@@ -130,6 +130,48 @@ follow-up that wires writer/verifier auth (spec §2 non-goal).
 {{- end -}}
 
 {{/*
+rrcs.redis.{central,region}.cluster — "true"/"false" for the Go components'
+*_CLUSTER env and the verifier's -redis-*-cluster flags. Fail-closed:
+cluster=true requires external.enabled=true, because a ClusterClient pointed at
+the bundled single-node Redis errors on CLUSTER SLOTS. Caught at template time
+rather than crash-looping the pod (mirrors the rediss:// guard above).
+*/}}
+{{- define "rrcs.redis.central.cluster" -}}
+{{- if .Values.redis.central.external.cluster -}}
+{{- if not .Values.redis.central.external.enabled -}}
+{{- fail "redis.central.external.cluster=true requires redis.central.external.enabled=true (cluster mode applies only to an external Redis Cluster; the bundled redis-central is single-node)." -}}
+{{- end -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{- define "rrcs.redis.region.cluster" -}}
+{{- if .Values.redis.region.external.cluster -}}
+{{- if not .Values.redis.region.external.enabled -}}
+{{- fail "redis.region.external.cluster=true requires redis.region.external.enabled=true (cluster mode applies only to an external Redis Cluster; the bundled redis-region is single-node)." -}}
+{{- end -}}
+true
+{{- else -}}
+false
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.redis.{central,region}.connectKind — "cluster"/"simple" for the redpanda-
+connect redis components. Wraps the guarded .cluster helper so the toggle has one
+source of truth.
+*/}}
+{{- define "rrcs.redis.central.connectKind" -}}
+{{- if eq (include "rrcs.redis.central.cluster" .) "true" -}}cluster{{- else -}}simple{{- end -}}
+{{- end -}}
+
+{{- define "rrcs.redis.region.connectKind" -}}
+{{- if eq (include "rrcs.redis.region.cluster" .) "true" -}}cluster{{- else -}}simple{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.nats.credsSecret.{publisher,subscriber,admin} — Secret name to mount.
 Bundled: the chart-rendered Secret name from values. External: user-supplied
 Secret name (may be empty for admin, in which case purge is skipped).
