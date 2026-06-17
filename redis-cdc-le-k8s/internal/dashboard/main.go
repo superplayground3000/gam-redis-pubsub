@@ -20,6 +20,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/redis/go-redis/v9"
+
+	"redis-cdc-le-k8s/internal/rediscfg"
 )
 
 //go:embed static/index.html
@@ -81,8 +83,8 @@ func Run(args []string) {
 	listen := getenv("LISTEN_ADDR", ":8080")
 	scanMatch := getenv("SCAN_MATCH", "lb:*")
 
-	central := redis.NewClient(&redis.Options{Addr: centralAddr})
-	region := redis.NewClient(&redis.Options{Addr: regionAddr})
+	central := rediscfg.New(rediscfg.Options{Addr: centralAddr, Cluster: rediscfg.EnvBool("CENTRAL_CLUSTER")})
+	region := rediscfg.New(rediscfg.Options{Addr: regionAddr, Cluster: rediscfg.EnvBool("REGION_CLUSTER")})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -92,7 +94,11 @@ func Run(args []string) {
 		}
 		time.Sleep(time.Second)
 	}
-	_ = region.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err()
+	// Enable keyspace notifications on every region master — in cluster mode each
+	// node must be configured (and later subscribed) independently.
+	_ = rediscfg.ForEachMaster(ctx, region, func(ctx context.Context, shard *redis.Client) error {
+		return shard.ConfigSet(ctx, "notify-keyspace-events", "KEA").Err()
+	})
 
 	h := newHub()
 	var wg sync.WaitGroup
@@ -144,8 +150,24 @@ func Run(args []string) {
 	_ = central.Close()
 }
 
-// subscribeChanges streams region key changes (set/del) to the browser.
-func subscribeChanges(ctx context.Context, c *redis.Client, h *hub) {
+// subscribeChanges streams region key changes (set/del) to the browser. In
+// cluster mode keyspace events fire only on the node owning each key, so it
+// subscribes on every master; in single-node mode ForEachMaster runs the pump
+// once against the one client (identical to the previous behavior).
+func subscribeChanges(ctx context.Context, c redis.UniversalClient, h *hub) {
+	_ = rediscfg.ForEachMaster(ctx, c, func(ctx context.Context, shard *redis.Client) error {
+		// Start the pump and return immediately: a blocking read here would
+		// prevent ForEachMaster from returning across the other masters.
+		go pumpKeyevents(ctx, shard, h)
+		return nil
+	})
+	// Preserve the prior contract that this call blocks until shutdown so the
+	// caller's WaitGroup tracks the subscription's lifetime.
+	<-ctx.Done()
+}
+
+// pumpKeyevents forwards one master's set/del keyspace events to the hub.
+func pumpKeyevents(ctx context.Context, c *redis.Client, h *hub) {
 	sub := c.PSubscribe(ctx, "__keyevent@0__:set", "__keyevent@0__:del")
 	defer func() { _ = sub.Close() }()
 	ch := sub.Channel()
@@ -167,6 +189,9 @@ func subscribeChanges(ctx context.Context, c *redis.Client, h *hub) {
 			}
 			val := ""
 			if op == "set" {
+				// In steady state the key lives on this master, so Get on the shard
+				// client resolves without a redirect; during slot migration the key
+				// may have moved and the Get can miss (value stays empty, tolerated).
 				val, _ = c.Get(ctx, key).Result()
 			}
 			b, _ := json.Marshal(map[string]any{
@@ -177,29 +202,40 @@ func subscribeChanges(ctx context.Context, c *redis.Client, h *hub) {
 	}
 }
 
-// scanAll loads every key matching pattern and its string value into a map.
-func scanAll(ctx context.Context, c *redis.Client, match string) map[string]string {
+// scanAll loads every key matching pattern and its string value into a map. In
+// cluster mode SCAN only covers the connected node, so it scans every master and
+// merges the results; in single-node mode ForEachMaster runs once. In steady
+// state per-key GET on the owning shard resolves without a redirect (during slot
+// migration a key may have moved and the GET can miss). Partial results are
+// returned on error (graceful degradation, matching the previous behavior).
+func scanAll(ctx context.Context, c redis.UniversalClient, match string) map[string]string {
 	out := map[string]string{}
-	var cursor uint64
-	for {
-		keys, cur, err := c.Scan(ctx, cursor, match, 500).Result()
-		if err != nil {
-			return out
-		}
-		for _, k := range keys {
-			if v, err := c.Get(ctx, k).Result(); err == nil {
-				out[k] = v
+	var mu sync.Mutex
+	_ = rediscfg.ForEachMaster(ctx, c, func(ctx context.Context, shard *redis.Client) error {
+		var cursor uint64
+		for {
+			keys, cur, err := shard.Scan(ctx, cursor, match, 500).Result()
+			if err != nil {
+				return err
+			}
+			for _, k := range keys {
+				if v, err := shard.Get(ctx, k).Result(); err == nil {
+					mu.Lock()
+					out[k] = v
+					mu.Unlock()
+				}
+			}
+			cursor = cur
+			if cursor == 0 {
+				break
 			}
 		}
-		cursor = cur
-		if cursor == 0 {
-			break
-		}
-	}
+		return nil
+	})
 	return out
 }
 
-func pollLoop(ctx context.Context, central, region *redis.Client, writerURL, sinkURL, match string, h *hub) {
+func pollLoop(ctx context.Context, central, region redis.UniversalClient, writerURL, sinkURL, match string, h *hub) {
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
 	for {
