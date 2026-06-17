@@ -88,7 +88,9 @@ fan out across shards.
 package rediscfg
 
 type Options struct {
-    Addr     string // host:port; comma-separated seed nodes allowed in cluster mode
+    Addr     string // host:port. Comma-separated seed nodes are accepted in
+                     // cluster mode, but the chart supplies a single seed (the
+                     // ClusterClient discovers the rest via CLUSTER SLOTS).
     Cluster  bool
     PoolSize int    // optional; 0 = library default (writer sets workers*2)
 }
@@ -142,9 +144,10 @@ Each component changes its client field/variable type from `*redis.Client` to
 
 ### 3. Selection — explicit per-address toggle
 
-A boolean toggle per address; no startup probe. Existing addr variables accept
-comma-separated cluster seed nodes (a single seed also works — the client
-discovers the rest via `CLUSTER SLOTS`).
+A boolean toggle per address; no startup probe. The address passed to each
+component is the existing single seed `host:port` from the chart's external-Redis
+URL; the client discovers the remaining nodes via `CLUSTER SLOTS`. (`rediscfg`
+also accepts comma-separated seeds, but the chart supplies one — see §5.)
 
 | Component | Cluster toggle | Address var |
 |---|---|---|
@@ -175,21 +178,54 @@ client, so non-cluster dashboards behave exactly as today.
 
 ### 5. Chart wiring
 
-Add the cluster toggles, sourced from `values.yaml` (default `false`):
+The chart already models an externally-provided Redis under
+`redis.{central,region}.external` (`enabled` + `url`), and every component's
+address is derived from that block via the `rrcs.redis.{central,region}.hostPort`
+helpers (`chart/templates/_helpers.tpl:116-130`). Cluster mode is only meaningful
+against such an external cluster — the bundled `redis-central`/`redis-region`
+deployments are single-node and stay that way. The cluster flag is therefore
+nested **inside the existing external block**, so it is structurally tied to the
+`url` that points at the cluster:
 
-- `chart/templates/latency-calculator.yaml` — `REGION_CLUSTER`.
-- `chart/templates/writer.yaml` — `REDIS_CLUSTER`.
-- `chart/templates/dashboard.yaml` — `CENTRAL_CLUSTER`, `REGION_CLUSTER`.
-- `chart/templates/verifier-job.yaml` — `-redis-central-cluster` /
-  `-redis-region-cluster` args.
-- `chart/values.yaml` — a `redisCluster` map holding per-address booleans
-  (`redisCluster.central`, `redisCluster.region`), each defaulting to `false`.
-  `writer` reads `redisCluster.central`; `latency` reads `redisCluster.region`;
-  `dashboard` and `verifier` each read both.
+```yaml
+# chart/values.yaml
+redis:
+  central:
+    external:
+      enabled: false
+      url: ""        # e.g. "redis://cluster-seed.central.svc:6379" (one seed node)
+      cluster: false # NEW: route to this URL with a ClusterClient
+  region:
+    external:
+      enabled: false
+      url: ""
+      cluster: false # NEW
+```
 
-The chart does not deploy a clustered Redis; the toggles point at an external
-cluster. `redis-central`/`redis-region` remain single-node. This is documented in
-the chart values comments.
+Wiring:
+- `chart/templates/latency-calculator.yaml` — add `REGION_CLUSTER` env =
+  `.Values.redis.region.external.cluster`.
+- `chart/templates/writer.yaml` — add `REDIS_CLUSTER` env =
+  `.Values.redis.central.external.cluster` (the writer's `REDIS_ADDR` is central).
+- `chart/templates/dashboard.yaml` — add `CENTRAL_CLUSTER` =
+  `.Values.redis.central.external.cluster` and `REGION_CLUSTER` =
+  `.Values.redis.region.external.cluster`.
+- `chart/templates/verifier-job.yaml` — add `-redis-central-cluster=` /
+  `-redis-region-cluster=` args from the same two values.
+- The address envs/flags are **unchanged** — they keep using the existing
+  `rrcs.redis.*.hostPort` helpers, which now resolve to the external cluster's
+  seed `host:port` when `external.enabled=true`.
+
+**Fail-closed guard:** setting `external.cluster=true` while `external.enabled=false`
+points a `ClusterClient` at the bundled single-node Redis, which fails on
+`CLUSTER SLOTS`. A new helper `rrcs.redis.{central,region}.cluster` resolves the
+cluster bool and `fail`s with a clear message when `cluster=true` but
+`enabled=false`. Templates source the toggle through this helper (mirroring the
+existing `rediss://`-rejection guard in the `hostPort` helpers) rather than
+reading the value directly, so the misconfiguration is caught at
+`helm template`/install time instead of crash-looping the pod.
+
+The chart does not deploy a clustered Redis; documented in the values comments.
 
 ## Error handling
 
@@ -226,8 +262,11 @@ Modified (Go):
 - `internal/dashboard/main.go`
 
 Modified (chart):
+- `chart/templates/_helpers.tpl` — new `rrcs.redis.{central,region}.cluster`
+  helpers (resolve the cluster bool; fail-closed when `cluster=true` &
+  `enabled=false`)
 - `chart/templates/latency-calculator.yaml`
 - `chart/templates/writer.yaml`
 - `chart/templates/dashboard.yaml`
 - `chart/templates/verifier-job.yaml`
-- `chart/values.yaml`
+- `chart/values.yaml` — add `redis.{central,region}.external.cluster: false`
