@@ -11,7 +11,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/redis/go-redis/v9"
+	"redis-cdc-le-k8s/internal/rediscfg"
 )
 
 func env(k, def string) string {
@@ -33,6 +33,7 @@ func envInt(k string, def int) int {
 
 func Run(args []string) {
 	addr := env("REGION_ADDR", "redis-region:6379")
+	cluster := rediscfg.EnvBool("REGION_CLUSTER")
 	stream := env("STREAM", "cdc:latency")
 	windowSec := envInt("WINDOW_SEC", 60)
 	intervalSec := envInt("INTERVAL_SEC", 10)
@@ -41,7 +42,7 @@ func Run(args []string) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	rdb := redis.NewClient(&redis.Options{Addr: addr})
+	rdb := rediscfg.New(rediscfg.Options{Addr: addr, Cluster: cluster})
 	defer rdb.Close()
 
 	cons := NewConsumer(rdb, stream)
