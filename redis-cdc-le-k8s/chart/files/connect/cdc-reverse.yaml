@@ -63,7 +63,12 @@ pipeline:
                                 "MAXLEN", "~", {{ .Values.latencyCalculator.streamMaxLen | quote }}, "*",
                                 "op", meta("op"),
                                 "kv_key", meta("kv_key"),
-                                "writer_ts", meta("body").parse_json().ts.string(),
+                                # parse_json() decodes the JSON number `ts` as a
+                              # float64; .string() on it would emit scientific
+                              # notation (e.g. 1.78e+12) that downstream int
+                              # parsers reject. .int64() coerces back to the
+                              # integer epoch-millis the writer encoded.
+                              "writer_ts", meta("body").parse_json().ts.int64().string(),
                                 "sink_ts", now().ts_unix_milli().string()
                               ]
             - catch:
