@@ -31,7 +31,7 @@ func TestEventValuesOrder(t *testing.T) {
 // address with a short deadline yields a dial/timeout error whose text does NOT
 // contain "no such key", exercising the propagate branch.
 func TestGroupLagFailsClosed(t *testing.T) {
-	c := NewRedisClient("127.0.0.1:1") // reserved, refuses connections
+	c := NewRedisClient("127.0.0.1:1", false) // reserved, refuses connections
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()

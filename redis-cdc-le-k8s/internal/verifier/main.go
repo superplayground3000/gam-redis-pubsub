@@ -15,6 +15,8 @@ func Run(args []string) {
 	epoch := fs.String("epoch", "", "unique per-run epoch token (required)")
 	central := fs.String("redis-central", "redis-central:6379", "central Redis host:port")
 	region := fs.String("redis-region", "redis-region:6379", "region Redis host:port")
+	centralCluster := fs.Bool("redis-central-cluster", false, "treat --redis-central as a Redis Cluster seed")
+	regionCluster := fs.Bool("redis-region-cluster", false, "treat --redis-region as a Redis Cluster seed")
 	natsURL := fs.String("nats", "http://nats:8222", "NATS monitoring URL")
 	stream := fs.String("nats-stream", "KV_CDC", "JetStream stream name")
 	// --nats-consumer is accepted (the verifier Job passes --nats-consumer=cdc_sink)
@@ -33,9 +35,9 @@ func Run(args []string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	centralC := NewRedisClient(*central)
+	centralC := NewRedisClient(*central, *centralCluster)
 	defer centralC.Close()
-	regionC := NewRedisClient(*region)
+	regionC := NewRedisClient(*region, *regionCluster)
 	defer regionC.Close()
 
 	checks := &Checks{Central: centralC, Region: regionC, NatsURL: *natsURL, Stream: *stream, SourceGroup: *sourceGroup, Quiesce: *quiesce}

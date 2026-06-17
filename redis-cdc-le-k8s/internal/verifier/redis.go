@@ -8,12 +8,14 @@ import (
 	"time"
 
 	"github.com/redis/go-redis/v9"
+
+	"redis-cdc-le-k8s/internal/rediscfg"
 )
 
-type RedisClient struct{ rdb *redis.Client }
+type RedisClient struct{ rdb redis.UniversalClient }
 
-func NewRedisClient(addr string) *RedisClient {
-	return &RedisClient{rdb: redis.NewClient(&redis.Options{Addr: addr})}
+func NewRedisClient(addr string, cluster bool) *RedisClient {
+	return &RedisClient{rdb: rediscfg.New(rediscfg.Options{Addr: addr, Cluster: cluster})}
 }
 func (c *RedisClient) Close() error { return c.rdb.Close() }
 
