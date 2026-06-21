@@ -12,6 +12,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/signal"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -202,6 +203,21 @@ func pumpKeyevents(ctx context.Context, c *redis.Client, h *hub) {
 	}
 }
 
+// serializeHash renders a hash as a canonical "k=v" string (fields sorted) so the
+// central/region divergence comparison is order-independent and stable.
+func serializeHash(m map[string]string) string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	parts := make([]string, 0, len(m))
+	for _, k := range keys {
+		parts = append(parts, k+"="+m[k])
+	}
+	return "hash:{" + strings.Join(parts, ",") + "}"
+}
+
 // scanAll loads every key matching pattern and its string value into a map. In
 // cluster mode SCAN only covers the connected node, so it scans every master and
 // merges the results; in single-node mode ForEachMaster runs once. In steady
@@ -219,7 +235,19 @@ func scanAll(ctx context.Context, c redis.UniversalClient, match string) map[str
 				return err
 			}
 			for _, k := range keys {
-				if v, err := shard.Get(ctx, k).Result(); err == nil {
+				typ, terr := shard.Type(ctx, k).Result()
+				if terr != nil {
+					continue // key vanished or moved mid-scan; tolerate
+				}
+				if typ == "hash" {
+					if m, herr := shard.HGetAll(ctx, k).Result(); herr == nil && len(m) > 0 {
+						mu.Lock()
+						out[k] = serializeHash(m)
+						mu.Unlock()
+					}
+					continue
+				}
+				if v, gerr := shard.Get(ctx, k).Result(); gerr == nil {
 					mu.Lock()
 					out[k] = v
 					mu.Unlock()

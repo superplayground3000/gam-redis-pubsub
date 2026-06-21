@@ -23,3 +23,14 @@ func TestDivergence(t *testing.T) {
 		t.Fatalf("Divergent=%d want 3", d.Divergent)
 	}
 }
+
+func TestSerializeHashCanonical(t *testing.T) {
+	a := serializeHash(map[string]string{"b": "2", "a": "1"})
+	b := serializeHash(map[string]string{"a": "1", "b": "2"})
+	if a != b {
+		t.Fatalf("serialization must be order-independent: %q vs %q", a, b)
+	}
+	if a != "hash:{a=1,b=2}" {
+		t.Fatalf("unexpected canonical form: %q", a)
+	}
+}
