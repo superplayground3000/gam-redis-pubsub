@@ -69,9 +69,15 @@ func Run(args []string) {
 	}
 	res.RenameParityOK = pok
 
+	hok, err := checks.HashOps(ctx, *epoch)
+	if err != nil {
+		log.Printf("hash-ops error: %v", err)
+	}
+	res.HashOpsOK = hok
+
 	rep := Report{CDC: res, Verdict: ComputeVerdict(res)}
 	b, _ := json.Marshal(rep)
 	fmt.Printf("RESULT_JSON:%s\n", b)
-	log.Printf("verdict.pass=%v reason=%q dedup_delta=%d ops_ok=%v replay_ok=%v rename_parity_ok=%v",
-		rep.Verdict.Pass, rep.Verdict.Reason, res.DedupDelta, res.OpsOK, res.ReplayOK, res.RenameParityOK)
+	log.Printf("verdict.pass=%v reason=%q dedup_delta=%d ops_ok=%v replay_ok=%v rename_parity_ok=%v hash_ops_ok=%v",
+		rep.Verdict.Pass, rep.Verdict.Reason, res.DedupDelta, res.OpsOK, res.ReplayOK, res.RenameParityOK, res.HashOpsOK)
 }
