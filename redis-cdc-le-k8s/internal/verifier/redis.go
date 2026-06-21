@@ -65,6 +65,27 @@ func (c *RedisClient) Set(ctx context.Context, key, val string) error {
 	return c.rdb.Set(ctx, key, val, 0).Err()
 }
 
+// GetHash returns (fields, exists). HGETALL on a missing key yields an empty map;
+// Redis has no empty hashes, so len>0 == exists.
+func (c *RedisClient) GetHash(ctx context.Context, key string) (map[string]string, bool, error) {
+	m, err := c.rdb.HGetAll(ctx, key).Result()
+	if err != nil {
+		return nil, false, err
+	}
+	return m, len(m) > 0, nil
+}
+
+// SetHash merges fields into a hash (HSET), mimicking the writer's authoritative
+// central apply so HashOps can assert central<->region convergence.
+func (c *RedisClient) SetHash(ctx context.Context, key string, fields map[string]string) error {
+	return c.rdb.HSet(ctx, key, fields).Err()
+}
+
+// Del removes a key (string or hash), mimicking the central delete apply.
+func (c *RedisClient) Del(ctx context.Context, key string) error {
+	return c.rdb.Del(ctx, key).Err()
+}
+
 // renamePreserveScript MUST stay identical to chart/files/connect/cdc_rename.lua
 // (the sink) and writer.renamePreserveScript: value-preserving, EXISTS-guarded so
 // a missing old_key is a no-op rather than a "no such key" error.
