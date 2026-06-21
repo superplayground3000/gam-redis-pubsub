@@ -103,7 +103,9 @@ func (w *Worker) buildEvent(seq uint64) Event {
 		key := w.hashKey(id)
 		switch op {
 		case "delete":
-			return NewDeleteEvent(key) // DEL is type-agnostic
+			e := NewDeleteEvent(key) // DEL is type-agnostic; tag as hash so envelope metadata is honest
+			e.Type = "hash"
+			return e
 		case "update":
 			return NewUpdateHashEvent(key, w.hashFields())
 		default: // create
