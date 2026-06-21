@@ -27,6 +27,15 @@ ${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op update kv_key "lb:company:
 # delete an employee
 ${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op delete kv_key "lb:company:active:{employees:${EMP_ID}}" ts "$(ts)" body ''
 
+# create a hash (profile) with multiple fields
+${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op create type hash kv_key "lb:hash:active:{profiles:${ITEM_ID}}" ts "$(ts)" body '{"name":"alice","tier":"free"}'
+
+# merge-update several hash fields at once (name persists, tier overwritten, region added)
+${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op update type hash kv_key "lb:hash:active:{profiles:${ITEM_ID}}" ts "$(ts)" body '{"tier":"pro","region":"apac"}'
+
+# delete the whole hash
+${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op delete type hash kv_key "lb:hash:active:{profiles:${ITEM_ID}}" ts "$(ts)" body ''
+
 # standby->active rename (add-not-enabled-then-enable)
 ${REDIS_CLI} XADD ${STREAM} '*' event_id "$(uuid)" op rename old_key "lb:company:standby:{employees:${EMP_ID}}" new_key "lb:company:active:{employees:${EMP_ID}}" ts "$(ts)" body '{"id":"emp-${EMP_ID}","enabled":true}'
 
