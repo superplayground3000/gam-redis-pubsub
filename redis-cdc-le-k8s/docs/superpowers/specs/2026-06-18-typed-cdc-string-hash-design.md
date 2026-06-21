@@ -196,8 +196,12 @@ same terminal hash state — the dual-write convergence `HashOps` asserts.
 
 - **Unit:** `payload_test.go` (hash constructors set `type=hash`, populate
   `Fields`, body is the field-map JSON, `StreamValues` includes `type`);
-  `worker_test.go` (`applyCentral` issues `HSET` for hash create/update and `DEL`
-  for delete — not `SET`); verifier `redis_test.go` (field list includes `type`).
+  `worker_test.go` (`buildEvent` routes a fraction of traffic to the hash key
+  family with `type=hash`); verifier `redis_test.go` (field list includes `type`);
+  verifier `report_test.go` (`HashOpsOK` gates the verdict); dashboard
+  `divergence_test.go` (`serializeHash` is canonical). No offline Redis double
+  exists, so `applyCentral`'s HSET/DEL and `GetHash/SetHash/Del` are covered E2E
+  by `HashOps` (below), matching the repo's existing test split.
 - **Bloblang shape:** assert the HSET args mapping flattens `{f1:v1,f2:v2}` to
   `[K,f1,v1,f2,v2]` (covered via the verifier `HashOps` end-to-end check; a focused
   Connect mapping test is optional if a harness exists).
