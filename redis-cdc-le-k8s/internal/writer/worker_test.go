@@ -2,6 +2,7 @@
 package writer
 
 import (
+	"encoding/json"
 	"math/rand"
 	"strings"
 	"testing"
@@ -32,6 +33,38 @@ func TestBuildEventOpKeyMapping(t *testing.T) {
 	}
 	if hashTag(e.OldKey) == "" || hashTag(e.OldKey) != hashTag(e.NewKey) {
 		t.Fatalf("rename keys must share a hash tag: %q vs %q", e.OldKey, e.NewKey)
+	}
+}
+
+func TestBuildEventHashFamily(t *testing.T) {
+	w := &Worker{Mix: OpMix{Create: 1}, KeySpaceSize: 100, HashRatio: 1, rng: rand.New(rand.NewSource(1))}
+	e := w.buildEvent(0)
+	if e.Type != "hash" {
+		t.Fatalf("HashRatio=1 create must be a hash event, got type %q", e.Type)
+	}
+	if !strings.Contains(e.KvKey, ":hash:") {
+		t.Fatalf("hash event must use the hash key family, got %q", e.KvKey)
+	}
+	if len(e.Fields) == 0 {
+		t.Fatalf("hash create must populate Fields: %+v", e)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(e.Body), &body); err != nil {
+		t.Fatalf("hash body not JSON: %v", err)
+	}
+	if len(body) != len(e.Fields) {
+		t.Fatalf("Body must equal Fields JSON: body=%v fields=%v", body, e.Fields)
+	}
+}
+
+func TestBuildEventStringWhenHashRatioZero(t *testing.T) {
+	w := &Worker{Mix: OpMix{Create: 1}, KeySpaceSize: 100, HashRatio: 0, rng: rand.New(rand.NewSource(1))}
+	e := w.buildEvent(0)
+	if e.Type != "string" {
+		t.Fatalf("HashRatio=0 must produce string events, got type %q", e.Type)
+	}
+	if !strings.Contains(e.KvKey, ":standby:") {
+		t.Fatalf("string create must target standby, got %q", e.KvKey)
 	}
 }
 

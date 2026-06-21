@@ -3,6 +3,7 @@ package writer
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/rand"
 	"time"
@@ -54,6 +55,7 @@ type Worker struct {
 	PayloadBytes  int
 	KeySpaceSize  int64
 	Mix           OpMix
+	HashRatio     float64 // fraction of non-rename ops routed to the hash key family
 	Lim           *Limiter
 	Counters      *Counters
 	State         *RunState
@@ -75,10 +77,42 @@ type Worker struct {
 // safe no-op. Crucially, `active` is written ONLY by promotion — no create/update
 // ever writes active directly — so a late rename can never roll back a newer active
 // value (there is no independent newer active write to lose).
+// hashKeyFmt is the dedicated hash key family — disjoint from the string
+// standby/active families so a key never changes type (which would WRONGTYPE).
+const hashKeyFmt = "lb:hash:active:{profiles:%d}"
+
+func (w *Worker) hashKey(id int64) string { return fmt.Sprintf(hashKeyFmt, id) }
+
+// hashFields builds a small multi-field hash body; "rev" varies per call so a
+// later update visibly overwrites it while other fields merge.
+func (w *Worker) hashFields() map[string]string {
+	return map[string]string{
+		"name": fmt.Sprintf("profile-%d", w.rng.Int63n(w.KeySpaceSize)),
+		"tier": []string{"free", "pro", "ent"}[w.rng.Intn(3)],
+		"rev":  fmt.Sprintf("%d", w.rng.Int63()),
+	}
+}
+
 func (w *Worker) buildEvent(seq uint64) Event {
+	op := w.Mix.pick(seq)
+	// A fraction of create/update/delete traffic targets the hash family. Rename
+	// stays string-only — it models the standby→active promotion lifecycle, a
+	// string concept; hashes never rename here.
+	if op != "rename" && w.HashRatio > 0 && w.rng.Float64() < w.HashRatio {
+		id := w.rng.Int63n(w.KeySpaceSize)
+		key := w.hashKey(id)
+		switch op {
+		case "delete":
+			return NewDeleteEvent(key) // DEL is type-agnostic
+		case "update":
+			return NewUpdateHashEvent(key, w.hashFields())
+		default: // create
+			return NewCreateHashEvent(key, w.hashFields())
+		}
+	}
 	p := Patterns[w.rng.Intn(len(Patterns))]
 	id := w.rng.Int63n(w.KeySpaceSize)
-	switch w.Mix.pick(seq) {
+	switch op {
 	case "create":
 		return NewCreateEvent(p.StandbyKey(id), w.PayloadBytes)
 	case "update":

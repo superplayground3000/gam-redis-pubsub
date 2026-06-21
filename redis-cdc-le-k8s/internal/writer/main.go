@@ -25,6 +25,7 @@ func Run(args []string) {
 	initialRate := envInt("INITIAL_RATE", 0)
 	keySpaceSize := envInt("KEY_SPACE_SIZE", 1000)
 	payloadBytes := envInt("PAYLOAD_BYTES", 200)
+	hashRatio := envFloat("HASH_RATIO", 0.2)
 	maxRate := envInt("MAX_RATE", 20_000)
 	healthAddr := envStr("HEALTH_ADDR", ":8081")
 	mix := OpMix{
@@ -59,7 +60,7 @@ func Run(args []string) {
 		w := &Worker{
 			ID: i, RDB: rdb, StreamKey: streamKey, StreamMaxLen: int64(streamMaxLen),
 			PipelineDepth: pipelineDepth, PayloadBytes: payloadBytes, KeySpaceSize: int64(keySpaceSize),
-			Mix: mix, Lim: lim, Counters: counters, State: state,
+			Mix: mix, HashRatio: hashRatio, Lim: lim, Counters: counters, State: state,
 		}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.Run(ctx) }()
@@ -109,4 +110,17 @@ func envInt(k string, def int) int {
 		return def
 	}
 	return n
+}
+
+func envFloat(k string, def float64) float64 {
+	v := os.Getenv(k)
+	if v == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(v, 64)
+	if err != nil {
+		log.Printf("WARN: %s=%q not a float, using %g", k, v, def)
+		return def
+	}
+	return f
 }
