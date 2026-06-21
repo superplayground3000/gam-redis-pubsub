@@ -18,7 +18,7 @@ func TestEventValuesOrder(t *testing.T) {
 	for i := 0; i < len(vals); i += 2 {
 		found[vals[i].(string)] = true
 	}
-	for _, k := range []string{"event_id", "op", "kv_key", "old_key", "new_key", "ts", "body"} {
+	for _, k := range []string{"event_id", "op", "type", "kv_key", "old_key", "new_key", "ts", "body"} {
 		if !found[k] {
 			t.Fatalf("missing field %q in %v", k, vals)
 		}

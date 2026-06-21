@@ -23,9 +23,14 @@ func (c *RedisClient) Close() error { return c.rdb.Close() }
 // Always emits the full field set so the source pipeline metadata is consistent.
 func eventValues(f map[string]string) []any {
 	get := func(k string) string { return f[k] }
+	typ := get("type")
+	if typ == "" {
+		typ = "string" // default so emitted envelopes always carry a concrete type
+	}
 	return []any{
 		"event_id", get("event_id"),
 		"op", get("op"),
+		"type", typ,
 		"kv_key", get("kv_key"),
 		"old_key", get("old_key"),
 		"new_key", get("new_key"),
