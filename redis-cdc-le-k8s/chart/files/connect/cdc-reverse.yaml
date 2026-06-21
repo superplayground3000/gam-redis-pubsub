@@ -84,13 +84,12 @@ pipeline:
                         url: {{ include "rrcs.redis.region.url" . }}
                         kind: {{ include "rrcs.redis.region.connectKind" . }}
                         command: hset
-                        # Flatten the JSON field-map body into HSET args:
+                        # Flatten the JSON field-map body into HSET args. Kept on ONE
+                        # line: Bloblang rejects a method chain split across newlines
+                        # inside the .concat( ) call ("expected comma or closing bracket").
                         # key_values() -> [{key,value}]; map_each -> [[k,v]];
                         # flatten -> [k,v,...]; concat prepends the key.
-                        args_mapping: |
-                          root = [ meta("kv_key") ].concat(
-                            meta("body").parse_json().key_values()
-                              .map_each(kv -> [ kv.key, kv.value.string() ]).flatten() )
+                        args_mapping: 'root = [meta("kv_key")].concat(meta("body").parse_json().key_values().map_each(kv -> [kv.key, kv.value.string()]).flatten())'
                 - processors:
                     - redis:
                         url: {{ include "rrcs.redis.region.url" . }}
