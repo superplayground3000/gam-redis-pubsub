@@ -16,6 +16,8 @@ type CDCResult struct {
 	// RenameParityOK: after a value-preserving rename, central and region hold the
 	// same new_key value (dual-write convergence).
 	RenameParityOK bool `json:"rename_parity_ok"`
+	// HashOpsOK: hash create/update merge and delete converged central<->region.
+	HashOpsOK bool `json:"hash_ops_ok"`
 }
 
 type Verdict struct {
@@ -38,6 +40,8 @@ func ComputeVerdict(r CDCResult) Verdict {
 		return Verdict{false, "replay not idempotent: rename re-delivery changed terminal state"}
 	case !r.RenameParityOK:
 		return Verdict{false, "rename parity failed: central and region diverged after a value-preserving rename"}
+	case !r.HashOpsOK:
+		return Verdict{false, "hash ops failed: HSET merge or delete did not converge central<->region"}
 	default:
 		return Verdict{true, ""}
 	}
