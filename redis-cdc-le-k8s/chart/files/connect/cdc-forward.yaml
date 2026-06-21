@@ -37,6 +37,7 @@ pipeline:
         root = {
           "event_id": $eid,
           "op":       meta("op").or("update"),
+          "type":     meta("type").or("string"),
           "kv_key":   meta("kv_key").or(""),
           "old_key":  meta("old_key").or(""),
           "new_key":  meta("new_key").or(""),
