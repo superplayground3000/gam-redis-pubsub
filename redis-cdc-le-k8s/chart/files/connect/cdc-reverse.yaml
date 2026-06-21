@@ -40,6 +40,7 @@ pipeline:
     # later processor (the metric label) or by args_mapping must live in metadata.
     - mapping: |
         meta op      = this.op
+        meta type    = this.type.or("string")
         meta kv_key  = this.kv_key
         meta old_key = this.old_key
         meta new_key = this.new_key
@@ -63,24 +64,45 @@ pipeline:
                                 "MAXLEN", "~", {{ .Values.latencyCalculator.streamMaxLen | quote }}, "*",
                                 "op", meta("op"),
                                 "kv_key", meta("kv_key"),
-                                "writer_ts", meta("body").parse_json().ts.string(),
+                                # parse_json() decodes the JSON number `ts` as a
+                              # float64; .string() on it would emit scientific
+                              # notation (e.g. 1.78e+12) that downstream int
+                              # parsers reject. .int64() coerces back to the
+                              # integer epoch-millis the writer encoded.
+                              "writer_ts", meta("body").parse_json().ts.int64().string(),
                                 "sink_ts", now().ts_unix_milli().string()
                               ]
             - catch:
                 - log:
                     level: WARN
                     message: 'latency xadd failed (best-effort, ignored): ${! error() }'
-            # Authoritative apply. NOT wrapped — a SET failure must nack/redeliver.
-            - redis:
-                url: {{ include "rrcs.redis.region.url" . }}
-                kind: {{ include "rrcs.redis.region.connectKind" . }}
-                command: set
-                args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
+            # Authoritative apply, type-aware. NOT wrapped — a failure must nack/redeliver.
+            - switch:
+                - check: meta("type") == "hash"
+                  processors:
+                    - redis:
+                        url: {{ include "rrcs.redis.region.url" . }}
+                        kind: {{ include "rrcs.redis.region.connectKind" . }}
+                        command: hset
+                        # Flatten the JSON field-map body into HSET args:
+                        # key_values() -> [{key,value}]; map_each -> [[k,v]];
+                        # flatten -> [k,v,...]; concat prepends the key.
+                        args_mapping: |
+                          root = [ meta("kv_key") ].concat(
+                            meta("body").parse_json().key_values()
+                              .map_each(kv -> [ kv.key, kv.value.string() ]).flatten() )
+                - processors:
+                    - redis:
+                        url: {{ include "rrcs.redis.region.url" . }}
+                        kind: {{ include "rrcs.redis.region.connectKind" . }}
+                        command: set
+                        args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
             - metric:
                 type: counter
                 name: cdc_apply
                 labels:
                   op: '${! meta("op") }'
+                  type: '${! meta("type") }'
         - check: meta("op") == "delete"
           processors:
             - redis:
