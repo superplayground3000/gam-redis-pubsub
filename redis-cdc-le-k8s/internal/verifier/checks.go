@@ -215,3 +215,89 @@ func (c *Checks) RenameParity(ctx context.Context, epoch string) (ok bool, err e
 	ok = cok && rok && cv == rv && cv == valOld && !kaCentralEx && rAbsent
 	return
 }
+
+// HashOps exercises the hash path end-to-end. Like RenameParity, it reproduces
+// the writer's authoritative CENTRAL apply (the verifier's emitted events bypass
+// the writer) and asserts the sink's REGION apply converges with it:
+//   create -> central HSET + emit -> central==region=={fields}
+//   update -> central HSET merge + emit -> central==region=={merged superset}
+//   delete -> central DEL + emit -> gone on both sides
+func (c *Checks) HashOps(ctx context.Context, epoch string) (ok bool, err error) {
+	key := fmt.Sprintf("lb:hash:active:{verify-%s-h}", epoch)
+
+	f1 := map[string]string{"name": "alice", "tier": "free"}
+	if err = c.Central.SetHash(ctx, key, f1); err != nil {
+		return
+	}
+	if err = c.emit(ctx, map[string]string{
+		"event_id": "vhc-" + epoch, "op": "create", "type": "hash", "kv_key": key,
+		"body": `{"name":"alice","tier":"free"}`,
+	}); err != nil {
+		return
+	}
+	if ok, err = c.hashParity(ctx, key, f1); err != nil || !ok {
+		return
+	}
+
+	// Merge update: overwrite tier, add region; name must persist (merge).
+	if err = c.Central.SetHash(ctx, key, map[string]string{"tier": "pro", "region": "apac"}); err != nil {
+		return
+	}
+	if err = c.emit(ctx, map[string]string{
+		"event_id": "vhu-" + epoch, "op": "update", "type": "hash", "kv_key": key,
+		"body": `{"tier":"pro","region":"apac"}`,
+	}); err != nil {
+		return
+	}
+	want := map[string]string{"name": "alice", "tier": "pro", "region": "apac"}
+	if ok, err = c.hashParity(ctx, key, want); err != nil || !ok {
+		return
+	}
+
+	// Delete removes the whole hash on both sides.
+	if err = c.Central.Del(ctx, key); err != nil {
+		return
+	}
+	if err = c.emit(ctx, map[string]string{
+		"event_id": "vhd-" + epoch, "op": "delete", "type": "hash", "kv_key": key,
+	}); err != nil {
+		return
+	}
+	_, cEx, e := c.Central.GetHash(ctx, key)
+	if e != nil {
+		err = e
+		return
+	}
+	_, rEx, e := c.Region.GetHash(ctx, key)
+	if e != nil {
+		err = e
+		return
+	}
+	ok = !cEx && !rEx
+	return
+}
+
+// hashParity asserts central AND region both hold exactly want.
+func (c *Checks) hashParity(ctx context.Context, key string, want map[string]string) (bool, error) {
+	cv, _, err := c.Central.GetHash(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	rv, _, err := c.Region.GetHash(ctx, key)
+	if err != nil {
+		return false, err
+	}
+	return mapsEqual(cv, want) && mapsEqual(rv, want), nil
+}
+
+func mapsEqual(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if b[k] != v {
+			return false
+		}
+	}
+	return true
+}
