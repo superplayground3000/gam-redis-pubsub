@@ -107,9 +107,16 @@ return 1`
 func applyCentral(pipe redis.Pipeliner, ctx context.Context, e Event) {
 	switch e.Op {
 	case "create", "update":
-		pipe.Set(ctx, e.KvKey, e.Body, 0)
+		// Type-aware authoritative apply, mirroring the sink. A hash applied as a
+		// SET (or vice versa) would diverge central from region and make GetString
+		// reads hit WRONGTYPE. HSet merges fields (no clearing), like the sink HSET.
+		if e.Type == "hash" {
+			pipe.HSet(ctx, e.KvKey, e.Fields)
+		} else {
+			pipe.Set(ctx, e.KvKey, e.Body, 0)
+		}
 	case "delete":
-		pipe.Del(ctx, e.KvKey)
+		pipe.Del(ctx, e.KvKey) // DEL removes a hash too
 	case "rename":
 		// Value-preserving rename (new_key inherits old_key's central value),
 		// matching the sink. EXISTS-guarded so a missing old_key is a no-op
