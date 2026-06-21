@@ -51,3 +51,50 @@ func TestStreamValuesOrderedSlice(t *testing.T) {
 		t.Fatalf("first field must be event_id, got %v", vals[0])
 	}
 }
+
+func TestStringEventTypeIsString(t *testing.T) {
+	if e := NewCreateEvent("k", 8); e.Type != "string" {
+		t.Fatalf("string event must have type=string, got %q", e.Type)
+	}
+	if e := NewDeleteEvent("k"); e.Type != "string" {
+		t.Fatalf("delete event must have type=string, got %q", e.Type)
+	}
+}
+
+func TestCreateHashEvent(t *testing.T) {
+	fields := map[string]string{"name": "a", "tier": "pro"}
+	e := NewCreateHashEvent("lb:hash:active:{profiles:1}", fields)
+	if e.Op != "create" || e.Type != "hash" {
+		t.Fatalf("bad hash create: %+v", e)
+	}
+	if len(e.Fields) != 2 {
+		t.Fatalf("fields not stored: %+v", e)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(e.Body), &body); err != nil {
+		t.Fatalf("body not JSON: %v", err)
+	}
+	if body["name"] != "a" || body["tier"] != "pro" {
+		t.Fatalf("body must equal field map: %v", body)
+	}
+}
+
+func TestUpdateHashEventOp(t *testing.T) {
+	e := NewUpdateHashEvent("k", map[string]string{"f": "v"})
+	if e.Op != "update" || e.Type != "hash" {
+		t.Fatalf("bad hash update: %+v", e)
+	}
+}
+
+func TestStreamValuesIncludesType(t *testing.T) {
+	vals := NewCreateHashEvent("k", map[string]string{"f": "v"}).StreamValues()
+	found := false
+	for i := 0; i+1 < len(vals); i += 2 {
+		if vals[i] == "type" && vals[i+1] == "hash" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("StreamValues missing type=hash: %v", vals)
+	}
+}
