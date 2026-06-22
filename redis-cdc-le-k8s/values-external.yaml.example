@@ -11,10 +11,11 @@
 # (the sink is never deployed against a broken consumer). It verifies the stream
 # exists, then creates the pull consumer if it is absent. If the consumer already
 # exists the Job validates it and FAILS CLOSED when it is unusable (PUSH, which
-# bind:true cannot attach to) or stale (filter_subject no longer matches the
-# subjectPrefix) — it never mutates your consumer, but it also never reports
-# success while the sink would be broken; fix or delete it and re-run. It
-# authenticates with adminSecret if set,
+# bind:true cannot attach to), stale (filter_subject no longer matches the
+# subjectPrefix), or would weaken at-least-once delivery (ack_policy != explicit,
+# or a max_deliver differing from values that could drop messages) — it never
+# mutates your consumer, but it also never reports success while the sink would
+# be broken; fix or delete it and re-run. It authenticates with adminSecret if set,
 # else subscriberSecret (whose JWT must carry the CONSUMER.*CREATE grants —
 # gen-nats-auth.sh mints them). Auth everywhere is credential-file based (NATS
 # `.creds` / Connect `user_credentials_file`); no user/pass or token path.
