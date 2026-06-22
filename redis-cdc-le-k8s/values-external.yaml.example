@@ -2,16 +2,39 @@
 # NATS JetStream and Redis. Copy to a real values file (NOT committed), fill
 # in your URLs, and pre-create the K8s Secrets referenced below.
 #
+# In external mode the chart's nats-init Job is DISABLED (it is gated on
+# `not .Values.nats.external.enabled`), so the chart never creates your stream
+# OR the durable pull consumer. You must pre-create BOTH yourself — the sink
+# input uses `bind: true`, which only ATTACHES to an existing pull consumer and
+# will fail to start if it is missing. Auth everywhere is credential-file based
+# (NATS `.creds` / Connect `user_credentials_file`); no user/pass or token path.
+#
 # Prerequisites you must satisfy in your external NATS account:
-#   - The stream named by nats.stream.name (default APP_EVENTS) must exist
-#     and bind subjects "<nats.stream.subjectPrefix>.>"
-#     (default "app.events.>").
+#   - The stream named by nats.stream.name (default KV_CDC) must exist and bind
+#     subjects "<nats.stream.subjectPrefix>.>" (default "kv.cdc.>").
+#   - The durable PULL consumer named by nats.stream.consumer.durable (default
+#     cdc_sink) must exist on that stream, filtering "<subjectPrefix>.>".
+#     Create it with the bundled helper using credential-file auth — its
+#     defaults already match nats.stream.* (STREAM=KV_CDC CONSUMER=cdc_sink
+#     FILTER='kv.cdc.>'); override via env if you changed them:
+#       NATS_CLI="nats --server nats://nats.prod.example.com:4222 \
+#         --creds /path/admin.creds" RUN=1 scripts/create-consumer.sh
 #   - The publisher user JWT must allow: pub <subjectPrefix>.> and
-#     pub $JS.API.STREAM.INFO.<stream-name>; sub _INBOX.>
-#   - The subscriber user JWT must allow: pub $JS.ACK.<stream>.<durable>.>,
-#     pub $JS.API.STREAM.INFO.<stream>, and the four narrow consumer subjects
-#     (DURABLE.CREATE, CREATE, CREATE.>, INFO) for stream.durable;
-#     sub _INBOX.>.
+#     pub $JS.API.STREAM.INFO.<stream>; sub _INBOX.>
+#   - The subscriber user JWT. In pull/bind mode the sink only needs to BIND +
+#     fetch + ack, i.e. pub $JS.API.CONSUMER.INFO.<stream>.<durable>,
+#     pub $JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>,
+#     pub $JS.ACK.<stream>.<durable>.>, pub $JS.API.STREAM.INFO.<stream>;
+#     sub _INBOX.>. The bundled generator scripts/gen-nats-auth.sh ALSO grants
+#     the consumer-CREATE subjects ($JS.API.CONSUMER.DURABLE.CREATE.<stream>.
+#     <durable>, $JS.API.CONSUMER.CREATE.<stream>.<durable>[.>]) for back-compat
+#     with non-bind (push) configs — harmless to keep. If you mint your own
+#     creds, mirror that script (the authoritative grant set) rather than this
+#     minimal list, or you may diverge from what the rest of the lab assumes.
+#   - The cred used to RUN create-consumer.sh creates the durable, so it must
+#     allow pub $JS.API.CONSUMER.DURABLE.CREATE.<stream>.<durable> and
+#     pub $JS.API.STREAM.INFO.<stream>. The admin cred below (pub $JS.API.>)
+#     covers this; the gen-nats-auth.sh subscriber's CREATE grants do too.
 #   - (Optional) admin user JWT with pub $JS.API.> for the harness purge.
 #
 # Pre-create the Secrets (keys: user.creds):
@@ -29,7 +52,7 @@ nats:
       subscriberSecret: prod-subscriber-creds
       adminSecret: prod-admin-creds                          # optional; "" skips harness purge
   # stream.subjectPrefix must match the prefix bound into your stream and the
-  # one your publisher creds are authorized to publish on. Default "app.events"
+  # one your publisher creds are authorized to publish on. Default "kv.cdc"
   # works only if your external NATS uses that exact prefix. In external mode
   # the chart does NOT reconcile your stream — changing subjectPrefix here
   # without first updating your stream's bound subjects (and your publisher
