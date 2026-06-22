@@ -1,0 +1,151 @@
+{{- if .Values.nats.external.enabled }}
+{{- /*
+  External-JetStream counterpart of nats-init-job.yaml (which runs only when
+  nats.external.enabled=false). Against an EXTERNAL NATS the chart does NOT own
+  the stream — but the sink still binds (bind:true) to the durable PULL consumer
+  named by nats.stream.consumer.durable, and the nats_jetstream input only
+  ATTACHES, never creates. So this Job ensures a USABLE consumer exists:
+    - verify the user-owned stream is present (fail-closed if not),
+    - create the pull consumer if absent; if it already exists, validate it and
+      fail-closed when it is unusable (PUSH) or stale (wrong filter_subject).
+      We never mutate or delete the user-owned consumer — but we also never
+      report success while leaving one the sink cannot bind to.
+  Credential: nats.external.auth.adminSecret if set, else subscriberSecret
+  (whose JWT must carry $JS.API.CONSUMER.*CREATE grants — gen-nats-auth.sh mints
+  them). create-consumer.sh remains the manual fallback when neither cred can
+  create the consumer.
+*/}}
+{{- $credsSecret := .Values.nats.external.auth.adminSecret | default (include "rrcs.nats.credsSecret.subscriber" .) }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  # Helm HOOK (not a plain manifest). pre-install/pre-upgrade means helm RUNS
+  # this Job and BLOCKS on it before creating/upgrading the sink — so a
+  # fail-closed exit (missing stream, or an unusable/stale consumer) FAILS THE
+  # RELEASE rather than letting a "successful" deploy bring up a sink that can't
+  # bind. (A plain Job wouldn't gate anything: helm reports success while it
+  # retries and fails in the background.) Safe as a hook only in external mode —
+  # the external NATS already exists, so the hook can reach it; the bundled
+  # nats-init Job can't be a hook because its NATS is deployed by the same
+  # release. Stable name + before-hook-creation: helm deletes the prior run by
+  # name on each install/upgrade. No hash needed — hook Jobs aren't part of the
+  # release manifest, so the immutable-completed-Job upgrade failure (which the
+  # bundled Job's hash guards against) does not apply here. A FAILED run is kept
+  # (no hook-failed in the delete policy) for debugging.
+  name: {{ include "rrcs.name" (dict "root" $ "base" "nats-init-ext") }}
+  labels:
+    app: nats-init-ext
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-weight": "0"
+    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 600
+  template:
+    metadata:
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "nats-init-ext") | nindent 8 }}
+    spec:
+      restartPolicy: OnFailure
+      {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
+      {{- include "rrcs.scheduling" . | nindent 6 }}
+      volumes:
+        - name: manage-creds
+          secret:
+            secretName: {{ $credsSecret | quote }}
+            defaultMode: 0444    # Secret is in a per-pod tmpfs; non-root nats-box user needs read access
+      initContainers:
+        - name: wait-nats
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              until nats --server {{ include "rrcs.nats.url" . }} --creds /etc/nats-creds/manage/user.creds rtt >/dev/null 2>&1; do
+                echo "waiting for nats..."; sleep 1;
+              done
+          volumeMounts:
+            - name: manage-creds
+              mountPath: /etc/nats-creds/manage
+              readOnly: true
+      containers:
+        - name: ensure-consumer
+          image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
+          imagePullPolicy: {{ .Values.images.pullPolicy }}
+          command:
+            - /bin/sh
+            - -c
+          args:
+            - |
+              set -e
+              SERVER={{ include "rrcs.nats.url" . | quote }}
+              CREDS="/etc/nats-creds/manage/user.creds"
+              STREAM={{ .Values.nats.stream.name | quote }}
+              CONSUMER={{ .Values.nats.stream.consumer.durable | quote }}
+              FILTER='{{ include "rrcs.nats.stream.subjects" . }}'
+
+              # The external stream is USER-OWNED — the chart never creates or
+              # reconciles it. Fail clearly if it is missing so the operator
+              # provisions it first; the Job's backoffLimit retries until it
+              # appears (creating a consumer on a non-existent stream errors).
+              if ! nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" >/dev/null 2>&1; then
+                echo "ERROR: external stream '$STREAM' not found on $SERVER (or creds lack \$JS.API.STREAM.INFO.$STREAM)." >&2
+                echo "Create the stream first — it must bind subjects '$FILTER'. The chart does NOT reconcile external streams." >&2
+                exit 1
+              fi
+
+              # Pull consumer: create if absent, otherwise VALIDATE. The external
+              # consumer is user-owned, so we never edit or delete it (unlike the
+              # bundled nats-init Job, which fully reconciles its own). But we must
+              # not report success while leaving a consumer the sink cannot use:
+              # if an existing one is PUSH (bind:true can't attach) or has a stale
+              # filter_subject (e.g. after a subjectPrefix change → every event
+              # silently dropped), we FAIL LOUDLY and tell the operator to fix it.
+              if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER" --json >/tmp/cons.json 2>/dev/null; then
+                DELIVER=$(jq -r '.config.deliver_subject // ""' /tmp/cons.json)
+                CUR_FILTER=$(jq -r '.config.filter_subject // ""' /tmp/cons.json)
+                if [ -n "$DELIVER" ]; then
+                  echo "ERROR: consumer '$CONSUMER' on '$STREAM' is PUSH (deliver_subject=$DELIVER); the sink uses bind:true and needs a PULL consumer." >&2
+                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job (or scripts/create-consumer.sh) to recreate it as pull." >&2
+                  exit 1
+                fi
+                if [ "$CUR_FILTER" != "$FILTER" ]; then
+                  echo "ERROR: consumer '$CONSUMER' filter_subject [$CUR_FILTER] != desired [$FILTER] (stale — e.g. nats.stream.subjectPrefix changed). The sink would silently drop every event." >&2
+                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job, or realign the consumer's filter manually." >&2
+                  exit 1
+                fi
+                # Usable PULL consumer bound to the right subjects. Tuning params
+                # (ack_wait / max_ack_pending / max_deliver) still WORK if drifted,
+                # so flag them as a non-fatal hint rather than failing — and never
+                # mutate a user-owned consumer to "fix" them.
+                CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
+                CUR_MAXDELIVER=$(jq -r '.config.max_deliver' /tmp/cons.json)
+                if [ "$CUR_MAXPENDING" != {{ .Values.nats.stream.consumer.maxAckPending | quote }} ] \
+                  || [ "$CUR_MAXDELIVER" != {{ .Values.nats.stream.consumer.maxDeliver | quote }} ]; then
+                  echo "note: consumer '$CONSUMER' tuning differs from values (max_ack_pending=$CUR_MAXPENDING vs {{ .Values.nats.stream.consumer.maxAckPending }}, max_deliver=$CUR_MAXDELIVER vs {{ .Values.nats.stream.consumer.maxDeliver }}); still usable, not changing a user-owned consumer." >&2
+                fi
+                echo "pull consumer '$CONSUMER' already exists on '$STREAM' with the desired filter [$FILTER]; usable"
+              else
+                echo "creating pull consumer '$CONSUMER' (filter [$FILTER]) on external stream '$STREAM'"
+                nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
+                  --pull \
+                  --filter "$FILTER" \
+                  --ack explicit \
+                  --deliver all \
+                  --replay instant \
+                  --wait {{ .Values.nats.stream.consumer.ackWait }} \
+                  --max-pending {{ .Values.nats.stream.consumer.maxAckPending }} \
+                  --max-deliver={{ .Values.nats.stream.consumer.maxDeliver }} \
+                  --defaults
+              fi
+              nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
+          volumeMounts:
+            - name: manage-creds
+              mountPath: /etc/nats-creds/manage
+              readOnly: true
+          resources:
+            {{- toYaml .Values.resources.verifier | nindent 12 }}
+{{- end }}

@@ -2,21 +2,33 @@
 # NATS JetStream and Redis. Copy to a real values file (NOT committed), fill
 # in your URLs, and pre-create the K8s Secrets referenced below.
 #
-# In external mode the chart's nats-init Job is DISABLED (it is gated on
-# `not .Values.nats.external.enabled`), so the chart never creates your stream
-# OR the durable pull consumer. You must pre-create BOTH yourself — the sink
-# input uses `bind: true`, which only ATTACHES to an existing pull consumer and
-# will fail to start if it is missing. Auth everywhere is credential-file based
-# (NATS `.creds` / Connect `user_credentials_file`); no user/pass or token path.
+# In external mode the bundled nats-init Job is DISABLED (gated on
+# `not .Values.nats.external.enabled`), so the chart never creates or reconciles
+# your STREAM — you must pre-create that yourself. The durable PULL consumer the
+# sink binds to (bind:true) IS handled: the chart runs a separate external init
+# Job (templates/nats-init-external-job.yaml) as a pre-install/pre-upgrade Helm
+# HOOK, so helm BLOCKS on it and a failure FAILS the `helm install/upgrade`
+# (the sink is never deployed against a broken consumer). It verifies the stream
+# exists, then creates the pull consumer if it is absent. If the consumer already
+# exists the Job validates it and FAILS CLOSED when it is unusable (PUSH, which
+# bind:true cannot attach to) or stale (filter_subject no longer matches the
+# subjectPrefix) — it never mutates your consumer, but it also never reports
+# success while the sink would be broken; fix or delete it and re-run. It
+# authenticates with adminSecret if set,
+# else subscriberSecret (whose JWT must carry the CONSUMER.*CREATE grants —
+# gen-nats-auth.sh mints them). Auth everywhere is credential-file based (NATS
+# `.creds` / Connect `user_credentials_file`); no user/pass or token path.
 #
 # Prerequisites you must satisfy in your external NATS account:
 #   - The stream named by nats.stream.name (default KV_CDC) must exist and bind
-#     subjects "<nats.stream.subjectPrefix>.>" (default "kv.cdc.>").
+#     subjects "<nats.stream.subjectPrefix>.>" (default "kv.cdc.>"). The external
+#     init Job fail-closes (exits non-zero, backoff-retries) until it exists.
 #   - The durable PULL consumer named by nats.stream.consumer.durable (default
-#     cdc_sink) must exist on that stream, filtering "<subjectPrefix>.>".
-#     Create it with the bundled helper using credential-file auth — its
-#     defaults already match nats.stream.* (STREAM=KV_CDC CONSUMER=cdc_sink
-#     FILTER='kv.cdc.>'); override via env if you changed them:
+#     cdc_sink) is auto-created by the external init Job. You only need to
+#     pre-create it by hand if NEITHER adminSecret nor a CREATE-capable
+#     subscriber is available — then use the bundled helper (credential-file
+#     auth; defaults already match nats.stream.*: STREAM=KV_CDC CONSUMER=cdc_sink
+#     FILTER='kv.cdc.>'; override via env if you changed them):
 #       NATS_CLI="nats --server nats://nats.prod.example.com:4222 \
 #         --creds /path/admin.creds" RUN=1 scripts/create-consumer.sh
 #   - The publisher user JWT must allow: pub <subjectPrefix>.> and
@@ -31,7 +43,8 @@
 #     with non-bind (push) configs — harmless to keep. If you mint your own
 #     creds, mirror that script (the authoritative grant set) rather than this
 #     minimal list, or you may diverge from what the rest of the lab assumes.
-#   - The cred used to RUN create-consumer.sh creates the durable, so it must
+#   - The cred that CREATES the durable — the external init Job's adminSecret
+#     (else subscriberSecret), or whatever you run create-consumer.sh with — must
 #     allow pub $JS.API.CONSUMER.DURABLE.CREATE.<stream>.<durable> and
 #     pub $JS.API.STREAM.INFO.<stream>. The admin cred below (pub $JS.API.>)
 #     covers this; the gen-nats-auth.sh subscriber's CREATE grants do too.
