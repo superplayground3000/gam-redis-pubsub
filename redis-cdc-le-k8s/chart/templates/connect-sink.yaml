@@ -25,7 +25,7 @@ spec:
             - /bin/sh
             - -c
           args:
-            - HP="{{ include "rrcs.redis.region.hostPort" . }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-region; sleep 1; done
+            - {{ include "rrcs.redis.region.waitCmd" . }}
         - name: wait-consumer
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}

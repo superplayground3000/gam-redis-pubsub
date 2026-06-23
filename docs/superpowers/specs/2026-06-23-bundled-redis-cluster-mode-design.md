@@ -24,8 +24,13 @@ in-cluster Redis.
 ## Non-goals
 
 - HA / replicas (0 replicas — the Redis Cluster minimum is 3 masters).
-- Persistence across pod restarts (`cluster-announce` / stable IPs). Ephemeral,
-  lab-style. Pod-IP churn on restart can disrupt the cluster — accepted limitation.
+- Keyspace persistence (`appendonly`/`save` stay off — throwaway lab data).
+- **Surviving a pod delete.** Cluster state (`nodes.conf`) lives in an `emptyDir`,
+  so deleting/rescheduling a node breaks the 0-replica cluster. This is an
+  explicit scope decision: the lab is fresh-install oriented and runs with
+  ephemeral storage (no `StorageClass` dependency). A `helm upgrade` that rolls
+  the pods is handled — the cluster-init hook reforms the cluster — but a bare
+  pod eviction without re-running init is out of scope.
 - External Redis auth / TLS (already deferred per existing spec §2).
 
 ## 1. Values API (`mode` enum)
@@ -85,24 +90,29 @@ that takes `side`; each file becomes a one-line `include`. The template branches
   - **StatefulSet** `redis-<side>`, `replicas: 3`, `serviceName: redis-<side>-hl`.
     redis args add `--cluster-enabled yes --cluster-config-file /data/nodes.conf
     --cluster-node-timeout 5000`, keeping `--protected-mode no --appendonly no
-    --save ""`. `emptyDir` at `/data` (ephemeral). Reuses `rrcs.image`,
-    `rrcs.scheduling`, `rrcs.imagePullSecrets`, `rrcs.podLabels`.
-  - **cluster-init Job** `redis-<side>-init`: waits for the 3 pods to answer
-    `ping`, then `redis-cli --cluster create
-    redis-<side>-0.redis-<side>-hl:6379 …-1… …-2… --cluster-replicas 0
-    --cluster-yes`. Idempotent — skips create if `cluster_state:ok` already
-    (safe on Helm upgrade / hook re-run).
+    --save ""`. `/data` is an **`emptyDir`** (ephemeral — see Non-goals). Reuses
+    `rrcs.image`, `rrcs.scheduling`, `rrcs.imagePullSecrets`, `rrcs.podLabels`.
+  - **cluster-init Job** `redis-<side>-init`, run as a Helm hook
+    (`post-install,post-upgrade`; `hook-delete-policy: before-hook-creation`) so
+    it re-executes safely on upgrade instead of hitting the immutable-Job error.
+    Script: wait for all 3 pods to `ping`; exit 0 if `cluster_state:ok` already;
+    otherwise — first install OR an upgrade that left the ephemeral nodes
+    stale/partial — `flushall` + `cluster reset hard` every node (data is
+    ephemeral; this avoids the "node is not empty" abort that would fail the
+    upgrade), then `redis-cli --cluster create … --cluster-replicas 0
+    --cluster-yes`. Converges from any degraded state rather than erroring.
 
 ## 4. Testing / verification
 
 - **Regression:** `helm template` at defaults → assert zero diff vs current render.
 - **Cluster render:** `helm template --set redis.central.mode=cluster
-  --set redis.region.mode=cluster` → assert per side: StatefulSet(replicas=3) +
-  headless Service + ClusterIP Service + init Job; writer `REDIS_CLUSTER=true`;
-  both connect legs `kind: cluster`; writer `wait-redis-central` uses
-  `cluster_state:ok`.
-- **Invalid mode:** `helm template --set redis.central.mode=bogus` → fails at
-  template time with a clear message.
-- `helm lint` clean.
+  --set redis.region.mode=cluster` → assert per side: StatefulSet(replicas=3,
+  `emptyDir`) + headless Service + ClusterIP Service + init Job (Helm hook);
+  writer `REDIS_CLUSTER=true`; both connect legs `kind: cluster`; all wait sites
+  use `cluster_state:ok`.
+- **Invalid mode / contradiction:** `--set redis.central.mode=bogus` and
+  `--set redis.central.external.cluster=true` (without external.enabled) both
+  fail at template time with clear messages.
+- `helm lint` clean in both modes; full cluster render parses as valid YAML.
 - **Manual (noted, not automated):** kind/k3d deploy to confirm the cluster forms
   and the writer + CDC path connect through `ClusterClient`.
