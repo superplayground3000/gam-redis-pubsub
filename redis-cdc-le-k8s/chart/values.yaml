@@ -42,12 +42,17 @@ redis:
   # password (these are throwaway lab Redises on a private Service, never public).
   protectedMode: "no"
   central:
+    mode: standalone               # bundled topology: standalone | cluster
+                                   #   standalone → single-node Deployment (default)
+                                   #   cluster    → minimal 3-master / 0-replica Redis Cluster
+                                   # ignored when external.enabled=true
     external:
       enabled: false
       url: ""                      # required when enabled, e.g. "redis://redis.prod:6379"
       cluster: false               # route to url with a ClusterClient; requires enabled: true
       authSecret: ""               # RESERVED — v1 does NOT consume it (see spec §2 non-goals)
   region:
+    mode: standalone               # bundled topology: standalone | cluster (see central)
     external:
       enabled: false
       url: ""

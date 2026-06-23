@@ -130,31 +130,71 @@ follow-up that wires writer/verifier auth (spec §2 non-goal).
 {{- end -}}
 
 {{/*
+rrcs.redis.validateMode — fail-closed enum guard for redis.<side>.mode. mode
+selects the bundled topology (standalone single-node vs a minimal 3-master
+cluster) and is ignored when external.enabled=true. Validated unconditionally so
+a typo surfaces at template time rather than as a silent standalone fallback.
+Usage: {{ include "rrcs.redis.validateMode" (dict "side" "central" "mode" .Values.redis.central.mode) }}
+*/}}
+{{- define "rrcs.redis.validateMode" -}}
+{{- if not (has .mode (list "standalone" "cluster")) -}}
+{{- fail (printf "redis.%s.mode=%q is invalid — must be \"standalone\" or \"cluster\"." .side .mode) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.redis.{central,region}.cluster — "true"/"false" for the Go components'
-*_CLUSTER env and the verifier's -redis-*-cluster flags. Fail-closed:
-cluster=true requires external.enabled=true, because a ClusterClient pointed at
-the bundled single-node Redis errors on CLUSTER SLOTS. Caught at template time
-rather than crash-looping the pod (mirrors the rediss:// guard above).
+*_CLUSTER env, the verifier's -redis-*-cluster flags, and connectKind. One
+source of truth for "talk to this Redis as a cluster":
+  external.enabled=true  → external.cluster (the user-supplied Redis is/ isn't a cluster).
+  external.enabled=false → mode=="cluster" (the bundled topology this chart deploys).
+Fail-closed: external.cluster=true with external.enabled=false is a contradiction
+(no external Redis to be a cluster), caught at template time.
 */}}
 {{- define "rrcs.redis.central.cluster" -}}
-{{- if .Values.redis.central.external.cluster -}}
-{{- if not .Values.redis.central.external.enabled -}}
-{{- fail "redis.central.external.cluster=true requires redis.central.external.enabled=true (cluster mode applies only to an external Redis Cluster; the bundled redis-central is single-node)." -}}
-{{- end -}}
-true
+{{- if .Values.redis.central.external.enabled -}}
+{{- if .Values.redis.central.external.cluster -}}true{{- else -}}false{{- end -}}
 {{- else -}}
-false
+{{- if .Values.redis.central.external.cluster -}}
+{{- fail "redis.central.external.cluster=true requires redis.central.external.enabled=true (it describes an external Redis Cluster). For a bundled in-cluster Redis, set redis.central.mode=cluster instead." -}}
+{{- end -}}
+{{- if eq .Values.redis.central.mode "cluster" -}}true{{- else -}}false{{- end -}}
 {{- end -}}
 {{- end -}}
 
 {{- define "rrcs.redis.region.cluster" -}}
-{{- if .Values.redis.region.external.cluster -}}
-{{- if not .Values.redis.region.external.enabled -}}
-{{- fail "redis.region.external.cluster=true requires redis.region.external.enabled=true (cluster mode applies only to an external Redis Cluster; the bundled redis-region is single-node)." -}}
-{{- end -}}
-true
+{{- if .Values.redis.region.external.enabled -}}
+{{- if .Values.redis.region.external.cluster -}}true{{- else -}}false{{- end -}}
 {{- else -}}
-false
+{{- if .Values.redis.region.external.cluster -}}
+{{- fail "redis.region.external.cluster=true requires redis.region.external.enabled=true (it describes an external Redis Cluster). For a bundled in-cluster Redis, set redis.region.mode=cluster instead." -}}
+{{- end -}}
+{{- if eq .Values.redis.region.mode "cluster" -}}true{{- else -}}false{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.redis.{central,region}.waitCmd — the shell line an init container uses to
+block until the Redis is usable. Standalone waits for PONG; cluster waits for
+cluster_state:ok (a freshly-booted cluster node answers PING before the slots
+are assigned, so PONG alone would let clients start too early and hit
+CLUSTERDOWN). Driven by the same .cluster source of truth.
+*/}}
+{{- define "rrcs.redis.central.waitCmd" -}}
+{{- $hp := include "rrcs.redis.central.hostPort" . -}}
+{{- if eq (include "rrcs.redis.central.cluster" .) "true" -}}
+HP="{{ $hp }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" cluster info 2>/dev/null | grep -q cluster_state:ok; do echo waiting redis-central cluster; sleep 1; done
+{{- else -}}
+HP="{{ $hp }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-central; sleep 1; done
+{{- end -}}
+{{- end -}}
+
+{{- define "rrcs.redis.region.waitCmd" -}}
+{{- $hp := include "rrcs.redis.region.hostPort" . -}}
+{{- if eq (include "rrcs.redis.region.cluster" .) "true" -}}
+HP="{{ $hp }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" cluster info 2>/dev/null | grep -q cluster_state:ok; do echo waiting redis-region cluster; sleep 1; done
+{{- else -}}
+HP="{{ $hp }}"; HOST="${HP%%:*}"; PORT="${HP##*:}"; until redis-cli -h "$HOST" -p "$PORT" ping | grep -q PONG; do echo waiting redis-region; sleep 1; done
 {{- end -}}
 {{- end -}}
 
