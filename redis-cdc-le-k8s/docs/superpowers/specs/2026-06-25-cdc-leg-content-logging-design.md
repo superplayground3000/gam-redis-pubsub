@@ -35,6 +35,19 @@ Four `log` processors, two per leg, each emitting **complete** content via
 `fields_mapping` (structured JSON fields, not a single raw string, to match the
 json logger). Each line carries `leg` + `stage` labels for filtering.
 
+**Gated off by default.** The dumped `body` is real application data (an
+exposure risk) and emits one line per message (high log volume), so the
+processors are wrapped in `{{- if .Values.connect.contentLog.enabled }}` and are
+not rendered at all by default. Two new values keys:
+
+- `connect.contentLog.enabled` — `false` by default; `true` renders the four
+  processors.
+- `connect.contentLog.level` — `INFO` by default; the level each content dump
+  logs at when enabled.
+
+Enable with `--set connect.contentLog.enabled=true` for transient data-flow
+debugging; leave off in any shared/long-running deployment.
+
 ### Forward leg (`cdc-forward.yaml`)
 
 1. **`redis_in`** — first processor, *before* the existing `mapping`. Dumps the
@@ -59,7 +72,13 @@ json logger). Each line carries `leg` + `stage` labels for filtering.
 - **Commit-first git flow:** the unrelated uncommitted `internal/latency/stream.go`
   scientific-notation fix was committed to `le-failover-benchmark` first, then
   switched to `master` for this work.
-- **Log level `INFO`** — visible immediately under the existing logger config.
+- **Gated off by default** — code review (Codex stop-time) flagged unconditional
+  INFO full-payload logging as a default data-exposure + log-volume regression.
+  Resolved by gating behind `connect.contentLog.enabled` (default `false`) rather
+  than shipping it always-on.
+- **Log level configurable, default `INFO`** — when enabled, emits at
+  `connect.contentLog.level` (default `INFO`, the level originally chosen), so a
+  single `--set enabled=true` restores immediate visibility.
 - **Full content** — dump everything (all fields + full body), not a key-field
   subset.
 - **`fields_mapping` (structured)** rather than a raw interpolated string, so the
@@ -67,9 +86,11 @@ json logger). Each line carries `leg` + `stage` labels for filtering.
 
 ## Verification
 
-- `helm template chart` renders with rc=0.
-- All four stages (`redis_in`, `nats_out`, `nats_in`, `redis_apply`) appear in the
-  rendered ConfigMap with correct nesting under `pipeline.processors`.
+- `helm template chart` renders with rc=0 in both states.
+- Default (`enabled=false`): 0 content-log stages in the rendered ConfigMaps.
+- `--set connect.contentLog.enabled=true`: all four stages (`redis_in`,
+  `nats_out`, `nats_in`, `redis_apply`) appear with correct nesting under
+  `pipeline.processors`, at `connect.contentLog.level` (verified INFO and DEBUG).
 
 ## Out of scope
 
