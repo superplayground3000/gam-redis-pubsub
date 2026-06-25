@@ -65,9 +65,13 @@ JetStream stream `CDC`, subject `cdc.kv`, durable **pull** consumer `sink` with
 - header `Nats-Msg-Id: <i>` (dedup key, `i ∈ 1..N`),
 - body `{"i": <i>}`.
 
-Connect pipeline (`jetstream pull input, bind:true → sleep(SLEEP_MS) → redis`):
-applies `SET kv:<i> = i` and `INCR applied:<i>`. Controller reconciles the
-`applied:*` ledger against `1..N` plus final consumer state.
+Connect pipeline (`jetstream pull input, bind:true → mapping → sleep → redis`):
+**stashes `i` into metadata first** (`meta i = this.i.string()`) — the `redis`
+processor REPLACES message content with the Redis reply (the parent lab's
+`cdc-reverse.yaml` warning), so after the SET `this` is `"OK"` and `i` is gone;
+both writes must read `meta("i")`. It then applies `SET kv:<i> = i` and
+`INCR applied:<i>` via `args_mapping`. Controller reconciles the `applied:*`
+ledger against `1..N` plus final consumer state.
 
 ## Validation strategy (PASS bar)
 

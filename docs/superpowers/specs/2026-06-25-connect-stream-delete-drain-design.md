@@ -58,12 +58,21 @@ Two distinguishable outcomes for an in-flight message at DELETE time:
   ```
   input:    nats_jetstream { stream: CDC, durable: sink, bind: true }
   pipeline: threads: ${PIPELINE_THREADS}
-            processors: [ sleep { duration: ${SLEEP_MS}ms },
-                          redis { command: set,  args: [kv:<i>, i] },
-                          redis { command: incr, args: [applied:<i>] } ]
+            processors:
+              # STASH i INTO METADATA FIRST. The `redis` processor REPLACES
+              # message content with the Redis reply (see the parent lab's
+              # cdc-reverse.yaml warning), so after the SET below `this` is "OK"
+              # and i is gone — every later processor must read meta("i"), never
+              # this.i. Mirrors the parent lab's "stash to metadata first" rule.
+              - mapping: 'meta i = this.i.string()'
+              - sleep:   { duration: ${SLEEP_MS}ms }
+              - redis:   { command: set,  args_mapping: 'root = [ "kv:" + meta("i"), meta("i") ]' }
+              - redis:   { command: incr, args_mapping: 'root = [ "applied:" + meta("i") ]' }
   output:   reject_errored { drop: {} }
   ```
-  (`i` comes from the `Nats-Msg-Id` / body via Bloblang `meta`/`this`.)
+  `i` is read once from the body (`this.i`) into `meta i` before any `redis`
+  processor runs; both `args_mapping`s derive keys from `meta("i")`. The
+  `Nats-Msg-Id` header still carries `i` independently for JetStream dedup.
 
 ## 5. Experiment sequence (controller)
 
