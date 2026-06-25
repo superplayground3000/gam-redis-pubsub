@@ -23,19 +23,28 @@ cp .env.example .env
 ./scripts/smoke-test.sh          # deterministic profile, asserts verdict PASS
 ```
 
-High-throughput run (DELETE mid-firehose):
+High-throughput run (DELETE mid-firehose, confirmed stably-parked cohort):
 
 ```bash
-# edit .env: PROFILE=throughput MSG_COUNT=20000 PUBLISH_RATE=5000 \
-#            SLEEP_MS=25 PIPELINE_THREADS=8 ARM_INFLIGHT=200
-docker compose run --rm controller
+docker compose run --rm \
+  -e PROFILE=throughput -e MSG_COUNT=20000 -e PUBLISH_RATE=5000 \
+  -e SLEEP_MS=25 -e PIPELINE_THREADS=8 -e ARM_INFLIGHT=200 \
+  -e MAX_ACK_PENDING=1000 -e MIN_INFLIGHT=4 \
+  controller
 ```
+
+`MIN_INFLIGHT=4` with `PIPELINE_THREADS=8` requires at least 4 messages to be
+simultaneously in-flight inside Connect at both the first and confirm poll before
+DELETE fires — proving the DELETE lands over a real multi-message cohort, not a
+transient single message. The confirm-poll delay is `max(20ms, min(SLEEP_MS/4,
+100ms))` = 20ms with `SLEEP_MS=25`, which stays inside the per-message sleep window.
 
 ## Knobs
 
 See `.env.example`. Key ones: `PROFILE`, `MSG_COUNT`, `SLEEP_MS` (in-flight
 window), `PIPELINE_THREADS`, `ACK_WAIT` (redelivery healing), `ARM_FRACTION` /
-`ARM_INFLIGHT` (when DELETE fires).
+`ARM_INFLIGHT` (when DELETE fires), `MIN_INFLIGHT` (cohort size confirmed across
+two polls; default 1 for deterministic, recommend 4 for throughput with threads=8).
 
 ## Ports
 

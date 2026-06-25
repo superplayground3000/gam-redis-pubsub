@@ -140,8 +140,16 @@ PIPELINE_THREADS=1
 ACK_WAIT=5s
 # deterministic: fire DELETE after this fraction of N is applied
 ARM_FRACTION=0.3
-# throughput: fire DELETE when consumer num_ack_pending reaches this
+# throughput: fire DELETE once at least this many messages have been dispatched
+# from NATS into Connect (i.e. NATS undelivered backlog has dropped by ARM_INFLIGHT).
+# Condition: NumPending <= N - ARM_INFLIGHT && num_ack_pending >= MIN_INFLIGHT.
 ARM_INFLIGHT=200
+# Minimum messages that must be simultaneously in-flight inside Connect
+# (num_ack_pending >= MIN_INFLIGHT) — bounded by PIPELINE_THREADS — for a DELETE
+# to count as landing mid-flight. Default 1 works for deterministic (threads=1).
+# For throughput with PIPELINE_THREADS=8, recommend MIN_INFLIGHT=4 so the DELETE
+# provably lands over a real multi-message cohort, not a transient single message.
+MIN_INFLIGHT=1
 # JetStream consumer max_ack_pending bound
 MAX_ACK_PENDING=1000
 # Service addresses (compose-internal DNS)
@@ -308,11 +316,16 @@ type Config struct {
 	ArmFraction     float64
 	ArmInflight     int
 	MaxAckPending   int
-	NATSURL         string
-	RedisAddr       string
-	ConnectAddr     string
-	StreamID        string
-	HealthAddr      string
+	// MinInflight is the minimum number of messages that must be simultaneously
+	// in-flight inside Connect (num_ack_pending) for a DELETE to count as landing
+	// mid-flight. Bounded by PIPELINE_THREADS. Default 1; raise to e.g. 4 with
+	// PIPELINE_THREADS=8 for a stronger throughput proof.
+	MinInflight int
+	NATSURL     string
+	RedisAddr   string
+	ConnectAddr string
+	StreamID    string
+	HealthAddr  string
 }
 
 func LoadConfig(get func(string) string) Config {
@@ -326,6 +339,7 @@ func LoadConfig(get func(string) string) Config {
 		ArmFraction:     flt(get, "ARM_FRACTION", 0.3),
 		ArmInflight:     num(get, "ARM_INFLIGHT", 200),
 		MaxAckPending:   num(get, "MAX_ACK_PENDING", 1000),
+		MinInflight:     num(get, "MIN_INFLIGHT", 1),
 		NATSURL:         str(get, "NATS_URL", "nats://nats:4222"),
 		RedisAddr:       str(get, "REDIS_ADDR", "redis:6379"),
 		ConnectAddr:     str(get, "CONNECT_ADDR", "http://connect:4195"),
@@ -673,6 +687,10 @@ type ArmInput struct {
 	N               int
 	ArmFraction     float64
 	ArmInflight     int
+	// MinInflight is the minimum num_ack_pending required for the arm condition to
+	// fire. Default 1. Raise (e.g. 4) with PIPELINE_THREADS=8 to require a real
+	// multi-message cohort simultaneously in-flight inside Connect.
+	MinInflight     int
 	AppliedDistinct int // count of distinct kv:* keys applied so far
 	NumAckPending   int // consumer delivered-but-not-acked
 	NumPending      int // messages not yet delivered to consumer (NATS backlog)
@@ -681,21 +699,28 @@ type ArmInput struct {
 // Armed reports whether a meaningful in-flight cohort exists to DELETE into.
 //
 // For throughput: fires when the undelivered NATS backlog (NumPending) drops below
-// N-ArmInflight, meaning at least ArmInflight messages have been handed to Connect
-// (delivered or in-progress). This ensures DELETE lands mid-firehose with a large
-// cohort in various stages of processing — achievable regardless of pipeline thread
-// count, unlike NumAckPending which is bounded by the number of pipeline threads.
+// N-ArmInflight (at least ArmInflight messages have been handed to Connect) AND
+// NumAckPending >= MinInflight (a real cohort of at least MinInflight messages is
+// simultaneously inside Connect's pipeline). Using >= MinInflight instead of > 0
+// proves the DELETE lands over a real cohort, not a transient single message.
 //
 // For deterministic: fires when a fraction of messages have been applied and at
-// least one is in-flight (NumAckPending > 0).
+// least MinInflight messages are simultaneously in-flight (NumAckPending >=
+// MinInflight). With the default MinInflight=1 this is identical to the prior
+// NumAckPending > 0 behavior.
 func Armed(in ArmInput) bool {
+	minInFlight := in.MinInflight
+	if minInFlight < 1 {
+		minInFlight = 1
+	}
 	if in.Profile == "throughput" {
 		// NumPending counts messages NATS hasn't yet delivered. When it drops to
 		// N - ArmInflight, at least ArmInflight messages have been dispatched to
-		// Connect — a large cohort is mid-firehose.
-		return in.NumPending <= in.N-in.ArmInflight && in.NumAckPending > 0
+		// Connect — a large cohort is mid-firehose. We also require a real cohort
+		// of >= MinInflight messages inside Connect's pipeline right now.
+		return in.NumPending <= in.N-in.ArmInflight && in.NumAckPending >= minInFlight
 	}
-	return in.NumAckPending > 0 && float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
+	return in.NumAckPending >= minInFlight && float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
 }
 ```
 
@@ -1193,9 +1218,26 @@ func waitConnectReady(ctx context.Context, c *connectClient) error {
 	return fmt.Errorf("connect not ready after 60s")
 }
 
-// armAndDelete polls until the arm predicate fires, snapshots the in-flight cohort
-// (num_ack_pending), then DELETEs the stream. Returns inflight-at-delete.
+// armAndDelete polls until the arm predicate fires, then does a SECOND confirm-poll
+// after a short delay to verify the cohort is still stably parked (not draining
+// away in the gap between the first poll and the DELETE reaching Connect). Only after
+// both polls show NumAckPending >= MinInflight does it fire the DELETE.
+//
+// confirmDelay = max(20ms, min(SLEEP_MS/4, 100ms)) — long enough to detect a
+// draining cohort, short enough to stay inside the sleep window.
+//
+// inflight_at_delete is set from the SECOND (confirm) poll — the value closest
+// to the actual DELETE moment and conservative (may be slightly lower).
 func armAndDelete(ctx context.Context, cfg Config, connect *connectClient, sink *sinkReader, js *jsClient) (int, error) {
+	// Compute confirm-poll delay: SLEEP_MS/4, clamped to [20ms, 100ms].
+	confirmDelay := time.Duration(cfg.SleepMS/4) * time.Millisecond
+	if confirmDelay < 20*time.Millisecond {
+		confirmDelay = 20 * time.Millisecond
+	}
+	if confirmDelay > 100*time.Millisecond {
+		confirmDelay = 100 * time.Millisecond
+	}
+
 	deadline := time.After(2 * time.Minute)
 	tick := time.NewTicker(200 * time.Millisecond)
 	defer tick.Stop()
@@ -1217,16 +1259,50 @@ func armAndDelete(ctx context.Context, cfg Config, connect *connectClient, sink 
 		}
 		in := ArmInput{
 			Profile: cfg.Profile, N: cfg.MsgCount, ArmFraction: cfg.ArmFraction,
-			ArmInflight: cfg.ArmInflight, AppliedDistinct: distinct,
-			NumAckPending: cs.NumAckPending, NumPending: int(cs.NumPending),
+			ArmInflight: cfg.ArmInflight, MinInflight: cfg.MinInflight,
+			AppliedDistinct: distinct,
+			NumAckPending:   cs.NumAckPending, NumPending: int(cs.NumPending),
 		}
-		if Armed(in) {
-			log.Printf("ARMED: distinct=%d num_pending=%d num_ack_pending=%d -> DELETE", distinct, cs.NumPending, cs.NumAckPending)
-			if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
-				return 0, err
-			}
-			return cs.NumAckPending, nil
+		if !Armed(in) {
+			continue
 		}
+
+		// First poll armed. Wait confirmDelay, then confirm the cohort is still
+		// stably parked (not draining away in the gap before DELETE arrives).
+		log.Printf("ARMED (first poll): distinct=%d num_pending=%d num_ack_pending=%d; confirming in %s...",
+			distinct, cs.NumPending, cs.NumAckPending, confirmDelay)
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(confirmDelay):
+		}
+
+		cs2, err := js.consumerState(ctx)
+		if err != nil {
+			return 0, err
+		}
+		// Build confirm input: reuse the same backlog/distinct snapshot (unchanged
+		// during confirmDelay) but refresh NumAckPending/NumPending from cs2.
+		in2 := in
+		in2.NumAckPending = cs2.NumAckPending
+		in2.NumPending = int(cs2.NumPending)
+		if !Armed(in2) {
+			// Cohort drained below MinInflight between first and confirm poll:
+			// the sleep window closed before DELETE would land. Keep polling.
+			log.Printf("CONFIRM FAILED: num_ack_pending dropped to %d (< min_inflight=%d); re-arming...",
+				cs2.NumAckPending, cfg.MinInflight)
+			continue
+		}
+
+		// Confirm poll still shows a parked cohort — fire DELETE immediately.
+		log.Printf("ARMED (confirmed): num_ack_pending=%d (was %d) -> DELETE",
+			cs2.NumAckPending, cs.NumAckPending)
+		if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
+			return 0, err
+		}
+		// Return the SECOND poll's count: closest to the DELETE moment and
+		// conservative (avoids inflating inflight_at_delete with a transient peak).
+		return cs2.NumAckPending, nil
 	}
 }
 

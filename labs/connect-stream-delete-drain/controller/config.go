@@ -15,11 +15,16 @@ type Config struct {
 	ArmFraction     float64
 	ArmInflight     int
 	MaxAckPending   int
-	NATSURL         string
-	RedisAddr       string
-	ConnectAddr     string
-	StreamID        string
-	HealthAddr      string
+	// MinInflight is the minimum number of messages that must be simultaneously
+	// in-flight inside Connect (num_ack_pending) for a DELETE to count as landing
+	// mid-flight. Bounded by PIPELINE_THREADS. Default 1; raise to e.g. 4 with
+	// PIPELINE_THREADS=8 for a stronger throughput proof.
+	MinInflight int
+	NATSURL     string
+	RedisAddr   string
+	ConnectAddr string
+	StreamID    string
+	HealthAddr  string
 }
 
 func LoadConfig(get func(string) string) Config {
@@ -33,6 +38,7 @@ func LoadConfig(get func(string) string) Config {
 		ArmFraction:     flt(get, "ARM_FRACTION", 0.3),
 		ArmInflight:     num(get, "ARM_INFLIGHT", 200),
 		MaxAckPending:   num(get, "MAX_ACK_PENDING", 1000),
+		MinInflight:     num(get, "MIN_INFLIGHT", 1),
 		NATSURL:         str(get, "NATS_URL", "nats://nats:4222"),
 		RedisAddr:       str(get, "REDIS_ADDR", "redis:6379"),
 		ConnectAddr:     str(get, "CONNECT_ADDR", "http://connect:4195"),

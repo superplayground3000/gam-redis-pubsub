@@ -83,9 +83,13 @@ hold:
 2. **Fully drained** — consumer ends `num_pending == 0 && num_ack_pending == 0`,
    stable across 3 consecutive polls (the parent lab's quiescence lesson: never
    trust a single poll — `lag` drops before the ack lands).
-3. **DELETE landed mid-flight** — `num_ack_pending > 0` captured immediately
-   before the DELETE, else the test proved nothing → FAIL as **inconclusive** (no
-   silent pass).
+3. **DELETE landed mid-flight** — `inflight_at_delete >= MIN_INFLIGHT` (default
+   1), confirmed across **two consecutive polls** separated by `confirmDelay =
+   max(20ms, min(SLEEP_MS/4, 100ms))`. Both polls must show `num_ack_pending >=
+   MIN_INFLIGHT`; if the cohort drains between polls the arm loop continues. This
+   proves the cohort is stably parked inside Connect's pipeline right up to the
+   DELETE, not transiently draining. Else the test proved nothing → FAIL as
+   **inconclusive** (no silent pass).
 
 Reported as findings, not failures: duplicate count `Σ(applied:<i> − 1)` and max
 redelivery depth — the quantified at-least-once cost of a mid-flight handover.
@@ -97,7 +101,11 @@ this is a self-contained compose lab. `validate_lab.sh` exit 0 is the gate.
 
 ## Empirical finding
 
-The messages actually held inside Connect's pipeline at any instant (`num_ack_pending`) tracks approximately `pipeline.threads`, because the JetStream pull(bind) input fetches roughly one message per pipeline thread at a time; the rest of the message firehose stays as undelivered backlog in NATS (`num_pending`). So `inflight_at_delete` measures the per-pod in-Connect cohort — the messages "already received" by Connect and squarely in the handover-loss zone — not the whole stream. Both the `deterministic` and `throughput` profiles showed `lost:[]` across runs: Connect drains its received-but-unapplied messages on `DELETE /streams/<id>` rather than dropping them.
+The messages actually held inside Connect's pipeline at any instant (`num_ack_pending`) tracks approximately `pipeline.threads`, because the JetStream pull(bind) input fetches roughly one message per pipeline thread at a time; the rest of the message firehose stays as undelivered backlog in NATS (`num_pending`). So `inflight_at_delete` measures the per-pod in-Connect cohort — the messages "already received" by Connect and squarely in the handover-loss zone — not the whole stream. The bulk of the firehose remains NATS backlog at DELETE time, not in-Connect.
+
+The harness deletes over a cohort of `>= MIN_INFLIGHT` messages that are simultaneously in-flight inside Connect (bounded by `pipeline.threads`), confirmed stably-parked across two consecutive polls before firing DELETE. This rules out the snapshot→DELETE race: the cohort must remain parked through the confirm-poll, not merely pass through `num_ack_pending > 0` transiently. The residual timing caveat — the cohort could start draining in the sub-RTT window between the confirm poll and the DELETE reaching Connect — is closed to the confirm-poll granularity (`confirmDelay = max(20ms, min(SLEEP_MS/4, 100ms))`), which is short relative to the per-message sleep window.
+
+Both the `deterministic` and `throughput` profiles showed `lost:[]` across runs: Connect drains its received-but-unapplied messages on `DELETE /streams/<id>` rather than dropping them.
 
 Note on `max_ack_pending` in the pipeline template: on a `bind: true` pull consumer the consumer was created server-side (by the controller) and the server-side bound already controls flow. The `max_ack_pending` field in the Connect input config is almost certainly inert in this mode — Connect's pull(bind) respects the server-side consumer config, not a client-side override. It is retained in the template for documentary intent (mirroring the consumer's configured bound) but should not be relied on as an effective flow-control knob.
 

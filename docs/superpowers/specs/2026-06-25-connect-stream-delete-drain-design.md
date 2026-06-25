@@ -82,15 +82,18 @@ Two distinguishable outcomes for an in-flight message at DELETE time:
 2. **Publish** `N` messages with `Nats-Msg-Id: 1..N` at `PUBLISH_RATE` (0 =
    burst).
 3. **POST** stream `source_leg` to `connect`.
-4. **Arm & fire** — poll consumer info; when the arm condition holds
-   (`deterministic`: `num_ack_pending > 0 AND applied:* count >= ARM_FRACTION*N`
-   — the `num_ack_pending > 0` guard ensures the DELETE always lands on a real
-   in-flight cohort; `throughput`: `num_pending <= N - ARM_INFLIGHT AND
-   num_ack_pending > 0`, i.e. fire once at least `ARM_INFLIGHT` messages have
-   been dispatched from the NATS backlog into Connect — `num_ack_pending` alone
-   is bounded by `pipeline.threads` and would never reach large values),
-   **capture `num_ack_pending` (= inflight at delete)**, then `DELETE
-   /streams/source_leg`.
+4. **Arm & fire (confirm-poll)** — poll consumer info every 200ms; when the arm
+   condition first holds (`deterministic`: `num_ack_pending >= MIN_INFLIGHT AND
+   applied:* count >= ARM_FRACTION*N`; `throughput`: `num_pending <= N -
+   ARM_INFLIGHT AND num_ack_pending >= MIN_INFLIGHT`, i.e. at least `ARM_INFLIGHT`
+   messages dispatched from NATS into Connect and at least `MIN_INFLIGHT`
+   simultaneously in-flight inside Connect's pipeline), wait
+   `confirmDelay = max(20ms, min(SLEEP_MS/4, 100ms))` then **confirm** with a
+   second poll that `num_ack_pending >= MIN_INFLIGHT` still holds. If the cohort
+   drained below `MIN_INFLIGHT` between the two polls, keep polling (the cohort
+   was transient; wait for the next stable window). Once confirmed, **capture
+   `num_ack_pending` from the SECOND poll** (= `inflight_at_delete`, closest to
+   DELETE and conservative), then `DELETE /streams/source_leg` immediately.
 5. **Re-POST** a fresh `source_leg` (new leader) to drain the remainder.
 6. **Quiesce** — wait until `num_pending == 0 && num_ack_pending == 0`, stable
    across 3 consecutive polls.
@@ -103,8 +106,10 @@ Exit 0 iff **all**:
 1. **Zero loss** — `∀ i ∈ 1..N: applied:<i> >= 1`. Any `== 0` (drained) → FAIL,
    print lost indices.
 2. **Fully drained** — `num_pending == 0 && num_ack_pending == 0`, stable ×3.
-3. **DELETE landed mid-flight** — `inflight_at_delete > 0`, else FAIL
-   **inconclusive** (no silent pass).
+3. **DELETE landed mid-flight** — `inflight_at_delete >= MIN_INFLIGHT`, confirmed
+   across two consecutive polls (confirm-poll, §5). Both polls must show
+   `num_ack_pending >= MIN_INFLIGHT`; a cohort that drains between polls does not
+   count. Else FAIL **inconclusive** (no silent pass).
 
 Findings (reported, not failed): `dup_count = Σ(applied:<i> − 1)`, max redelivery
 depth. Verdict JSON:
@@ -122,6 +127,7 @@ depth. Verdict JSON:
 | `ACK_WAIT` | `5s` | `5s` | redelivery healing window |
 | `ARM_FRACTION` | `0.3` | — | fire DELETE after this fraction applied |
 | `ARM_INFLIGHT` | — | `200` | fire DELETE once this many messages have been dispatched from NATS into Connect (`num_pending <= N - ARM_INFLIGHT`); `num_ack_pending` alone is bounded by `pipeline.threads` and cannot reliably reach large values |
+| `MIN_INFLIGHT` | `1` | `4` (recommended) | minimum `num_ack_pending` required simultaneously in Connect for the arm to fire and DELETE to count as mid-flight; bounded by `PIPELINE_THREADS`; confirmed across two polls (§5) |
 | `MAX_ACK_PENDING` | `1000` | `1000` | consumer bound |
 
 ## 8. Failure-loudness by construction
