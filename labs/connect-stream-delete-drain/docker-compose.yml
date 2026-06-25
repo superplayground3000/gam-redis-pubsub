@@ -1,0 +1,51 @@
+name: connect-stream-delete-drain
+networks:
+  lab:
+    driver: bridge
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-m", "8222"]
+    ports: ["15422:4222"]
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8222/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports: ["16379:6379"]
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  connect:
+    image: hpdevelop/connect:4.92.0-claudefix
+    command: ["streams", "-o", "/etc/connect/observability.yaml"]
+    volumes:
+      - ./connect/observability.yaml:/etc/connect/observability.yaml:ro
+    ports: ["14195:4195"]
+    networks: [lab]
+    healthcheck:
+      # /ready returns 200 even with zero streams. If the image lacks wget,
+      # Task 12 swaps this for `condition: service_started` — the controller's
+      # own waitConnectReady() poll is the authoritative gate either way.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4195/ready || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+  controller:
+    build: ./controller
+    env_file: [.env]
+    networks: [lab]
+    ports: ["18080:18080"]
+    depends_on:
+      nats: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      connect: { condition: service_healthy }
+    volumes:
+      - ./connect/pipeline.tmpl.yaml:/etc/connect/pipeline.tmpl.yaml:ro

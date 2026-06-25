@@ -1,0 +1,26 @@
+input:
+  nats_jetstream:
+    urls: ["nats://nats:4222"]
+    stream: CDC
+    durable: sink
+    bind: true
+pipeline:
+  threads: __THREADS__
+  processors:
+    # Stash i into metadata BEFORE any redis processor: the redis processor
+    # REPLACES message content with the Redis reply, so after the SET below
+    # `this` is "OK" and i is gone. Every later write reads meta("i").
+    - mapping: 'meta i = this.i.string()'
+    - sleep:
+        duration: __SLEEP_MS__ms
+    - redis:
+        url: redis://redis:6379
+        command: set
+        args_mapping: 'root = [ "kv:" + meta("i"), meta("i") ]'
+    - redis:
+        url: redis://redis:6379
+        command: incr
+        args_mapping: 'root = [ "applied:" + meta("i") ]'
+output:
+  reject_errored:
+    drop: {}
