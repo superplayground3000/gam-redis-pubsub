@@ -4,6 +4,10 @@ input:
     stream: CDC
     durable: sink
     bind: true
+    # max_ack_pending on a bind:true pull consumer is likely inert: the consumer
+    # was created server-side and NATS owns the flow-control bound; Connect's
+    # pull(bind) mode respects the server-side config, not a client override.
+    # Retained for documentary symmetry with the consumer's configured bound.
     max_ack_pending: __MAX_ACK_PENDING__
 pipeline:
   threads: __THREADS__

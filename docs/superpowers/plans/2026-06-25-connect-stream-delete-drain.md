@@ -86,7 +86,7 @@ metrics:
     use_histogram_timing: true
 ```
 
-- [ ] **Step 3: Create the pipeline template** (`__SLEEP_MS__` / `__THREADS__` substituted by the controller — the streams REST API does NOT expand env vars)
+- [ ] **Step 3: Create the pipeline template** (`__SLEEP_MS__` / `__THREADS__` / `__MAX_ACK_PENDING__` substituted by the controller — the streams REST API does NOT expand env vars)
 
 `connect/pipeline.tmpl.yaml`:
 
@@ -97,6 +97,10 @@ input:
     stream: CDC
     durable: sink
     bind: true
+    # max_ack_pending on a bind:true pull consumer is likely inert (server-side
+    # consumer owns the flow-control bound), but is passed through for symmetry
+    # with the consumer config and to document the intent.
+    max_ack_pending: __MAX_ACK_PENDING__
 pipeline:
   threads: __THREADS__
   processors:
@@ -397,9 +401,9 @@ import (
 )
 
 func TestRenderPipeline(t *testing.T) {
-	tmpl := "threads: __THREADS__\nduration: __SLEEP_MS__ms\n"
-	out := RenderPipeline(tmpl, 200, 4)
-	require.Equal(t, "threads: 4\nduration: 200ms\n", out)
+	tmpl := "threads: __THREADS__\nduration: __SLEEP_MS__ms\nmax_ack_pending: __MAX_ACK_PENDING__\n"
+	out := RenderPipeline(tmpl, 200, 4, 1000)
+	require.Equal(t, "threads: 4\nduration: 200ms\nmax_ack_pending: 1000\n", out)
 	require.False(t, strings.Contains(out, "__"))
 }
 ```
@@ -416,28 +420,24 @@ Expected: FAIL — `undefined: RenderPipeline`.
 ```go
 package main
 
-import "strings"
+import (
+	"strconv"
+	"strings"
+)
 
-// RenderPipeline substitutes the literal __SLEEP_MS__ / __THREADS__ placeholders.
-// We substitute in the controller (not via env interpolation) because the streams
-// REST API does NOT expand environment variables in POSTed configs.
-func RenderPipeline(tmpl string, sleepMS, threads int) string {
+// RenderPipeline substitutes the literal __SLEEP_MS__ / __THREADS__ / __MAX_ACK_PENDING__
+// placeholders. We substitute in the controller (not via env interpolation) because the
+// streams REST API does NOT expand environment variables in POSTed configs.
+func RenderPipeline(tmpl string, sleepMS, threads, maxAckPending int) string {
 	return strings.NewReplacer(
 		"__SLEEP_MS__", itoa(sleepMS),
 		"__THREADS__", itoa(threads),
+		"__MAX_ACK_PENDING__", itoa(maxAckPending),
 	).Replace(tmpl)
 }
-```
-
-Add to `render.go`:
-
-```go
-import "strconv"
 
 func itoa(n int) string { return strconv.Itoa(n) }
 ```
-
-(Combine the two `import` lines into one block.)
 
 - [ ] **Step 4: Run test to verify it passes**
 
@@ -629,10 +629,28 @@ func TestArmedDeterministic(t *testing.T) {
 }
 
 func TestArmedThroughput(t *testing.T) {
-	in := ArmInput{Profile: "throughput", ArmInflight: 200}
-	in.NumAckPending = 199
+	// ARM_INFLIGHT=200, N=1000: fires when NumPending <= 800 (>=200 dispatched)
+	// and at least one message is in-flight (NumAckPending > 0).
+	in := ArmInput{Profile: "throughput", ArmInflight: 200, N: 1000}
+
+	// Not enough dispatched yet (only 100 delivered so pending=900>800)
+	in.NumPending = 900
+	in.NumAckPending = 5
 	require.False(t, Armed(in))
-	in.NumAckPending = 200
+
+	// Enough dispatched (pending=800 == N-ArmInflight) but nothing in-flight: don't fire
+	in.NumPending = 800
+	in.NumAckPending = 0
+	require.False(t, Armed(in))
+
+	// Enough dispatched and work is in-flight: fires
+	in.NumPending = 800
+	in.NumAckPending = 5
+	require.True(t, Armed(in))
+
+	// Far into processing, still fires as long as something is in-flight
+	in.NumPending = 0
+	in.NumAckPending = 3
 	require.True(t, Armed(in))
 }
 ```
@@ -657,12 +675,25 @@ type ArmInput struct {
 	ArmInflight     int
 	AppliedDistinct int // count of distinct kv:* keys applied so far
 	NumAckPending   int // consumer delivered-but-not-acked
+	NumPending      int // messages not yet delivered to consumer (NATS backlog)
 }
 
 // Armed reports whether a meaningful in-flight cohort exists to DELETE into.
+//
+// For throughput: fires when the undelivered NATS backlog (NumPending) drops below
+// N-ArmInflight, meaning at least ArmInflight messages have been handed to Connect
+// (delivered or in-progress). This ensures DELETE lands mid-firehose with a large
+// cohort in various stages of processing — achievable regardless of pipeline thread
+// count, unlike NumAckPending which is bounded by the number of pipeline threads.
+//
+// For deterministic: fires when a fraction of messages have been applied and at
+// least one is in-flight (NumAckPending > 0).
 func Armed(in ArmInput) bool {
 	if in.Profile == "throughput" {
-		return in.NumAckPending >= in.ArmInflight
+		// NumPending counts messages NATS hasn't yet delivered. When it drops to
+		// N - ArmInflight, at least ArmInflight messages have been dispatched to
+		// Connect — a large cohort is mid-firehose.
+		return in.NumPending <= in.N-in.ArmInflight && in.NumAckPending > 0
 	}
 	return in.NumAckPending > 0 && float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
 }
@@ -1078,11 +1109,15 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("read template: %w", err)
 	}
-	pipeline := RenderPipeline(string(tmpl), cfg.SleepMS, cfg.PipelineThreads)
+	pipeline := RenderPipeline(string(tmpl), cfg.SleepMS, cfg.PipelineThreads, cfg.MaxAckPending)
 
 	connect := newConnectClient(cfg.ConnectAddr)
 	if err := waitConnectReady(ctx, connect); err != nil {
 		return err
+	}
+	// Clean slate: delete any leftover stream from a previous run (idempotent; 404 is OK).
+	if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
+		return fmt.Errorf("pre-run cleanup: %w", err)
 	}
 
 	sink := newSinkReader(cfg.RedisAddr)
@@ -1182,10 +1217,11 @@ func armAndDelete(ctx context.Context, cfg Config, connect *connectClient, sink 
 		}
 		in := ArmInput{
 			Profile: cfg.Profile, N: cfg.MsgCount, ArmFraction: cfg.ArmFraction,
-			ArmInflight: cfg.ArmInflight, AppliedDistinct: distinct, NumAckPending: cs.NumAckPending,
+			ArmInflight: cfg.ArmInflight, AppliedDistinct: distinct,
+			NumAckPending: cs.NumAckPending, NumPending: int(cs.NumPending),
 		}
 		if Armed(in) {
-			log.Printf("ARMED: distinct=%d num_ack_pending=%d -> DELETE", distinct, cs.NumAckPending)
+			log.Printf("ARMED: distinct=%d num_pending=%d num_ack_pending=%d -> DELETE", distinct, cs.NumPending, cs.NumAckPending)
 			if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
 				return 0, err
 			}

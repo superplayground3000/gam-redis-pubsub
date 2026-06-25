@@ -95,6 +95,12 @@ verdict:{pass}}`.
 The research-lab skill's `validate_lab.sh` (docker-compose) **does** apply here —
 this is a self-contained compose lab. `validate_lab.sh` exit 0 is the gate.
 
+## Empirical finding
+
+The messages actually held inside Connect's pipeline at any instant (`num_ack_pending`) tracks approximately `pipeline.threads`, because the JetStream pull(bind) input fetches roughly one message per pipeline thread at a time; the rest of the message firehose stays as undelivered backlog in NATS (`num_pending`). So `inflight_at_delete` measures the per-pod in-Connect cohort — the messages "already received" by Connect and squarely in the handover-loss zone — not the whole stream. Both the `deterministic` and `throughput` profiles showed `lost:[]` across runs: Connect drains its received-but-unapplied messages on `DELETE /streams/<id>` rather than dropping them.
+
+Note on `max_ack_pending` in the pipeline template: on a `bind: true` pull consumer the consumer was created server-side (by the controller) and the server-side bound already controls flow. The `max_ack_pending` field in the Connect input config is almost certainly inert in this mode — Connect's pull(bind) respects the server-side consumer config, not a client-side override. It is retained in the template for documentary intent (mirroring the consumer's configured bound) but should not be relied on as an effective flow-control knob.
+
 ## Design decisions / rejected alternatives
 
 - **`sleep` processor** over a freezable Redis valve proxy: pure Connect config,

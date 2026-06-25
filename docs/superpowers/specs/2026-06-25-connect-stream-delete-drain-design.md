@@ -56,7 +56,8 @@ Two distinguishable outcomes for an in-flight message at DELETE time:
 - Connect pipeline POSTed by the controller (`application/x-yaml`, the
   Content-Type proven in the k8s lab):
   ```
-  input:    nats_jetstream { stream: CDC, durable: sink, bind: true }
+  input:    nats_jetstream { stream: CDC, durable: sink, bind: true,
+                             max_ack_pending: ${MAX_ACK_PENDING} }
   pipeline: threads: ${PIPELINE_THREADS}
             processors:
               # STASH i INTO METADATA FIRST. The `redis` processor REPLACES
@@ -84,7 +85,10 @@ Two distinguishable outcomes for an in-flight message at DELETE time:
 4. **Arm & fire** — poll consumer info; when the arm condition holds
    (`deterministic`: `num_ack_pending > 0 AND applied:* count >= ARM_FRACTION*N`
    — the `num_ack_pending > 0` guard ensures the DELETE always lands on a real
-   in-flight cohort; `throughput`: `num_ack_pending >= ARM_INFLIGHT`),
+   in-flight cohort; `throughput`: `num_pending <= N - ARM_INFLIGHT AND
+   num_ack_pending > 0`, i.e. fire once at least `ARM_INFLIGHT` messages have
+   been dispatched from the NATS backlog into Connect — `num_ack_pending` alone
+   is bounded by `pipeline.threads` and would never reach large values),
    **capture `num_ack_pending` (= inflight at delete)**, then `DELETE
    /streams/source_leg`.
 5. **Re-POST** a fresh `source_leg` (new leader) to drain the remainder.
@@ -117,7 +121,7 @@ depth. Verdict JSON:
 | `PIPELINE_THREADS` | `1` | `8` | Connect concurrency |
 | `ACK_WAIT` | `5s` | `5s` | redelivery healing window |
 | `ARM_FRACTION` | `0.3` | — | fire DELETE after this fraction applied |
-| `ARM_INFLIGHT` | — | `200` | fire DELETE at this `num_ack_pending` |
+| `ARM_INFLIGHT` | — | `200` | fire DELETE once this many messages have been dispatched from NATS into Connect (`num_pending <= N - ARM_INFLIGHT`); `num_ack_pending` alone is bounded by `pipeline.threads` and cannot reliably reach large values |
 | `MAX_ACK_PENDING` | `1000` | `1000` | consumer bound |
 
 ## 8. Failure-loudness by construction
