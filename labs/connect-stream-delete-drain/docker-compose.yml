@@ -40,9 +40,14 @@ services:
       retries: 40
   controller:
     build: ./controller
-    env_file: [.env]
+    env_file:
+      - path: .env.example
+        required: true
+      - path: .env
+        required: false
     networks: [lab]
     ports: ["18080:18080"]
+    profiles: [run]
     depends_on:
       nats: { condition: service_healthy }
       redis: { condition: service_healthy }

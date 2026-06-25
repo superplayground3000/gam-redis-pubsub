@@ -30,6 +30,10 @@ func run(cfg Config) error {
 	if err := waitConnectReady(ctx, connect); err != nil {
 		return err
 	}
+	// Clean slate: delete any leftover stream from a previous run (idempotent; 404 is OK).
+	if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
+		return fmt.Errorf("pre-run cleanup: %w", err)
+	}
 
 	sink := newSinkReader(cfg.RedisAddr)
 	defer sink.close()
