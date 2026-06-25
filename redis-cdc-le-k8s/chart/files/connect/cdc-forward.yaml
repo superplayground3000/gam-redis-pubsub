@@ -31,6 +31,17 @@ input:
 pipeline:
   threads: 2
   processors:
+    # Dump the raw inbound Redis stream entry (app.events): XADD fields arrive as
+    # metadata, the body arrives as content. Logged BEFORE the mapping so it shows
+    # exactly what was read off the stream. Pass-through — does not alter the message.
+    - log:
+        level: INFO
+        message: "cdc-forward redis_in"
+        fields_mapping: |
+          root.leg   = "forward"
+          root.stage = "redis_in"
+          root.meta  = metadata()
+          root.body  = content().string()
     - mapping: |
         let body = content().string()
         let eid  = meta("event_id").or($body.hash("sha256").encode("hex"))
@@ -46,6 +57,18 @@ pipeline:
         }
         meta op       = meta("op").or("update")     # used for the subject interpolation
         meta event_id = $eid                          # used for the Nats-Msg-Id header
+    # Dump the self-contained JSON envelope about to be published to JetStream,
+    # plus the op/event_id meta that drive subject interpolation and the
+    # Nats-Msg-Id dedup header. Logged AFTER the mapping (content() is now the envelope).
+    - log:
+        level: INFO
+        message: "cdc-forward nats_out"
+        fields_mapping: |
+          root.leg      = "forward"
+          root.stage    = "nats_out"
+          root.subject_op = meta("op")
+          root.event_id = meta("event_id")
+          root.envelope = content().string()
 
 output:
   label: __POD__

@@ -35,6 +35,16 @@ input:
 pipeline:
   threads: 4
   processors:
+    # Dump the raw inbound JetStream message (the full envelope JSON) FIRST, before
+    # any processor touches it — the `redis` processor below REPLACES content with
+    # the Redis reply, so this is the only place the original NATS payload is intact.
+    - log:
+        level: INFO
+        message: "cdc-reverse nats_in"
+        fields_mapping: |
+          root.leg      = "reverse"
+          root.stage    = "nats_in"
+          root.envelope = content().string()
     # Stash the envelope fields into metadata FIRST: the `redis` processor below
     # REPLACES message content with the Redis reply, so any field needed by a
     # later processor (the metric label) or by args_mapping must live in metadata.
@@ -45,6 +55,20 @@ pipeline:
         meta old_key = this.old_key
         meta new_key = this.new_key
         meta body    = this.body
+    # Dump exactly what is about to be applied to region Redis (the op switch below
+    # turns these into SET / DEL / rename-EVAL). body holds the full value payload.
+    - log:
+        level: INFO
+        message: "cdc-reverse redis_apply"
+        fields_mapping: |
+          root.leg     = "reverse"
+          root.stage   = "redis_apply"
+          root.op      = meta("op")
+          root.type    = meta("type")
+          root.kv_key  = meta("kv_key")
+          root.old_key = meta("old_key")
+          root.new_key = meta("new_key")
+          root.body    = meta("body")
     - switch:
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
