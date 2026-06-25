@@ -4,6 +4,7 @@ input:
     stream: CDC
     durable: sink
     bind: true
+    max_ack_pending: __MAX_ACK_PENDING__
 pipeline:
   threads: __THREADS__
   processors:

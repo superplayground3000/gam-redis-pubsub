@@ -24,7 +24,7 @@ func run(cfg Config) error {
 	if err != nil {
 		return fmt.Errorf("read template: %w", err)
 	}
-	pipeline := RenderPipeline(string(tmpl), cfg.SleepMS, cfg.PipelineThreads)
+	pipeline := RenderPipeline(string(tmpl), cfg.SleepMS, cfg.PipelineThreads, cfg.MaxAckPending)
 
 	connect := newConnectClient(cfg.ConnectAddr)
 	if err := waitConnectReady(ctx, connect); err != nil {
@@ -132,10 +132,11 @@ func armAndDelete(ctx context.Context, cfg Config, connect *connectClient, sink 
 		}
 		in := ArmInput{
 			Profile: cfg.Profile, N: cfg.MsgCount, ArmFraction: cfg.ArmFraction,
-			ArmInflight: cfg.ArmInflight, AppliedDistinct: distinct, NumAckPending: cs.NumAckPending,
+			ArmInflight: cfg.ArmInflight, AppliedDistinct: distinct,
+			NumAckPending: cs.NumAckPending, NumPending: int(cs.NumPending),
 		}
 		if Armed(in) {
-			log.Printf("ARMED: distinct=%d num_ack_pending=%d -> DELETE", distinct, cs.NumAckPending)
+			log.Printf("ARMED: distinct=%d num_pending=%d num_ack_pending=%d -> DELETE", distinct, cs.NumPending, cs.NumAckPending)
 			if err := connect.DeleteStream(ctx, cfg.StreamID); err != nil {
 				return 0, err
 			}
