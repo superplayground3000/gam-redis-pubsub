@@ -1,0 +1,170 @@
+<mxfile>
+  <diagram id="le-exp-1" name="LE Failover Experiment">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="2" value="Leader-Election Failover Benchmark — Experiment Flow (single-node kind)"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=1;fontSize=16;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="20" width="1080" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- A: Setup (top-left) -->
+        <mxCell id="3" value="&lt;b&gt;Setup (one-time)&lt;/b&gt;&lt;br&gt;1 · kind create cluster cdc&lt;br&gt;2 · build + kind-load images (app, connect)&lt;br&gt;3 · helm deploy chart (profile=cdc)&lt;br&gt;4 · baseline verify-cdc — PASS gate ✓"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="70" width="520" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- Legend: configs (top-right) -->
+        <mxCell id="4" value="&lt;b&gt;Timing configs swept&lt;/b&gt;&lt;br&gt;tight    3s / 2s / 1s&lt;br&gt;default  6s / 4s / 1s&lt;br&gt;stock   15s / 10s / 2s&lt;br&gt;&lt;i&gt;(LeaseDuration / RenewDeadline / RetryPeriod)&lt;/i&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;align=left;spacingLeft=10;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="600" y="70" width="520" height="100" as="geometry" />
+        </mxCell>
+
+        <!-- Left swimlane: sweep loop -->
+        <mxCell id="10" value="Sweep — repeat per config (×3)"
+          style="swimlane;startSize=30;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="210" width="520" height="410" as="geometry" />
+        </mxCell>
+        <mxCell id="11" value="5 · helm upgrade lease timings (both legs)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="10">
+          <mxGeometry x="40" y="50" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="12" value="6 · settle + 20s soak (election stabilizes)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="10">
+          <mxGeometry x="40" y="122" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="13" value="7 · failover trials — source ×10 + sink ×10 (random) + sink ×5 (post-renew)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontStyle=1;fontSize=11;"
+          vertex="1" parent="10">
+          <mxGeometry x="40" y="194" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="14" value="8 · flap probe — netem delay ladder on live leader"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="10">
+          <mxGeometry x="40" y="266" width="440" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="15" value="9 · correctness gate — verify-cdc ✓"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;"
+          vertex="1" parent="10">
+          <mxGeometry x="40" y="338" width="440" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- Right swimlane: one failover trial measurement -->
+        <mxCell id="20" value="One failover trial — what is measured"
+          style="swimlane;startSize=30;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontStyle=1;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="600" y="210" width="520" height="410" as="geometry" />
+        </mxCell>
+        <mxCell id="21" value="read holder H_old + renewTime, leaseDuration"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="20">
+          <mxGeometry x="40" y="50" width="460" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="22" value="t_kill = now()  ·  force-delete leader pod (--grace-period=0 --force)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="20">
+          <mxGeometry x="40" y="122" width="460" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="23" value="lease left to EXPIRE ≈ LeaseDuration (no SIGTERM release)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;"
+          vertex="1" parent="20">
+          <mxGeometry x="40" y="194" width="460" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="24" value="standby ACQUIRES → acquireTime stamped"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="20">
+          <mxGeometry x="40" y="266" width="460" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="25" value="failover = acquireTime − t_kill = lease_remaining + overhead"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;"
+          vertex="1" parent="20">
+          <mxGeometry x="40" y="338" width="460" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- D: report step (bottom-left) -->
+        <mxCell id="5" value="10 · le-report.py — percentiles + render"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="40" y="700" width="520" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- Result box (bottom-right) -->
+        <mxCell id="6" value="&lt;b&gt;Performance report (.md)&lt;/b&gt;&lt;br&gt;failover ≈ LeaseDuration · flap onset ≈ RenewDeadline · all configs CDC-correct&lt;br&gt;&lt;b&gt;→ 6 / 4 / 1 is the knee&lt;/b&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="600" y="700" width="520" height="80" as="geometry" />
+        </mxCell>
+
+        <!-- ============ EDGES ============
+             A(3) bottom → B1(11) top
+             B1→B2→B3→B4→B5 vertical inside left swimlane
+             B5(15) left → B1(11) left  : loop "next config" (left gutter x=60)
+             B3(13) right → C1(21) left : dashed "per failover trial" (mid gutter x=580)
+             C1→C2→C3→C4→C5 vertical inside right swimlane
+             B5(15) bottom → D(5) top   : "after 3 configs"
+             C5(25) bottom → Result(6) top : "feeds"
+             D(5) right → Result(6) left : "render"
+        ================================= -->
+
+        <mxCell id="30" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="3" target="11" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <mxCell id="31" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="11" target="12" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="32" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="12" target="13" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="33" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="13" target="14" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="34" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="14" target="15" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- loop back: B5 left → B1 left, up the left gutter -->
+        <mxCell id="35" value="next config (×3)" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#b85450;fontColor=#b85450;exitX=0;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="15" target="11" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="60" y="576" /><mxPoint x="60" y="288" /></Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- detail link: B3 right → C1 left, mid gutter -->
+        <mxCell id="36" value="per failover trial" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#9673a6;fontColor=#9673a6;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="13" target="21" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points"><mxPoint x="580" y="432" /><mxPoint x="580" y="288" /></Array>
+          </mxGeometry>
+        </mxCell>
+
+        <mxCell id="37" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="21" target="22" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="38" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="22" target="23" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="39" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="23" target="24" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="40" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="24" target="25" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- sweep done → report -->
+        <mxCell id="41" value="after 3 configs" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="15" target="5" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- measurement feeds result -->
+        <mxCell id="42" value="feeds" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="25" target="6" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- report → result -->
+        <mxCell id="43" value="render" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="5" target="6" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
