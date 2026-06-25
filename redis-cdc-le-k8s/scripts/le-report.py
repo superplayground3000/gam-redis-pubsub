@@ -163,9 +163,16 @@ def main():
                 hit = [r for r in fl[cfg] if int(r["delay_ms"]) == x]
                 cells.append("FLAP" if hit and hit[0]["flapped"] == "1" else "stable" if hit else "—")
             w(f"| {cfg} | {rd}s | " + " | ".join(cells) + " |")
-        w("\nFlap onset tracks `RenewDeadline`: a leader tolerates renew round-trips up to "
-          "its `RenewDeadline` and demotes beyond it. Tighter timing ⇒ flaps under "
-          "smaller control-plane latency.\n")
+        w("\nFlap onset tracks `RenewDeadline`: a leader tolerates a renew round-trip up "
+          "to ~`RenewDeadline` and demotes beyond it — tight flaps just past 2s, default "
+          "just past 4s. Tighter timing ⇒ flaps under smaller control-plane latency, the "
+          "concrete cost of a shorter lease.\n")
+        w("> **Stock caveat.** Stock reads `stable` even at 12000 ms (>10s `RenewDeadline`). "
+          "This is an observation-window artifact, not extra safety: the stock leader still "
+          "*demotes* at ~`RenewDeadline`, but the standby can only take the Lease after the "
+          "15s `LeaseDuration` expires, so the `leaseTransitions` bump lands at/after the "
+          "20s probe window. The safety-relevant comparison — tight (2s) vs default (4s) — "
+          "is unaffected and clean.\n")
 
     # --- correctness ---
     cpath = os.path.join(d, "correctness.txt")
