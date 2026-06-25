@@ -74,7 +74,7 @@ def main():
     w("Active leader force-deleted (`--grace-period=0 --force`) at an arbitrary point in "
       "the renew cycle; failover = `acquireTime(new) − t_kill`. Source + sink pooled.\n")
     w("| config | duration/renew/retry | n | min | p50 | p95 | max | mean | "
-      "predicted ceiling* |")
+      "soft ceiling* |")
     w("|---|---|---|---|---|---|---|---|---|")
     for cfg in ORDER:
         sub = rnd[cfg]
@@ -82,11 +82,18 @@ def main():
         dur, renew, retry = CFG[cfg]
         ceil = dur + retry * 2.2  # LeaseDuration + RetryPeriod*(1+JitterFactor)
         if s:
+            flag = " ⚠️" if s["max"] > ceil else ""
             w(f"| {cfg} | {dur}s/{renew}s/{retry}s | {s['n']} | {fmt(s['min'])} | "
-              f"{fmt(s['p50'])} | {fmt(s['p95'])} | {fmt(s['max'])} | {fmt(s['mean'])} | "
-              f"≤{ceil:.1f}s |")
-    w("\n*predicted ceiling = `LeaseDuration + RetryPeriod·(1+JitterFactor)` with "
-      "client-go `JitterFactor=1.2`.\n")
+              f"{fmt(s['p50'])} | {fmt(s['p95'])} | {fmt(s['max'])}{flag} | {fmt(s['mean'])} | "
+              f"~{ceil:.1f}s |")
+    w("\n*soft ceiling = `LeaseDuration + RetryPeriod·(1+JitterFactor)`, `JitterFactor=1.2` "
+      "— the longest a standby's *jittered* acquire-retry can take after lease expiry. It is "
+      "an **approximate** bound: it omits the API round-trip and the kill's intra-renew-cycle "
+      "phase, so a small tail can exceed it. Here the stock random max (19.50s, +0.1s) and the "
+      "default post-renew max (§4, 8.36s, +0.16s) sit just over — the p95s are comfortably "
+      "under. Treat it as 'where the bulk lands,' not a hard guarantee. Source and sink legs "
+      "are pooled because their p50s match closely (tight 3.54/3.85s, default 6.92/6.94s, "
+      "stock 17.01/16.41s source/sink).\n")
 
     # --- decomposition: why the number is what it is ---
     w("## 2. Decomposition — LeaseDuration vs retry/jitter\n")
@@ -104,9 +111,12 @@ def main():
         ov = statistics.mean(r["acquire_overhead_s"] for r in sub)
         fo = statistics.mean(r["failover_acquire_s"] for r in sub)
         w(f"| {cfg} | {lr:.2f}s | {ov:.2f}s | {fo:.2f}s |")
-    w("\nThe overhead term stays roughly constant across configs (it is governed by "
-      "`RetryPeriod` and jitter, not `LeaseDuration`); the failover spread between configs "
-      "comes almost entirely from `lease_remaining`, i.e. from `LeaseDuration`.\n")
+    w("\nThe overhead term is governed by `RetryPeriod` (and jitter), not `LeaseDuration`: "
+      "it is ~1.0–1.2s for tight and default (both `RetryPeriod=1s`) and ~2.2s for stock "
+      "(`RetryPeriod=2s`) — i.e. it scales with `RetryPeriod`, not constant in absolute "
+      "terms. Either way it is small and roughly fixed *within a given `RetryPeriod`*, so the "
+      "large failover spread between configs comes almost entirely from `lease_remaining`, "
+      "i.e. from `LeaseDuration` (2.7s → 5.7s → 14.8s).\n")
 
     # --- clock-domain corroboration ---
     w("## 3. Clock-domain corroboration (acquire vs observed)\n")
@@ -205,11 +215,12 @@ def main():
       "(connect is already running), so single-digit-second failover is not a bottleneck; "
       "stock's larger lease just lengthens the dead-air window after a crash for no "
       "correctness gain (§6 all green regardless).\n")
-    w("\n**Conclusion.** `6s/4s/1s` sits at the knee: failover near the theoretical "
-      "`LeaseDuration + RetryPeriod·1.2` floor, a 2s safety margin that survives realistic "
-      "control-plane latency without flapping, and zero correctness cost. Tighter trades "
-      "safety margin for marginal speed; stock trades failover speed for margin this lab "
-      "does not need.\n")
+    w("\n**Conclusion.** `6s/4s/1s` sits at the knee: failover dominated by — and clustering "
+      "just under — the `LeaseDuration` term (p50 6.9s, p95 7.6s), a 2s safety margin that "
+      "survives realistic control-plane latency without flapping (§5), and zero correctness "
+      "cost (§6). Tighter (3s/2s/1s) trades half the latency headroom for ~3s of failover; "
+      "stock (15s/10s/2s) trades ~10s of failover speed for margin this warm-standby lab does "
+      "not need.\n")
 
     w("## Scope & caveats\n")
     w("- Single-node kind on one host: no real network partition, no contended control "
