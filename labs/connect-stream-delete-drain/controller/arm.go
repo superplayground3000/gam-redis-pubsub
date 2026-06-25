@@ -15,5 +15,5 @@ func Armed(in ArmInput) bool {
 	if in.Profile == "throughput" {
 		return in.NumAckPending >= in.ArmInflight
 	}
-	return float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
+	return in.NumAckPending > 0 && float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
 }

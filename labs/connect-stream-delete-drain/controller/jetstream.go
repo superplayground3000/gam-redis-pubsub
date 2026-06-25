@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"time"
@@ -38,7 +39,9 @@ func dialJetStream(ctx context.Context, url string) (*jsClient, error) {
 // setup deletes any prior stream (clean epoch) then creates the stream and a
 // durable pull consumer bound to a small ack_wait so un-acked msgs redeliver fast.
 func (c *jsClient) setup(ctx context.Context, ackWait time.Duration, maxAckPending int) error {
-	_ = c.js.DeleteStream(ctx, streamName) // ignore not-found
+	if err := c.js.DeleteStream(ctx, streamName); err != nil && !errors.Is(err, jetstream.ErrStreamNotFound) {
+		return fmt.Errorf("clean prior stream: %w", err)
+	}
 	st, err := c.js.CreateStream(ctx, jetstream.StreamConfig{
 		Name:     streamName,
 		Subjects: []string{subject},

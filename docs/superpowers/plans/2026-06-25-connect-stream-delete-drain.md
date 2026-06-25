@@ -620,7 +620,11 @@ func TestArmedDeterministic(t *testing.T) {
 	in := ArmInput{Profile: "deterministic", N: 100, ArmFraction: 0.3}
 	in.AppliedDistinct = 29
 	require.False(t, Armed(in))
+	// fraction met but no in-flight cohort: must not fire (inconclusive guard)
 	in.AppliedDistinct = 30
+	require.False(t, Armed(in))
+	// fraction met AND in-flight cohort present: fires
+	in.NumAckPending = 1
 	require.True(t, Armed(in))
 }
 
@@ -660,7 +664,7 @@ func Armed(in ArmInput) bool {
 	if in.Profile == "throughput" {
 		return in.NumAckPending >= in.ArmInflight
 	}
-	return float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
+	return in.NumAckPending > 0 && float64(in.AppliedDistinct) >= in.ArmFraction*float64(in.N)
 }
 ```
 
@@ -1067,7 +1071,7 @@ func main() {
 }
 
 func run(cfg Config) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
 
 	tmpl, err := os.ReadFile("/etc/connect/pipeline.tmpl.yaml")

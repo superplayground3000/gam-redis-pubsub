@@ -41,14 +41,16 @@ func (s *sinkReader) readLedger(ctx context.Context, n int) (map[int]int, error)
 	return out, nil
 }
 
-// distinctApplied counts keys kv:* currently present (cheap arm-progress proxy).
+// distinctApplied counts distinct keys kv:* currently present (cheap arm-progress proxy).
+// Redis SCAN may return the same key multiple times across pages; deduping via a map
+// ensures the count is accurate even when cursor wraps or overlaps.
 func (s *sinkReader) distinctApplied(ctx context.Context) (int, error) {
-	var n int
+	seen := make(map[string]struct{})
 	iter := s.rdb.Scan(ctx, 0, "kv:*", 1000).Iterator()
 	for iter.Next(ctx) {
-		n++
+		seen[iter.Val()] = struct{}{}
 	}
-	return n, iter.Err()
+	return len(seen), iter.Err()
 }
 
 func (s *sinkReader) close() error { return s.rdb.Close() }

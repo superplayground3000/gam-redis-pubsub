@@ -82,9 +82,11 @@ Two distinguishable outcomes for an in-flight message at DELETE time:
    burst).
 3. **POST** stream `source_leg` to `connect`.
 4. **Arm & fire** — poll consumer info; when the arm condition holds
-   (`deterministic`: `applied:* count >= ARM_FRACTION*N`; `throughput`:
-   `num_ack_pending >= ARM_INFLIGHT`), **capture `num_ack_pending` (= inflight at
-   delete)**, then `DELETE /streams/source_leg`.
+   (`deterministic`: `num_ack_pending > 0 AND applied:* count >= ARM_FRACTION*N`
+   — the `num_ack_pending > 0` guard ensures the DELETE always lands on a real
+   in-flight cohort; `throughput`: `num_ack_pending >= ARM_INFLIGHT`),
+   **capture `num_ack_pending` (= inflight at delete)**, then `DELETE
+   /streams/source_leg`.
 5. **Re-POST** a fresh `source_leg` (new leader) to drain the remainder.
 6. **Quiesce** — wait until `num_pending == 0 && num_ack_pending == 0`, stable
    across 3 consecutive polls.
