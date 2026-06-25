@@ -1,0 +1,149 @@
+<mxfile>
+  <diagram id="le-cluster-1" name="LE Cluster View">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1260" pageHeight="920" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="2" value="Cluster View — Leader-Election Failover Experiment (kind: cdc)"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=1;fontSize=16;"
+          vertex="1" parent="1"><mxGeometry x="30" y="20" width="1200" height="30" as="geometry" /></mxCell>
+
+        <!-- Cluster boundary (drawn first = behind) -->
+        <mxCell id="10" value="kind cluster: cdc  ·  node cdc-control-plane  ·  namespace cdc-k8s"
+          style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;verticalAlign=top;align=left;spacingLeft=12;spacingTop=8;fontStyle=1;fontSize=13;"
+          vertex="1" parent="1"><mxGeometry x="30" y="70" width="1200" height="560" as="geometry" /></mxCell>
+
+        <!-- Leg group rectangles (drawn before pods so pods sit on top) -->
+        <mxCell id="20" value="connect-source · Deployment (replicas=3)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6c8ebf;dashed=1;verticalAlign=top;align=center;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1"><mxGeometry x="360" y="300" width="240" height="250" as="geometry" /></mxCell>
+        <mxCell id="30" value="connect-sink · Deployment (replicas=3)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=none;strokeColor=#6c8ebf;dashed=1;verticalAlign=top;align=center;fontStyle=1;fontSize=11;"
+          vertex="1" parent="1"><mxGeometry x="820" y="300" width="240" height="250" as="geometry" /></mxCell>
+
+        <!-- apiserver note + Lease objects -->
+        <mxCell id="11" value="coordination.k8s.io Leases held in kube-apiserver — electors GET/UPDATE to renew or acquire"
+          style="text;html=1;align=center;verticalAlign=middle;fontSize=10;fontColor=#555555;"
+          vertex="1" parent="1"><mxGeometry x="380" y="84" width="680" height="20" as="geometry" /></mxCell>
+        <mxCell id="12" value="&lt;b&gt;Lease: connect-source-elector&lt;/b&gt;&lt;br&gt;holder = src#1 · leaseDuration=6s&lt;br&gt;renewTime ↑ every RetryPeriod"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="380" y="108" width="210" height="66" as="geometry" /></mxCell>
+        <mxCell id="13" value="&lt;b&gt;Lease: connect-sink-elector&lt;/b&gt;&lt;br&gt;holder = snk#1 · leaseDuration=6s&lt;br&gt;renewTime ↑ every RetryPeriod"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="830" y="108" width="210" height="66" as="geometry" /></mxCell>
+
+        <!-- Source pods -->
+        <mxCell id="21" value="&lt;b&gt;src#1 — LEADER (ACTIVE)&lt;/b&gt;&lt;br&gt;connect + elector&lt;br&gt;holds Lease → POSTs pipeline"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="378" y="345" width="204" height="58" as="geometry" /></mxCell>
+        <mxCell id="22" value="src#2 · standby (idle, /ready=200)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontColor=#666666;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="378" y="415" width="204" height="50" as="geometry" /></mxCell>
+        <mxCell id="23" value="src#3 · standby (idle)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontColor=#666666;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="378" y="478" width="204" height="50" as="geometry" /></mxCell>
+
+        <!-- Sink pods -->
+        <mxCell id="31" value="&lt;b&gt;snk#1 — LEADER (ACTIVE)&lt;/b&gt;&lt;br&gt;connect + elector&lt;br&gt;holds Lease → binds pull consumer"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=0;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="838" y="345" width="204" height="58" as="geometry" /></mxCell>
+        <mxCell id="32" value="snk#2 · standby (idle, /ready=200)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontColor=#666666;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="838" y="415" width="204" height="50" as="geometry" /></mxCell>
+        <mxCell id="33" value="snk#3 · standby (idle)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#999999;fontColor=#666666;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="838" y="478" width="204" height="50" as="geometry" /></mxCell>
+
+        <!-- Data-path stores -->
+        <mxCell id="17" value="writer&lt;br&gt;(load gen)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="60" y="415" width="110" height="64" as="geometry" /></mxCell>
+        <mxCell id="14" value="redis-central&lt;br&gt;CDC stream"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=14;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="205" y="405" width="120" height="84" as="geometry" /></mxCell>
+        <mxCell id="15" value="NATS JetStream&lt;br&gt;dedup + pull consumer"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="650" y="414" width="120" height="66" as="geometry" /></mxCell>
+        <mxCell id="16" value="redis-region&lt;br&gt;KV target"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=14;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;"
+          vertex="1" parent="1"><mxGeometry x="1090" y="405" width="120" height="84" as="geometry" /></mxCell>
+
+        <!-- Failover trigger banner (red) -->
+        <mxCell id="41" value="&lt;b&gt;FAILOVER TRIGGER (per trial)&lt;/b&gt;&lt;br&gt;① benchmark force-deletes the ACTIVE leader pod&lt;br&gt;② its Lease is left to EXPIRE (no SIGTERM release) ≈ LeaseDuration&lt;br&gt;③ a standby elector ACQUIRES (leaseTransitions++) &amp; resumes&lt;br&gt;&lt;b&gt;failover = acquireTime − t_kill&lt;/b&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=8;verticalAlign=middle;fontSize=9;"
+          vertex="1" parent="1"><mxGeometry x="610" y="200" width="200" height="120" as="geometry" /></mxCell>
+
+        <!-- Comparison panel -->
+        <mxCell id="50" value="Compare three lease-timing configs — re-run the whole sweep per config (helm upgrade --set lease.{duration,renewDeadline,retryPeriod} on both legs)"
+          style="rounded=0;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;verticalAlign=top;align=left;spacingLeft=12;spacingTop=8;fontStyle=1;fontSize=12;"
+          vertex="1" parent="1"><mxGeometry x="30" y="660" width="1200" height="250" as="geometry" /></mxCell>
+        <mxCell id="51" value="&lt;b&gt;tight  3s / 2s / 1s&lt;/b&gt;&lt;br&gt;failover p50 3.6s · max 5.1s&lt;br&gt;flap onset &gt; 2s&lt;br&gt;&lt;i&gt;least latency headroom&lt;/i&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;align=left;spacingLeft=10;fontSize=11;"
+          vertex="1" parent="1"><mxGeometry x="110" y="720" width="300" height="120" as="geometry" /></mxCell>
+        <mxCell id="52" value="&lt;b&gt;default  6s / 4s / 1s   ★ chosen&lt;/b&gt;&lt;br&gt;failover p50 6.9s · max 7.8s&lt;br&gt;flap onset &gt; 4s&lt;br&gt;&lt;i&gt;2s safety margin — the knee&lt;/i&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;align=left;spacingLeft=10;fontStyle=0;fontSize=11;"
+          vertex="1" parent="1"><mxGeometry x="480" y="720" width="300" height="120" as="geometry" /></mxCell>
+        <mxCell id="53" value="&lt;b&gt;stock  15s / 10s / 2s&lt;/b&gt;&lt;br&gt;failover p50 16.7s · max 19.5s&lt;br&gt;flap onset &gt; 8s&lt;br&gt;&lt;i&gt;slow failover, no gain here&lt;/i&gt;"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;align=left;spacingLeft=10;fontSize=11;"
+          vertex="1" parent="1"><mxGeometry x="850" y="720" width="300" height="120" as="geometry" /></mxCell>
+        <mxCell id="54" value="failover ≈ LeaseDuration   ·   flap onset ≈ RenewDeadline   ·   all three CDC-correct (verify-cdc PASS)   →   6 / 4 / 1 is the knee"
+          style="text;html=1;align=center;verticalAlign=middle;fontStyle=2;fontSize=11;fontColor=#333333;"
+          vertex="1" parent="1"><mxGeometry x="110" y="858" width="1040" height="40" as="geometry" /></mxCell>
+
+        <!-- ===================== EDGES =====================
+             DATA PATH (blue, left→right spine):
+               writer→central→src#1(active)→NATS→snk#1(active)→region
+             ELECTION (upper band y174..300):
+               group↔lease (solid green = holds/renews; dashed gray = watch/acquire)
+             TRIGGER (red dashed): banner→active pods
+             SWEEP (purple dashed): cluster→comparison; tight→default→stock
+        ================================================= -->
+
+        <!-- data path -->
+        <mxCell id="60" value="XADD" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#6c8ebf;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="17" target="14" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="61" value="XREAD CDC" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#6c8ebf;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="14" target="21" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="62" value="publish (Nats-Msg-Id)" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#6c8ebf;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="21" target="15" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="63" value="pull consume" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#6c8ebf;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="15" target="31" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="64" value="SET/DEL (Lua)" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#6c8ebf;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="31" target="16" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- election: source -->
+        <mxCell id="65" value="holds + renews" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#82b366;fontColor=#5d8a3a;fontSize=9;exitX=0.3;exitY=0;exitDx=0;exitDy=0;entryX=0.3;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="20" target="12" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="66" value="watch → acquire on expiry" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#999999;fontColor=#777777;fontSize=9;exitX=0.7;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="12" target="20" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- election: sink -->
+        <mxCell id="67" value="holds + renews" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;strokeColor=#82b366;fontColor=#5d8a3a;fontSize=9;exitX=0.3;exitY=0;exitDx=0;exitDy=0;entryX=0.3;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="30" target="13" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="68" value="watch → acquire on expiry" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#999999;fontColor=#777777;fontSize=9;exitX=0.7;exitY=1;exitDx=0;exitDy=0;entryX=0.7;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="13" target="30" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- trigger: banner → active pods (red) -->
+        <mxCell id="69" value="delete leader" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#b85450;fontColor=#b85450;fontSize=9;exitX=0.2;exitY=1;exitDx=0;exitDy=0;entryX=0.9;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="41" target="21" parent="1">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="562" y="332" /></Array></mxGeometry></mxCell>
+        <mxCell id="70" value="delete leader" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#b85450;fontColor=#b85450;fontSize=9;exitX=0.8;exitY=1;exitDx=0;exitDy=0;entryX=0.1;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="41" target="31" parent="1">
+          <mxGeometry relative="1" as="geometry"><Array as="points"><mxPoint x="858" y="332" /></Array></mxGeometry></mxCell>
+
+        <!-- sweep link: cluster → comparison -->
+        <mxCell id="71" value="vary timings; re-run sweep per config" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#9673a6;fontColor=#9673a6;fontSize=9;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="10" target="50" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- comparison sequence: tight → default → stock -->
+        <mxCell id="72" value="helm upgrade" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#9673a6;fontColor=#9673a6;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="51" target="52" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="73" value="helm upgrade" style="edgeStyle=orthogonalEdgeStyle;html=1;rounded=1;dashed=1;strokeColor=#9673a6;fontColor=#9673a6;fontSize=9;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;"
+          edge="1" source="52" target="53" parent="1"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
