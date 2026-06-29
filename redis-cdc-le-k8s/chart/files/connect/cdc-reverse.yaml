@@ -64,13 +64,21 @@ pipeline:
         meta kv_key  = this.kv_key
         meta old_key = this.old_key
         meta new_key = this.new_key
-        # Transport: the new forward publishes body as gzip-then-base64 and marks it
-        # with enc="gzip:base64". Decode+decompress ONLY those. Legacy / in-flight
-        # messages published before this change carry a plain body and no enc marker —
-        # pass them through unchanged so a rolling upgrade (or a replay of pre-encoding
-        # JetStream messages) doesn't fail the decode and poison-loop on redelivery.
-        # Either branch yields the original raw bytes for the op switch below.
-        meta body    = if this.enc.or("") == "gzip:base64" { this.body.decode("base64").decompress("gzip") } else { this.body }
+        # OP-GATE the body decode: only create/update carry a value. delete carries
+        # just kv_key; rename just old_key/new_key — their envelopes have an empty or
+        # absent body (the forward still stamps enc/body for EVERY op, so we must NOT
+        # decode blindly: a null/missing body would make .decode("base64") throw ->
+        # nack -> redelivery poison-loop). So judge op FIRST, decode body only when the
+        # op actually has one; for delete/rename meta("body") stays unset (the switch
+        # below never reads it for those ops).
+        #   Transport (create/update only): the new forward publishes body as
+        #   gzip-then-base64 and marks it enc="gzip:base64" — decode+decompress ONLY
+        #   those. Legacy / in-flight create/update messages carry a plain body and no
+        #   enc marker, so the else branch passes them through unchanged (a rolling
+        #   upgrade or a replay of pre-encoding JetStream messages won't fail the decode).
+        meta body    = if this.op == "create" || this.op == "update" {
+          if this.enc.or("") == "gzip:base64" { this.body.decode("base64").decompress("gzip") } else { this.body }
+        }
     {{- if .Values.connect.contentLog.enabled }}
     # Dump exactly what is about to be applied to region Redis (the op switch below
     # turns these into SET / DEL / rename-EVAL). body holds the full value payload.
@@ -87,8 +95,9 @@ pipeline:
           root.old_key = meta("old_key")
           root.new_key = meta("new_key")
           # body is post-decompress raw bytes (may be binary) — log length, not
-          # content, so binary doesn't garble the log line.
-          root.body_len = meta("body").length()
+          # content, so binary doesn't garble the log line. .or("") because body is
+          # now unset for delete/rename (op-gated above); null.length() would error.
+          root.body_len = meta("body").or("").length()
     {{- end }}
     - switch:
         - check: meta("op") == "create" || meta("op") == "update"
