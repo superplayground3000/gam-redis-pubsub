@@ -143,6 +143,21 @@ Usage: {{ include "rrcs.redis.validateMode" (dict "side" "central" "mode" .Value
 {{- end -}}
 
 {{/*
+rrcs.connect.bodyEncoding — fail-closed enum guard for the forward leg's body wire
+format; returns the validated value. Validated at template time so a typo (e.g.
+"gzip", "GZIP:BASE64") fails the render instead of silently selecting the lossy
+legacy content().string() path, which corrupts binary/invalid-UTF-8 bodies.
+Usage: {{ include "rrcs.connect.bodyEncoding" . }}
+*/}}
+{{- define "rrcs.connect.bodyEncoding" -}}
+{{- $e := .Values.connect.bodyEncoding | default "none" -}}
+{{- if not (has $e (list "none" "gzip:base64")) -}}
+{{- fail (printf "connect.bodyEncoding=%q is invalid — must be \"none\" or \"gzip:base64\"." $e) -}}
+{{- end -}}
+{{- $e -}}
+{{- end -}}
+
+{{/*
 rrcs.redis.{central,region}.cluster — "true"/"false" for the Go components'
 *_CLUSTER env, the verifier's -redis-*-cluster flags, and connectKind. One
 source of truth for "talk to this Redis as a cluster":

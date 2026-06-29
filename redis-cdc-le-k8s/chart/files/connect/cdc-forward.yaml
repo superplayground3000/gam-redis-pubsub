@@ -70,7 +70,7 @@ pipeline:
           "old_key":  meta("old_key").or(""),
           "new_key":  meta("new_key").or(""),
           "ts":       meta("ts").or("0"),
-          {{- if eq .Values.connect.bodyEncoding "gzip:base64" }}
+          {{- if eq (include "rrcs.connect.bodyEncoding" .) "gzip:base64" }}
           "enc":      "gzip:base64",                                   # self-describing marker; the reverse leg auto-detects it
           "body":     content().compress("gzip").encode("base64")      # raw bytes -> gzip -> base64: lossless, no JSON escape/U+FFFD
           {{- else }}
