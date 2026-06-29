@@ -45,6 +45,35 @@ RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh
 0 only when all three checks pass (dedup, per-op-under-quiescence, idempotent
 replay).
 
+## Body encoding & backward-safe upgrade
+
+The CDC body inside the NATS envelope can be carried as a plain string
+(`connect.bodyEncoding: "none"`, the default) or **gzip-then-base64**
+(`"gzip:base64"`). Plain `content().string()` both bloats and *silently corrupts*
+non-UTF-8/binary values (Go's JSON encoder rewrites invalid bytes to U+FFFD);
+`gzip:base64` carries the raw bytes losslessly and smaller. The **sink leg
+auto-detects** the format per message via the envelope's `enc` field, so it always
+consumes both — only the **source leg** honors the flag.
+
+`values-dev.yaml` enables `gzip:base64` (kind installs are fresh, so both legs start
+new together — safe). Because this is a wire-format change, **upgrading an existing
+deployment is reader-first** — the sink must understand the new format before the
+source produces it:
+
+```bash
+# 1. Deploy this chart with encoding still OFF; roll BOTH legs.
+#    Sink becomes decode-capable while the source still emits plain bodies (safe in any order).
+helm upgrade cdc ./chart -n cdc-k8s --set profile=cdc --set connect.bodyEncoding=none
+kubectl -n cdc-k8s rollout restart deploy/lab-connect-sink deploy/lab-connect-source
+
+# 2. Flip encoding ON; roll ONLY the source. Every sink already decodes.
+helm upgrade cdc ./chart -n cdc-k8s --set profile=cdc --set connect.bodyEncoding=gzip:base64
+kubectl -n cdc-k8s rollout restart deploy/lab-connect-source
+```
+
+(The chart has no configmap-checksum annotation, so pods must be rolled to re-POST a
+changed pipeline — the elector POSTs only on lease acquisition.)
+
 ## Inspect leader election
 
 ```bash

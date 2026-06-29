@@ -13,3 +13,9 @@ elector:
 nats:
   persistence:
     mode: emptyDir
+# kind runs are fresh installs (both connect legs start new together), so the
+# binary-safe encoding is safe to enable from the start — and verify-cdc.sh exercises
+# it. For an in-place upgrade of an existing deployment use the two-step procedure in
+# values.yaml (roll the sink first, then enable encoding on the source).
+connect:
+  bodyEncoding: "gzip:base64"

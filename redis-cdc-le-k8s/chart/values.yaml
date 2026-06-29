@@ -111,6 +111,23 @@ natsBox:
 # pipeline; standbys idle. One Lease + stream id + ServiceAccount per leg.
 connect:
   image: hpdevelop/connect:4.92.0-claudefix
+  # Wire format for the CDC body carried inside the NATS envelope. Only the FORWARD
+  # (source) leg honors this; the REVERSE (sink) leg auto-detects per message via the
+  # envelope's "enc" field, so it always consumes BOTH formats.
+  #   "none"        — legacy plain body (content().string()). UTF-8 only: binary or
+  #                   invalid-UTF-8 values are bloated and silently corrupted (U+FFFD).
+  #   "gzip:base64" — body is gzip-compressed then base64-encoded: binary-safe,
+  #                   lossless, and smaller for compressible payloads.
+  #
+  # Default is "none" so a chart upgrade is BACKWARD-SAFE by default (the wire format
+  # does not change until you opt in). This is a wire-format change, so the READER must
+  # understand the new format before the WRITER produces it — upgrade in two steps:
+  #   1. helm upgrade (bodyEncoding stays "none") and roll BOTH legs. The sink becomes
+  #      decode-capable while the source still emits plain bodies — safe in any order.
+  #   2. set bodyEncoding="gzip:base64" and roll ONLY the source leg. Every sink already
+  #      decodes, so no encoded body is ever produced for a sink that can't read it.
+  # Fresh installs may set "gzip:base64" directly (both legs start new together).
+  bodyEncoding: "none"
   # Debug-only: dump full Redis stream + NATS message content on both CDC legs
   # (forward: redis_in/nats_out; reverse: nats_in/redis_apply). OFF by default —
   # the dumped body is real application data (exposure risk) and it logs one line

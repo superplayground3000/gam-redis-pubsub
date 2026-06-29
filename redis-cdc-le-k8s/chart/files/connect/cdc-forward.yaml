@@ -6,13 +6,18 @@
 # PAYLOAD (op/keys/body inside it) so the sink never depends on NATS
 # header->metadata mapping.
 #
-# TRANSPORT ENCODING: the body is carried as gzip-then-base64 (envelope field
-# enc="gzip:base64"). We compress content() RAW BYTES — never content().string()
-# — because reinterpreting binary as UTF-8 and stuffing it into a JSON string both
-# (a) bloats it (control bytes escape 1->6 as \u00XX) and (b) CORRUPTS it (Go's
-# json encoder replaces invalid UTF-8 with U+FFFD, irreversibly). base64 is pure
-# ASCII (no JSON escaping, lossless); gzip shrinks compressible bodies. The reverse
-# leg decodes+decompresses symmetrically back to the original bytes before applying.
+# TRANSPORT ENCODING (connect.bodyEncoding): when "gzip:base64" the body is carried
+# as gzip-then-base64 and tagged with envelope enc="gzip:base64"; when "none" it is
+# the legacy plain content().string(). We compress content() RAW BYTES — never
+# content().string() — because reinterpreting binary as UTF-8 and stuffing it into a
+# JSON string both (a) bloats it (control bytes escape 1->6 as \u00XX) and
+# (b) CORRUPTS it (Go's json encoder replaces invalid UTF-8 with U+FFFD,
+# irreversibly). base64 is pure ASCII (no JSON escaping, lossless); gzip shrinks
+# compressible bodies. The reverse leg AUTO-DETECTS per message via the enc field, so
+# it consumes BOTH formats — which makes a backward-safe upgrade reader-first: roll
+# the sink leg onto this chart BEFORE flipping bodyEncoding to "gzip:base64" on the
+# source, so no encoded body is ever produced for a sink that can't decode it. See
+# values.yaml connect.bodyEncoding for the two-step procedure.
 #
 # This file is POSTed verbatim by the source elector once it wins the Lease (the
 # http/logger/metrics blocks live in observability.yaml). The streams REST API
@@ -65,8 +70,12 @@ pipeline:
           "old_key":  meta("old_key").or(""),
           "new_key":  meta("new_key").or(""),
           "ts":       meta("ts").or("0"),
-          "enc":      "gzip:base64",                                   # self-describing transport encoding (reverse + future compat)
+          {{- if eq .Values.connect.bodyEncoding "gzip:base64" }}
+          "enc":      "gzip:base64",                                   # self-describing marker; the reverse leg auto-detects it
           "body":     content().compress("gzip").encode("base64")      # raw bytes -> gzip -> base64: lossless, no JSON escape/U+FFFD
+          {{- else }}
+          "body":     content().string()                              # legacy plain body (UTF-8 only); no enc marker -> reverse passes through
+          {{- end }}
         }
         meta op       = meta("op").or("update")     # used for the subject interpolation
         meta event_id = $eid                          # used for the Nats-Msg-Id header
