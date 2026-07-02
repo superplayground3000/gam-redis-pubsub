@@ -120,30 +120,36 @@ for fb in "${FBS[@]}"; do
   # INCONCLUSIVE (never a silent pass). Then re-bind and prove recovery to N.
   req=$(require_inflight "$fb")
 
-  # proof_and_recover <label> <fb>: run after the close has fired. Reads post-close
-  # state, asserts interruption, re-binds, verifies no loss. Sets overall=1 on
-  # inconclusive/loss. Assumes a fresh consumer is bound after post_reverse.
-  proof_and_recover(){ local L=$1 FB=$2
-    local ab uf ac; ab=$(cf '.num_ack_pending'); ac=$(region_keys); uf=$(( MSG_COUNT - ac ))
-    echo "$L fb=$FB: interrupted in-flight(abandoned un-acked)=${ab}; applied_at_close=${ac}/${MSG_COUNT} (unfinished=${uf})"
-    if [ "${ab:-0}" -lt 1 ] 2>/dev/null || [ "${uf:-0}" -lt 1 ] 2>/dev/null; then
-      echo "$L fb=$FB INCONCLUSIVE: close interrupted no live work (abandoned=${ab}, unfinished=${uf}) — NOT a pass"; overall=1; return 1
-    fi
-    post_reverse "$FB"; wait_quiescent || fail "$L fb=$FB: not quiescent after re-bind"
-    if hp verify -count "${MSG_COUNT}"; then
-      echo "  -> ${uf} unfinished keys (incl ${ab} interrupted in-flight) recovered via redelivery; no loss"
-    else overall=1; echo "$L fb=$FB FAIL (LOSS)"; fi
-  }
+  # After a non-blocking DELETE, connect tears the stream down ASYNCHRONOUSLY while
+  # still alive (it may apply+ack part of the in-flight batch during teardown). So
+  # measuring num_ack_pending immediately would RACE the teardown. Wait until the
+  # stream is gone (GET 404) AND num_ack_pending has stopped changing, so the
+  # abandoned/interrupted count is STABLE. (SIGTERM/SIGKILL need no such barrier —
+  # the process is confirmed dead before we measure, so the count can't move.)
+  settle_after_delete(){ local prev="x" cur code i
+    for i in $(seq 1 40); do
+      code=$(curl -sS -o /dev/null -w '%{http_code}' "$API/streams/reverse" 2>/dev/null)
+      cur=$(cf '.num_ack_pending')
+      [ "$code" = 404 ] && [ "$cur" = "$prev" ] && return 0
+      prev="$cur"
+    done; return 0; }   # fallback: ~6s of polling is ample teardown time regardless
 
-  # Experiment 1 — Streams DELETE.
+  # Experiment 1 — Streams DELETE (measured only AFTER teardown settles).
   reset_consumer; flush_redis; post_reverse "$fb"
   hp publish -count "${MSG_COUNT}" >/dev/null
   if ! armed=$(arm "$req" 15); then
     echo "EXP1 fb=$fb INCONCLUSIVE: could not arm num_ack_pending>=${req} (saw ${armed}) — NOT a pass"; overall=1
   else
     t0=$(date +%s.%N); code=$(del_reverse); t1=$(date +%s.%N)
-    echo "exp1 fb=$fb: DELETE -> $code in $(awk "BEGIN{printf \"%.2f\", $t1-$t0}")s"
-    proof_and_recover EXP1 "$fb"
+    settle_after_delete                       # wait async teardown to finish → stable count
+    ab=$(cf '.num_ack_pending'); ac=$(region_keys); uf=$(( MSG_COUNT - ac ))
+    echo "exp1 fb=$fb: DELETE -> $code in $(awk "BEGIN{printf \"%.2f\", $t1-$t0}")s | interrupted in-flight=${ab} (stable, post-teardown); applied_at_close=${ac}/${MSG_COUNT} (unfinished=${uf})"
+    if [ "${ab:-0}" -lt 1 ] 2>/dev/null || [ "${uf:-0}" -lt 1 ] 2>/dev/null; then
+      echo "EXP1 fb=$fb INCONCLUSIVE: DELETE interrupted no live work (abandoned=${ab}, unfinished=${uf}) — NOT a pass"; overall=1
+    else
+      post_reverse "$fb"; wait_quiescent || fail "exp1 fb=$fb: not quiescent after re-bind"
+      hp verify -count "${MSG_COUNT}" && echo "  -> ${uf} unfinished keys (incl ${ab} interrupted in-flight) recovered via redelivery; no loss" || { overall=1; echo "EXP1 fb=$fb FAIL (LOSS)"; }
+    fi
   fi
   del_reverse >/dev/null; sleep 1
 

@@ -310,8 +310,14 @@ All nine findings plus the stop-time follow-up folded in above. Status:
   each close must leave `num_ack_pending ≥ 1` (in-flight messages it abandoned un-acked) AND region
   `kv:*` count `< N` (unfinished backlog) at the moment of the close; otherwise the experiment is
   **INCONCLUSIVE** (never a pass). Then re-bind and prove recovery to identity-checked N.
-  Re-validated: interrupted-in-flight scales 1→15→117 with fetch_batch_size, unfinished ≥116 at
-  every close, all recover to N — no loss.
+  A further follow-up caught that the **DELETE** measurement raced connect's *async* teardown:
+  connect stays alive after the non-blocking DELETE and may apply+ack part of the batch during
+  teardown (unlike the confirmed-dead process after SIGTERM/SIGKILL), so an immediate read of
+  `num_ack_pending` is indeterminate. Fixed with a settle barrier — after DELETE, wait for
+  `GET /streams/reverse` → 404 (confirmed: 200 before, 404 immediately after) AND `num_ack_pending`
+  stable across reads before measuring.
+  Re-validated: interrupted-in-flight is stable post-teardown and scales 1→15→117 with
+  fetch_batch_size, unfinished ≥115 at every close, all recover to N — no loss.
 - RE-REVIEW ×6 (scenario-1 drain bound `margin` unspecified — too tight ⇒ spurious fail, too loose
   ⇒ non-draining build passes) → **resolved** by fixing `margin = max(2×SLEEP_MS, 500ms)`, keeping
   the `applied:*==1` counter as the primary drain-vs-redelivery discriminator (a non-draining build
