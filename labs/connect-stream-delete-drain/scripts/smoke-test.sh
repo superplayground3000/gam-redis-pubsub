@@ -126,22 +126,28 @@ for fb in "${FBS[@]}"; do
   # stream is gone (GET 404) AND num_ack_pending has stopped changing, so the
   # abandoned/interrupted count is STABLE. (SIGTERM/SIGKILL need no such barrier —
   # the process is confirmed dead before we measure, so the count can't move.)
-  settle_after_delete(){ local prev="x" cur code i
-    for i in $(seq 1 40); do
+  # FAIL CLOSED: returns 0 ONLY if it positively confirms teardown settled
+  # (GET 404 AND two consecutive equal num_ack_pending reads); returns 1 if it
+  # cannot confirm within the budget, so the caller must treat the measurement as
+  # untrusted (INCONCLUSIVE) rather than proceed on a raced value.
+  settle_after_delete(){ local prev="" cur code i
+    for i in $(seq 1 60); do
       code=$(curl -sS -o /dev/null -w '%{http_code}' "$API/streams/reverse" 2>/dev/null)
       cur=$(cf '.num_ack_pending')
-      [ "$code" = 404 ] && [ "$cur" = "$prev" ] && return 0
+      [ "$code" = 404 ] && [ -n "$prev" ] && [ "$cur" = "$prev" ] && return 0
       prev="$cur"
-    done; return 0; }   # fallback: ~6s of polling is ample teardown time regardless
+    done; return 1; }   # never confirmed settled → fail closed
 
-  # Experiment 1 — Streams DELETE (measured only AFTER teardown settles).
+  # Experiment 1 — Streams DELETE (measured only AFTER teardown positively settles).
   reset_consumer; flush_redis; post_reverse "$fb"
   hp publish -count "${MSG_COUNT}" >/dev/null
   if ! armed=$(arm "$req" 15); then
     echo "EXP1 fb=$fb INCONCLUSIVE: could not arm num_ack_pending>=${req} (saw ${armed}) — NOT a pass"; overall=1
   else
     t0=$(date +%s.%N); code=$(del_reverse); t1=$(date +%s.%N)
-    settle_after_delete                       # wait async teardown to finish → stable count
+    if ! settle_after_delete; then
+      echo "EXP1 fb=$fb INCONCLUSIVE: DELETE teardown never settled (no GET 404 + stable num_ack_pending within budget) — measurement untrusted, NOT a pass"; overall=1
+    else
     ab=$(cf '.num_ack_pending'); ac=$(region_keys); uf=$(( MSG_COUNT - ac ))
     echo "exp1 fb=$fb: DELETE -> $code in $(awk "BEGIN{printf \"%.2f\", $t1-$t0}")s | interrupted in-flight=${ab} (stable, post-teardown); applied_at_close=${ac}/${MSG_COUNT} (unfinished=${uf})"
     if [ "${ab:-0}" -lt 1 ] 2>/dev/null || [ "${uf:-0}" -lt 1 ] 2>/dev/null; then
@@ -149,6 +155,7 @@ for fb in "${FBS[@]}"; do
     else
       post_reverse "$fb"; wait_quiescent || fail "exp1 fb=$fb: not quiescent after re-bind"
       hp verify -count "${MSG_COUNT}" && echo "  -> ${uf} unfinished keys (incl ${ab} interrupted in-flight) recovered via redelivery; no loss" || { overall=1; echo "EXP1 fb=$fb FAIL (LOSS)"; }
+    fi
     fi
   fi
   del_reverse >/dev/null; sleep 1

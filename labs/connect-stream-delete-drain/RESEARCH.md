@@ -315,7 +315,9 @@ All nine findings plus the stop-time follow-up folded in above. Status:
   teardown (unlike the confirmed-dead process after SIGTERM/SIGKILL), so an immediate read of
   `num_ack_pending` is indeterminate. Fixed with a settle barrier — after DELETE, wait for
   `GET /streams/reverse` → 404 (confirmed: 200 before, 404 immediately after) AND `num_ack_pending`
-  stable across reads before measuring.
+  stable across reads before measuring. The barrier **fails closed**: if it cannot positively
+  confirm 404+stable within its budget it returns failure, and exp1 is marked **INCONCLUSIVE** —
+  it never proceeds to measure (and possibly pass) on an unsettled/raced value.
   Re-validated: interrupted-in-flight is stable post-teardown and scales 1→15→117 with
   fetch_batch_size, unfinished ≥115 at every close, all recover to N — no loss.
 - RE-REVIEW ×6 (scenario-1 drain bound `margin` unspecified — too tight ⇒ spurious fail, too loose
