@@ -303,13 +303,15 @@ All nine findings plus the stop-time follow-up folded in above. Status:
   now sweeps `fetch_batch_size` and asserts identity-N-after-rebind (drain bound scoped to fb=1),
   the drain barrier became a re-bind→redelivery barrier, and `fetch_batch_size`/`nats_num_delivered`
   are confirmed. Confirms the core claim: **the build never acks-before-apply → no msg loss.**
-- STOP-REVIEW (post-build): close experiments could silently pass without proving any in-flight
-  work existed at shutdown — the first smoke-test only printed a NOTE when `num_ack_pending`
-  under-armed (and discarded the value entirely for SIGTERM/SIGKILL), so `fb=1 exp1` passed with
-  `armed=0`. **Fixed**: `smoke-test.sh` now enforces deterministic arming — each close fires only
-  after observing `num_ack_pending ≥ min(ARM_INFLIGHT, fetch_batch_size)` (≥1), via fast
-  back-to-back polling; if it cannot arm, the experiment is **INCONCLUSIVE** (overall fail), never a
-  pass. Re-validated: fb=1 arms at 2, fb=16 at 16, fb=256 at 118 — all still NO-LOSS.
+- STOP-REVIEW (post-build): close experiments could pass without proving the close interrupted
+  live work. First the smoke-test didn't assert arming at all; then it asserted *pre-close* arming
+  (`num_ack_pending ≥ req`), which is still insufficient — the observe→fire gap means the in-flight
+  work could drain before the close lands. **Fixed**: the proof is now measured **post-close** —
+  each close must leave `num_ack_pending ≥ 1` (in-flight messages it abandoned un-acked) AND region
+  `kv:*` count `< N` (unfinished backlog) at the moment of the close; otherwise the experiment is
+  **INCONCLUSIVE** (never a pass). Then re-bind and prove recovery to identity-checked N.
+  Re-validated: interrupted-in-flight scales 1→15→117 with fetch_batch_size, unfinished ≥116 at
+  every close, all recover to N — no loss.
 - RE-REVIEW ×6 (scenario-1 drain bound `margin` unspecified — too tight ⇒ spurious fail, too loose
   ⇒ non-draining build passes) → **resolved** by fixing `margin = max(2×SLEEP_MS, 500ms)`, keeping
   the `applied:*==1` counter as the primary drain-vs-redelivery discriminator (a non-draining build

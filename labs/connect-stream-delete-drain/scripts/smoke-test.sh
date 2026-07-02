@@ -97,6 +97,8 @@ IFS=',' read -ra FBS <<< "${FETCH_BATCH_SIZES}"
 overall=0
 connect_ready(){ for _ in $(seq 1 60); do [ "$(curl -sS -o /dev/null -w '%{http_code}' "$API/ready" 2>/dev/null)" = 200 ] && return 0; sleep 1; done; return 1; }
 restart_connect(){ docker compose up -d connect >/dev/null 2>&1; connect_ready || fail "connect not ready after restart"; }
+# region_keys: count applied region keys kv:* (excludes applied:* and the ledger hash).
+region_keys(){ docker compose exec -T redis redis-cli --scan --pattern 'kv:*' 2>/dev/null | grep -c '^kv:'; }
 nfault=$(( FAULT_EVERY>0 ? MSG_COUNT/FAULT_EVERY : 0 ))
 
 for fb in "${FBS[@]}"; do
@@ -111,70 +113,94 @@ for fb in "${FBS[@]}"; do
   hp verify -count "${MSG_COUNT}" || { overall=1; echo "EXP0 fb=$fb FAIL"; }
   del_reverse >/dev/null; sleep 1
 
-  # Close experiments share deterministic arming: publish a backlog, then fire the
-  # close ONLY once a required in-flight set is observed. If it can't be armed, the
-  # experiment is INCONCLUSIVE (overall=1) — never a silent pass.
+  # Close experiments. Arming (pre-close) only ensures work is flowing; the PROOF
+  # that a close interrupted LIVE work is measured POST-close: num_ack_pending>0
+  # (in-flight messages the close left abandoned un-acked) AND region keys < N
+  # (unfinished backlog). If neither holds, the close interrupted nothing ⇒
+  # INCONCLUSIVE (never a silent pass). Then re-bind and prove recovery to N.
   req=$(require_inflight "$fb")
 
-  # Experiment 1 — Streams DELETE, then re-bind ⇒ redelivery recovery.
+  # proof_and_recover <label> <fb>: run after the close has fired. Reads post-close
+  # state, asserts interruption, re-binds, verifies no loss. Sets overall=1 on
+  # inconclusive/loss. Assumes a fresh consumer is bound after post_reverse.
+  proof_and_recover(){ local L=$1 FB=$2
+    local ab uf ac; ab=$(cf '.num_ack_pending'); ac=$(region_keys); uf=$(( MSG_COUNT - ac ))
+    echo "$L fb=$FB: interrupted in-flight(abandoned un-acked)=${ab}; applied_at_close=${ac}/${MSG_COUNT} (unfinished=${uf})"
+    if [ "${ab:-0}" -lt 1 ] 2>/dev/null || [ "${uf:-0}" -lt 1 ] 2>/dev/null; then
+      echo "$L fb=$FB INCONCLUSIVE: close interrupted no live work (abandoned=${ab}, unfinished=${uf}) — NOT a pass"; overall=1; return 1
+    fi
+    post_reverse "$FB"; wait_quiescent || fail "$L fb=$FB: not quiescent after re-bind"
+    if hp verify -count "${MSG_COUNT}"; then
+      echo "  -> ${uf} unfinished keys (incl ${ab} interrupted in-flight) recovered via redelivery; no loss"
+    else overall=1; echo "$L fb=$FB FAIL (LOSS)"; fi
+  }
+
+  # Experiment 1 — Streams DELETE.
   reset_consumer; flush_redis; post_reverse "$fb"
   hp publish -count "${MSG_COUNT}" >/dev/null
-  armed=$(arm "$req" 15) && armok=1 || armok=0
-  if [ "$armok" = 0 ]; then
-    echo "EXP1 fb=$fb INCONCLUSIVE: armed num_ack_pending=${armed} < required ${req} (no in-flight at close) — NOT a pass"
-    overall=1; del_reverse >/dev/null; sleep 1
+  if ! armed=$(arm "$req" 15); then
+    echo "EXP1 fb=$fb INCONCLUSIVE: could not arm num_ack_pending>=${req} (saw ${armed}) — NOT a pass"; overall=1
   else
     t0=$(date +%s.%N); code=$(del_reverse); t1=$(date +%s.%N)
-    abandoned=$(cf '.num_ack_pending')
-    echo "exp1 fb=$fb: armed=${armed} (>=${req}); DELETE -> $code in $(awk "BEGIN{printf \"%.2f\", $t1-$t0}")s; abandoned un-acked=${abandoned}"
-    post_reverse "$fb"                       # re-bind ⇒ redelivery drains
-    wait_quiescent || fail "exp1 fb=$fb: not quiescent after re-bind"
-    hp verify -count "${MSG_COUNT}" || { overall=1; echo "EXP1 fb=$fb FAIL (LOSS)"; }
-    del_reverse >/dev/null; sleep 1
+    echo "exp1 fb=$fb: DELETE -> $code in $(awk "BEGIN{printf \"%.2f\", $t1-$t0}")s"
+    proof_and_recover EXP1 "$fb"
   fi
+  del_reverse >/dev/null; sleep 1
 
-  # Experiment 2 — SIGTERM, restart, re-bind.
+  # Experiment 2 — SIGTERM (docker stop waits for exit), restart, re-bind.
   reset_consumer; flush_redis; post_reverse "$fb"
   hp publish -count "${MSG_COUNT}" >/dev/null
-  armed=$(arm "$req" 15) && armok=1 || armok=0
-  if [ "$armok" = 0 ]; then
-    echo "EXP2 fb=$fb INCONCLUSIVE: armed=${armed} < required ${req} — NOT a pass"
-    overall=1; docker compose up -d connect >/dev/null 2>&1; del_reverse >/dev/null; sleep 1
+  if ! armed=$(arm "$req" 15); then
+    echo "EXP2 fb=$fb INCONCLUSIVE: could not arm (saw ${armed}) — NOT a pass"; overall=1
+    docker compose up -d connect >/dev/null 2>&1
   else
-    echo "exp2 fb=$fb: armed=${armed} (>=${req}); SIGTERM"
-    docker compose stop -t 30 connect >/dev/null 2>&1   # SIGTERM, wait for exit
-    restart_connect; post_reverse "$fb"
-    wait_quiescent || fail "exp2 fb=$fb: not quiescent after SIGTERM+restart"
-    hp verify -count "${MSG_COUNT}" || { overall=1; echo "EXP2 fb=$fb FAIL (LOSS)"; }
-    del_reverse >/dev/null; sleep 1
+    echo "exp2 fb=$fb: SIGTERM"
+    docker compose stop -t 30 connect >/dev/null 2>&1
+    ab_pre=$(cf '.num_ack_pending'); ac_pre=$(region_keys)   # measure while connect down
+    restart_connect
+    # re-assert post-close state captured pre-restart via proof helper inputs
+    if [ "${ab_pre:-0}" -lt 1 ] 2>/dev/null || [ "$(( MSG_COUNT - ac_pre ))" -lt 1 ] 2>/dev/null; then
+      echo "EXP2 fb=$fb INCONCLUSIVE: SIGTERM interrupted no live work (abandoned=${ab_pre}, applied_at_close=${ac_pre}/${MSG_COUNT}) — NOT a pass"; overall=1; del_reverse >/dev/null
+    else
+      echo "EXP2 fb=$fb: interrupted in-flight=${ab_pre}; applied_at_close=${ac_pre}/${MSG_COUNT} (unfinished=$(( MSG_COUNT - ac_pre )))"
+      post_reverse "$fb"; wait_quiescent || fail "exp2 fb=$fb: not quiescent after SIGTERM+restart"
+      hp verify -count "${MSG_COUNT}" && echo "  -> recovered via redelivery; no loss" || { overall=1; echo "EXP2 fb=$fb FAIL (LOSS)"; }
+    fi
   fi
+  del_reverse >/dev/null; sleep 1
 
   # Experiment 3 — SIGKILL, restart, re-bind (safety floor).
   reset_consumer; flush_redis; post_reverse "$fb"
   hp publish -count "${MSG_COUNT}" >/dev/null
-  armed=$(arm "$req" 15) && armok=1 || armok=0
-  if [ "$armok" = 0 ]; then
-    echo "EXP3 fb=$fb INCONCLUSIVE: armed=${armed} < required ${req} — NOT a pass"
-    overall=1; docker compose up -d connect >/dev/null 2>&1; del_reverse >/dev/null; sleep 1
+  if ! armed=$(arm "$req" 15); then
+    echo "EXP3 fb=$fb INCONCLUSIVE: could not arm (saw ${armed}) — NOT a pass"; overall=1
+    docker compose up -d connect >/dev/null 2>&1
   else
-    echo "exp3 fb=$fb: armed=${armed} (>=${req}); SIGKILL"
+    echo "exp3 fb=$fb: SIGKILL"
     docker compose kill -s SIGKILL connect >/dev/null 2>&1
-    restart_connect; post_reverse "$fb"
-    wait_quiescent || fail "exp3 fb=$fb: not quiescent after SIGKILL+restart"
-    hp verify -count "${MSG_COUNT}" || { overall=1; echo "EXP3 fb=$fb FAIL (LOSS)"; }
-    del_reverse >/dev/null; sleep 1
+    ab_pre=$(cf '.num_ack_pending'); ac_pre=$(region_keys)   # measure while connect dead
+    restart_connect
+    if [ "${ab_pre:-0}" -lt 1 ] 2>/dev/null || [ "$(( MSG_COUNT - ac_pre ))" -lt 1 ] 2>/dev/null; then
+      echo "EXP3 fb=$fb INCONCLUSIVE: SIGKILL interrupted no live work (abandoned=${ab_pre}, applied_at_close=${ac_pre}/${MSG_COUNT}) — NOT a pass"; overall=1; del_reverse >/dev/null
+    else
+      echo "EXP3 fb=$fb: interrupted in-flight=${ab_pre}; applied_at_close=${ac_pre}/${MSG_COUNT} (unfinished=$(( MSG_COUNT - ac_pre )))"
+      post_reverse "$fb"; wait_quiescent || fail "exp3 fb=$fb: not quiescent after SIGKILL+restart"
+      hp verify -count "${MSG_COUNT}" && echo "  -> recovered via redelivery; no loss" || { overall=1; echo "EXP3 fb=$fb FAIL (LOSS)"; }
+    fi
   fi
+  del_reverse >/dev/null; sleep 1
 done
 
 line
 if [ "$overall" = 0 ]; then
-  echo "SMOKE-PASS: every close was armed with real in-flight work AND lost no messages,"
-  echo "  across DELETE/SIGTERM/SIGKILL for all fetch_batch_size in {${FETCH_BATCH_SIZES}}."
-  echo "  (exp1 'abandoned un-acked' = the redelivery window on close; it scales with fetch_batch_size —"
-  echo "   ~1 at fb=1 (drain-clean) up to ~fetch_batch_size — while every key stays present & identity-correct.)"
+  echo "SMOKE-PASS: every close provably interrupted LIVE in-flight work — post-close there were"
+  echo "  abandoned un-acked messages AND unfinished backlog (<N applied) — yet all N keys recovered"
+  echo "  to the region with correct identity via redelivery. Across DELETE/SIGTERM/SIGKILL for all"
+  echo "  fetch_batch_size in {${FETCH_BATCH_SIZES}}. The interrupted-in-flight count scales with"
+  echo "  fetch_batch_size (~1 at fb=1 up to ~fetch_batch_size); no setting loses a message."
 else
   echo "SMOKE-FAIL: at least one experiment lost messages, failed identity, or was INCONCLUSIVE"
-  echo "  (could not arm real in-flight work at close) — see EXP*/FAIL/INCONCLUSIVE lines above."
+  echo "  (close interrupted no live in-flight work) — see EXP*/FAIL/INCONCLUSIVE lines above."
 fi
 [ "${KEEP:-0}" = 1 ] || { echo "== teardown =="; docker compose down -v 2>&1 | tail -2; }
 exit "$overall"
