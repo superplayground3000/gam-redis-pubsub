@@ -1,0 +1,26 @@
+# P3 — slow pipeline (500ms/msg, threads:1) so a burst leaves a large in-flight
+# (fetched-but-unacked) set. The probe publishes a burst, waits until
+# num_ack_pending>0, then DELETEs the stream and observes whether the in-flight
+# messages are drained (completed → drop acks them → num_ack_pending falls to 0
+# without waiting for ack_wait redelivery) or hard-closed (abandoned un-acked →
+# only reappear after ack_wait). Also times the DELETE call to see if it blocks
+# until drain completes.
+input:
+  nats_jetstream:
+    urls: ["nats://nats:4222"]
+    stream: PROBE
+    durable: probe_cons
+    bind: true
+    fetch_batch_size: 1
+pipeline:
+  threads: 1
+  processors:
+    - sleep:
+        duration: 500ms
+    - log:
+        level: INFO
+        message: PROBE_APPLIED
+        fields_mapping: |
+          root.num_delivered = meta("nats_num_delivered")
+output:
+  drop: {}
