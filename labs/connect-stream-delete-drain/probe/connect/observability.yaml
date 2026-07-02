@@ -1,0 +1,13 @@
+# Streams-mode bootstrap (connect streams -o ...). Holds http/logger/metrics;
+# the actual input/pipeline/output is POSTed at runtime to /streams/{id}.
+# JSON logs so the probe script can grep structured fields (metadata dump).
+http:
+  address: 0.0.0.0:4195
+  enabled: true
+logger:
+  level: INFO
+  format: json
+  add_timestamp: true
+metrics:
+  prometheus:
+    use_histogram_timing: true

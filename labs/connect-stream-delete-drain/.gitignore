@@ -1,0 +1,4 @@
+# Local env copy (use .env.example as the template); never commit a real .env.
+.env
+# Go build artifact from host `go build` (image is built in Docker).
+harness/cdc-drain-harness

@@ -1,0 +1,19 @@
+# P1 — dump ALL JetStream metadata at processor time to discover the
+# delivery-count key this build exposes (expected candidate: nats_num_delivered).
+input:
+  nats_jetstream:
+    urls: ["nats://nats:4222"]
+    stream: PROBE
+    durable: probe_cons
+    bind: true
+    fetch_batch_size: 256
+pipeline:
+  threads: 1
+  processors:
+    - log:
+        level: INFO
+        message: PROBE_META
+        fields_mapping: |
+          root.all_meta = metadata()
+output:
+  drop: {}

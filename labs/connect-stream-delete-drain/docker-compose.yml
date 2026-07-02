@@ -1,0 +1,80 @@
+name: cdc-drain-lab
+
+networks:
+  lab: { driver: bridge }
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js", "-sd", "/data", "-m", "8222"]
+    ports: ["${NATS_MON_PORT:-18222}:8222"]
+    networks: [lab]
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--protected-mode", "no", "--save", "", "--appendonly", "no"]
+    ports: ["${REDIS_PORT:-16379}:6379"]
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # One-shot: wait for NATS, create the KV_CDC stream + pull consumer cdc_sink.
+  # NATS itself has no healthcheck (distroless image, no shell); readiness is
+  # gated by this Job completing, matching the production chart's nats-init.
+  nats-init:
+    image: natsio/nats-box:0.14.5
+    depends_on: [nats]
+    networks: [lab]
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        until nats --server nats://nats:4222 rtt >/dev/null 2>&1; do echo waiting nats; sleep 1; done
+        nats --server nats://nats:4222 stream add KV_CDC \
+          --subjects 'kv.cdc.>' --storage file --replicas 1 --retention limits \
+          --discard old --max-age 1h --max-bytes 256MB --max-msgs=-1 \
+          --max-msg-size 1MB --dupe-window 2m --defaults
+        nats --server nats://nats:4222 consumer add KV_CDC cdc_sink \
+          --pull --filter 'kv.cdc.>' --ack explicit --deliver all --replay instant \
+          --wait ${ACK_WAIT:-3s} --max-pending 4096 --max-deliver=-1 --defaults
+        nats --server nats://nats:4222 consumer info KV_CDC cdc_sink
+        echo nats-init done
+
+  # Long-running nats-box the smoke-test execs into for stream/consumer ops.
+  box:
+    image: natsio/nats-box:0.14.5
+    depends_on:
+      nats-init: { condition: service_completed_successfully }
+    entrypoint: ["sleep", "infinity"]
+    networks: [lab]
+
+  connect:
+    image: hpdevelop/connect:v4.92.0-batch-nats
+    depends_on:
+      redis: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    volumes:
+      - ./connect/observability.yaml:/etc/connect/observability.yaml:ro
+    command: ["streams", "-o", "/etc/connect/observability.yaml"]
+    ports: ["${CONNECT_PORT:-14195}:4195"]
+    networks: [lab]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:4195/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # Run-on-demand tool (distroless: no shell/sleep, so NOT a long-running
+  # service). profiles:[tools] keeps it out of `up`; smoke-test invokes it with
+  # `docker compose run --rm harness <subcommand>`.
+  harness:
+    build: ./harness
+    image: cdc-drain-harness:latest
+    profiles: ["tools"]
+    environment:
+      NATS_URL: nats://nats:4222
+      REDIS_ADDR: redis:6379
+    networks: [lab]
