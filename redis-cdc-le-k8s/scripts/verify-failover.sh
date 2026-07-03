@@ -42,9 +42,10 @@ rc() { kubectl -n "$NS" exec -i "$CENTRAL" -- redis-cli "$@"; }
 rr() { kubectl -n "$NS" exec -i "$REGION"  -- redis-cli "$@"; }
 holder() { kubectl -n "$NS" get lease "$LEASE" -o jsonpath='{.spec.holderIdentity}' 2>/dev/null; }
 now_ms() { date +%s%3N; }
-pending_total() { rc XPENDING "$STREAM" "$GROUP" 2>/dev/null | head -n1 | tr -d '[:space:]'; }
-# stream entry-ids pending for a given consumer (13-digit-ms-<seq>), one per line
-pending_ids_for() { rc XPENDING "$STREAM" "$GROUP" - + 100000 "$1" 2>/dev/null | grep -oE '[0-9]{13}-[0-9]+' | sort -u; }
+# stream entry-ids pending for a given consumer (raw output => bare IDs), one per line, sorted
+pending_ids_for() { rc --raw XPENDING "$STREAM" "$GROUP" - + 100000 "$1" 2>/dev/null | grep -oE '[0-9]{13,}-[0-9]+' | sort -u; }
+# count of pending entries for a given consumer — arm on THIS consumer, not the group total
+pending_count_for() { pending_ids_for "$1" | grep -c . || true; }
 
 log() { echo "[failover] $*"; }
 die() { echo "[failover] FAIL: $*" >&2; exit 1; }
@@ -83,27 +84,24 @@ run_one() {
   kubectl -n "$NS" exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null
   rm -f "$cmds"
 
-  # 4) arm: wait for a non-trivial PEL, then snapshot the active holder + consumer name CID
-  local armed=0 h
+  # 4) name the consumer for THIS run, then arm on ITS pending (NOT the group total —
+  #    a prior baseline run leaves orphaned dead-pod PELs in the same group).
+  local h cid
+  h="$(holder)"; [[ -n "$h" ]] || die "no lease holder before arm"
+  if [[ "$mode" == baseline ]]; then cid="$h"; else cid="cdc_propagator_active"; fi
+  local armed=0
   deadline=$(( $(date +%s) + ARM_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
-    local p; p="$(pending_total)"; p="${p:-0}"
+    local p; p="$(pending_count_for "$cid")"; p="${p:-0}"
     if (( p >= PENDING_THRESHOLD )); then armed=1; break; fi
     sleep 0.3
   done
-  (( armed == 1 )) || { echo "[failover] INCONCLUSIVE: PEL never reached $PENDING_THRESHOLD (raise N or lower throughput)"; return 3; }
-  h="$(holder)"; [[ -n "$h" ]] || die "no holder at arm time"
-  if [[ "$mode" == baseline ]]; then cid="$h"; else cid="cdc_propagator_active"; fi
+  (( armed == 1 )) || { echo "[failover] INCONCLUSIVE: PEL for $cid never reached $PENDING_THRESHOLD (raise N or lower throughput)"; return 3; }
+  # guard: leadership must not have moved between naming and arming (baseline cid tracks the holder)
+  if [[ "$mode" == baseline && "$(holder)" != "$h" ]]; then die "leadership moved during arm (holder=$(holder), expected $h) -> inconclusive"; fi
   local s_ids; s_ids="$(pending_ids_for "$cid")"
-  local s_count; s_count="$(echo -n "$s_ids" | grep -c . || true)"
+  local s_count; s_count="$(printf '%s\n' "$s_ids" | grep -c . || true)"
   (( s_count > 0 )) || die "S empty under CID=$cid at kill (oracle would be vacuous)"
-  # map S entry-ids -> kv_keys
-  local s_keys="" id kk
-  while IFS= read -r id; do
-    [[ -n "$id" ]] || continue
-    kk="$(rc XRANGE "$STREAM" "$id" "$id" 2>/dev/null | grep -oE 'lb:failover:active:\{run:[0-9]+:k[0-9]+\}' | head -n1)"
-    [[ -n "$kk" ]] && s_keys+="${kk}"$'\n'
-  done <<< "$s_ids"
   log "armed: holder=$h CID=$cid |S|=$s_count"
 
   # 5) SIGKILL the active pod
@@ -122,7 +120,7 @@ run_one() {
   if [[ "$mode" == fixed ]]; then
     deadline=$(( $(date +%s) + DRAIN_TIMEOUT_S ))
     while (( $(date +%s) < deadline )); do
-      local still; still="$(pending_ids_for "$cid" | comm -12 - <(echo "$s_ids") | grep -c . || true)"
+      local still; still="$(pending_ids_for "$cid" | comm -12 - <(printf '%s\n' "$s_ids") | grep -c . || true)"
       (( still == 0 )) && break
       sleep 2
     done
@@ -132,7 +130,7 @@ run_one() {
   sleep "$SINK_SETTLE_S"   # let the sink apply to region
 
   # 8) measure — PEL delta
-  local remain; remain="$(pending_ids_for "$cid" | comm -12 - <(echo "$s_ids") | grep -c . || true)"
+  local remain; remain="$(pending_ids_for "$cid" | comm -12 - <(printf '%s\n' "$s_ids") | grep -c . || true)"
   # 8b) measure — region key membership
   local present; present="$(rr --scan --pattern "lb:failover:active:{run:${runid}:k*}" 2>/dev/null | grep -c . || true)"
   local loss=$(( N - present ))
@@ -149,6 +147,7 @@ run_one() {
     (( loss > 0 ))    || die "baseline expected loss but region has all keys (kill mistimed -> INCONCLUSIVE, retry)"
     (( remain > 0 ))  || die "baseline expected S stuck in PEL but it drained"
     log "baseline OK: loss_keys=$loss (S stranded, region missing $loss)"
+    rc XGROUP DELCONSUMER "$STREAM" "$GROUP" "$cid" >/dev/null 2>&1 || true   # remove orphaned dead-pod consumer so it can't contaminate later runs
   else
     (( loss == 0 ))   || die "fixed expected NO loss but region missing $loss keys (fix insufficient on this image)"
     (( remain == 0 )) || die "fixed expected S drained but $remain of S still pending (fix insufficient)"
