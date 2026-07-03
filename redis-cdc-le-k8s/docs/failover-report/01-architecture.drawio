@@ -1,0 +1,92 @@
+<mxfile>
+  <diagram id="arch-1" name="Forward-leg architecture">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Title -->
+        <mxCell id="90" value="CDC relay — forward leg (Redis Stream → NATS JetStream). The fix changes the source consumer identity." style="text;html=1;align=left;verticalAlign=middle;fontSize=13;fontStyle=2;fontColor=#555555;" vertex="1" parent="1">
+          <mxGeometry x="40" y="40" width="900" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- Layer boxes (single row, y=340) -->
+        <mxCell id="2" value="Writer" style="shape=mxgraph.basic.person;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="40" y="340" width="80" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="3" value="Central Redis&#10;app.events stream&#10;group: cdc_propagator" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="165" y="330" width="160" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="4" value="connect-source&#10;leader of 3 (via K8s Lease)&#10;consumes as client_id" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontStyle=1;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="375" y="345" width="175" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="5" value="NATS JetStream&#10;KV_CDC&#10;Nats-Msg-Id dedup" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="605" y="330" width="160" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="6" value="connect-sink&#10;op → SET/DEL" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="815" y="345" width="140" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="7" value="Region Redis&#10;KV" style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=11;" vertex="1" parent="1">
+          <mxGeometry x="1005" y="330" width="140" height="110" as="geometry" />
+        </mxCell>
+
+        <!-- Callout: the fix -->
+        <mxCell id="8" value="THE FIX: source consumer name = client_id&#10;__POD__  (pod-scoped → loses on failover)&#10;→ cdc_propagator_active  (stable → recovers)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;fontStyle=1;dashed=1;" vertex="1" parent="1">
+          <mxGeometry x="335" y="150" width="255" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- Note: write-then-ack -->
+        <mxCell id="9" value="Write-then-ack: XAck fires ONLY after the NATS PubAck.&#10;So a message never acked in Redis is never lost 'before write' —&#10;the only loss vector is un-acked PEL entries orphaned on an ungraceful kill." style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=10;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="165" y="560" width="440" height="70" as="geometry" />
+        </mxCell>
+
+        <!-- ===== EDGES ===== -->
+        <!-- Writer → Central : XADD -->
+        <mxCell id="10" value="XADD event" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;" edge="1" source="2" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- Central → source : XREADGROUP -->
+        <mxCell id="11" value="XREADGROUP&#10;(consumer=client_id)" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;" edge="1" source="3" target="4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- source → NATS : publish -->
+        <mxCell id="12" value="publish + PubAck" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;" edge="1" source="4" target="5" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- NATS → sink : pull -->
+        <mxCell id="13" value="pull consumer" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;" edge="1" source="5" target="6" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- sink → Region : SET/DEL -->
+        <mxCell id="14" value="apply" style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;" edge="1" source="6" target="7" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- source → Central : XAck back-edge (dashed), routed below the boxes -->
+        <mxCell id="15" value="XAck (only AFTER PubAck)" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#b85450;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=1;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;fontSize=10;fontColor=#b85450;" edge="1" source="4" target="3" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="462" y="500" />
+              <mxPoint x="245" y="500" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- Callout → source (dashed connector) -->
+        <mxCell id="16" value="" style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#b85450;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;endArrow=open;" edge="1" source="8" target="4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
