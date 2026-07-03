@@ -32,7 +32,7 @@ input:
     streams:
       - app.events
     consumer_group: cdc_propagator
-    client_id: __POD__
+    client_id: {{ .Values.connect.source.consumerClientId }}
     body_key: body
     create_streams: true
     start_from_oldest: false

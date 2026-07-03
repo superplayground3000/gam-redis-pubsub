@@ -140,6 +140,12 @@ connect:
     # a node/pod loss without dropping to a single point of failure mid-failover.
     replicas: 3
     streamID: forward_leg          # streams-mode stream id the elector POSTs
+    # Stable logical Redis consumer name for the forward leg. It MUST NOT be
+    # pod-scoped: on ungraceful (SIGKILL) failover the incoming leader reuses this
+    # name and the redis_streams input replays the dead leader's un-acked PEL
+    # (backlog read from "0"), deduped downstream by Nats-Msg-Id. Set to __POD__
+    # only to reproduce the pre-fix message-loss baseline.
+    consumerClientId: cdc_propagator_active
     lease:
       name: connect-source-elector # Lease object name (run through rrcs.name)
       duration: 6s
