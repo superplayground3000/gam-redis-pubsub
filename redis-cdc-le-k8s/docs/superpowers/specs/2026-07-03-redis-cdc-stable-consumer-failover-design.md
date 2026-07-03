@@ -97,13 +97,24 @@ key prefix** per run (e.g. `lb:failover:{run:<runid>:kNNN}` with `event_id = <ru
 2. **Produce** `P` = a burst of N=500 distinct-key SET (`op=create`) events with known,
    run-unique `event_id`s. Record `P`.
 3. **Arm the kill in the vulnerable window.** Poll `XPENDING app.events cdc_propagator`
-   until pending is non-trivial, then **snapshot the dead consumer's PEL by ID**: the active
-   pod name comes from the Lease holder
-   (`kubectl get lease <release>-<source-lease> -o jsonpath='{.spec.holderIdentity}'`);
-   `XPENDING app.events cdc_propagator - + <big> <holder>` → pending **stream entry IDs**;
-   `XRANGE` each → their `event_id` fields = set `S` (at-risk ids). Note `S` mixes
-   truly-unpublished ids with published-but-not-yet-`XAck`'d ids (the `commit_period=200ms`
-   window, Q1) — accounted for below.
+   until pending is non-trivial, then **snapshot the at-risk PEL by ID under the run's
+   consumer name.** The Redis **consumer name** is this run's configured `consumerClientId`
+   (`CID`) — it is *not* always the pod name:
+   - **baseline** (`client_id=__POD__`): `CID` == the active pod name == the current Lease
+     holder;
+   - **fixed** (`client_id=cdc_propagator_active`): `CID` == the constant
+     `cdc_propagator_active`, independent of the pod.
+
+   The Lease holder
+   (`kubectl get lease <release>-<source-lease> -o jsonpath='{.spec.holderIdentity}'`) is
+   used **only** to pick which pod to SIGKILL; the PEL snapshot filters by `CID`:
+   `XPENDING app.events cdc_propagator - + <big> <CID>` → pending **stream entry IDs**;
+   `XRANGE` each → their `event_id` fields = set `S` (at-risk ids). This is the correction
+   that makes `S` non-empty and the oracle meaningful in **both** runs: in the fixed run the
+   surviving stable consumer name is exactly what the new leader re-attaches to and drains,
+   so `S` captured under `CID=cdc_propagator_active` is precisely the set that must be
+   replayed. Note `S` mixes truly-unpublished ids with published-but-not-yet-`XAck`'d ids
+   (the `commit_period=200ms` window, Q1) — accounted for below.
 4. **SIGKILL** the holder: `kubectl delete pod <holder> --grace-period=0 --force`.
 5. **Settle.** Wait until a *new* Lease holder is active. For the **fixed** run, also wait
    until group PEL drains toward ~0 (success signal) or timeout. For the **baseline** run,
@@ -117,13 +128,21 @@ key prefix** per run (e.g. `lb:failover:{run:<runid>:kNNN}` with `event_id = <ru
 
 ### Assertions & causal claim (Q3)
 
-- **baseline:** `Loss ≠ ∅`, and every lost id ∈ `S` (loss originates only from the stranded
-  PEL). If `Loss == ∅`, the kill missed the vulnerable window → **inconclusive, retry**;
+- **baseline** (`CID` = dead pod name): the new leader consumes under a **different**
+  consumer name (its own pod name), so `S` — captured under the dead pod's `CID` — is never
+  re-read. Assert `Loss ≠ ∅` and every lost id ∈ `S` (loss originates only from the stranded
+  PEL; undelivered `>` entries are still picked up by the new consumer, so they are *not*
+  lost). If `Loss == ∅`, the kill missed the vulnerable window → **inconclusive, retry**;
   never pass a baseline that didn't lose.
-- **fixed:** `Loss == ∅`, and `S ⊆ NATS_present` (the exact stranded ids were replayed).
+- **fixed** (`CID` = `cdc_propagator_active`): the new leader re-attaches to the **same**
+  consumer name and drains its PEL from `"0"`. Assert `Loss == ∅` and `S ⊆ NATS_present`
+  (the exact ids stranded at kill were replayed). Because `S` here is captured under the
+  surviving stable `CID` (per the step-3 correction), this set is non-empty and is precisely
+  the recovery claim — not a vacuous check.
 
-Tying loss/recovery to the **same kill-time PEL id set `S`** is the causal proof: the fix
-*replays those specific ids* rather than the system merely passing in aggregate.
+Tying loss/recovery to the **same kill-time PEL id set `S`**, captured under each run's real
+consumer name, is the causal proof: the fix *replays those specific ids* rather than the
+system merely passing in aggregate.
 
 ## Falsifiability
 
