@@ -81,6 +81,11 @@ run_one() {
   # 2) clean per-run state (fresh region; unique namespace makes central carryover irrelevant)
   rr FLUSHDB >/dev/null
   rc XGROUP CREATE "$STREAM" "$GROUP" 0 MKSTREAM >/dev/null 2>&1 || true
+  # a prior ABORTED fixed run can leave stale pending under the stable consumer; clear it pre-burst
+  # so it cannot contaminate this run's residual (fixed only — baseline uses fresh per-pod names).
+  if [[ "$mode" == fixed ]]; then
+    rc XGROUP DELCONSUMER "$STREAM" "$GROUP" cdc_propagator_active >/dev/null 2>&1 || true
+  fi
 
   # 3) burst N distinct-key create events (space-free tokens; body is opaque)
   local cmds; cmds="$(mktemp)"
@@ -93,23 +98,29 @@ run_one() {
   rm -f "$cmds"
 
   # 4) arm: poll the CURRENT leader's PEL, re-reading the lease holder each iteration (a fresh
-  #    rollout can hand leadership around before it settles, so a once-captured holder may be a
-  #    draining old-RS pod with an empty PEL). When the active consumer's PEL crosses the
-  #    threshold, THAT holder is the kill target and its consumer name is CID.
-  local h="" cid="" armed=0
+  #    rollout can hand leadership around before it settles). Require the holder to be STABLE
+  #    across two consecutive polls before arming, so we don't latch onto a pod that is losing
+  #    the lease. When the stable active consumer's PEL crosses the threshold, THAT holder is the
+  #    kill target and its consumer name is CID.
+  local h="" cid="" armed=0 prev_h=""
   deadline=$(( $(date +%s) + ARM_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     local ch ccid p
     ch="$(holder)"
-    if [[ -n "$ch" ]]; then
+    if [[ -n "$ch" && "$ch" == "$prev_h" ]]; then
       if [[ "$mode" == baseline ]]; then ccid="$ch"; else ccid="cdc_propagator_active"; fi
       p="$(pending_count_for "$ccid")"; p="${p:-0}"
       if (( p >= PENDING_THRESHOLD )); then h="$ch"; cid="$ccid"; armed=1; break; fi
     fi
+    prev_h="$ch"
     sleep 0.3
   done
-  (( armed == 1 )) || { echo "[failover] INCONCLUSIVE: no leader PEL reached $PENDING_THRESHOLD within ${ARM_TIMEOUT_S}s (raise N or lower throughput)"; return 3; }
+  (( armed == 1 )) || { echo "[failover] INCONCLUSIVE: no STABLE leader PEL reached $PENDING_THRESHOLD within ${ARM_TIMEOUT_S}s (raise N or lower throughput)"; return 3; }
   local arm_depth; arm_depth="$(pending_count_for "$cid")"
+  # re-confirm the armed pod is STILL the leader immediately before killing — a leadership flip
+  # in this gap could otherwise make us kill a non-active pod and never exercise failover (a
+  # false pass on the fixed leg, where CID is not tied to the pod name). Fail closed.
+  [[ "$(holder)" == "$h" ]] || { echo "[failover] INCONCLUSIVE: leadership moved between arm and kill (armed $h) -> retry"; return 3; }
   log "armed: holder=$h CID=$cid PEL_depth=$arm_depth"
 
   # 5) SIGKILL the active pod WHILE it holds a deep un-acked (mostly un-published) PEL.

@@ -17,15 +17,25 @@ the deployed image.
 
 | mode | consumerClientId | arm_depth | pel_residual | region_present / N | loss_keys | verdict |
 |------|------------------|-----------|--------------|--------------------|-----------|---------|
-| baseline | `__POD__` (→ pod name) | 1168 | **757** | 4243 / 5000 | **757** | LOSS |
-| fixed | `cdc_propagator_active` | 2126 | **0** | 5000 / 5000 | **0** | NO LOSS |
+| baseline | `__POD__` (→ pod name) | 591 | **767** | 4233 / 5000 | **767** | LOSS |
+| fixed | `cdc_propagator_active` | 1241 | **0** | 5000 / 5000 | **0** | NO LOSS |
 
 ```
-baseline: {"mode":"baseline","cid":"lab-connect-source-5bbcbf59bb-x5dnt","n":5000,
-           "arm_depth":1168,"pel_residual":757,"region_present":4243,"loss_keys":757}
+baseline: {"mode":"baseline","cid":"lab-connect-source-5b5fd7dc8f-hm78c","n":5000,
+           "arm_depth":591,"pel_residual":767,"region_present":4233,"loss_keys":767}
 fixed:    {"mode":"fixed","cid":"cdc_propagator_active","n":5000,
-           "arm_depth":2126,"pel_residual":0,"region_present":5000,"loss_keys":0}
+           "arm_depth":1241,"pel_residual":0,"region_present":5000,"loss_keys":0}
 ```
+
+**Reproducibility.** An earlier script revision produced the same verdict with independent
+numbers — baseline `pel_residual == loss_keys == 757` (of 5000), fixed `0` (files
+`1783059201195-baseline.json` / `1783059275949-fixed.json`). The baseline exact-agreement
+(`residual == loss`) held across both runs (757 and 767).
+
+**Fail-closed guard.** During one combined run the fixed leg detected a Lease-holder flip
+between arming and the kill and returned **INCONCLUSIVE** rather than passing — the verifier
+refuses to certify a fixed run in which it may have killed a non-active pod (would-be false
+pass), and retries instead.
 
 ## Why this is a causal proof
 

@@ -96,73 +96,62 @@ key prefix** per run (e.g. `lb:failover:{run:<runid>:kNNN}` with `event_id = <ru
    (1 active + 2 standby).
 2. **Produce** `P` = a burst of N=500 distinct-key SET (`op=create`) events with known,
    run-unique `event_id`s. Record `P`.
-3. **Arm the kill in the vulnerable window.** Poll `XPENDING app.events cdc_propagator`
-   until pending is non-trivial, then **snapshot the at-risk PEL by ID under the run's
-   consumer name.** The Redis **consumer name** is this run's configured `consumerClientId`
-   (`CID`) — it is *not* always the pod name:
-   - **baseline** (`client_id=__POD__`): `CID` == the active pod name == the current Lease
-     holder;
-   - **fixed** (`client_id=cdc_propagator_active`): `CID` == the constant
-     `cdc_propagator_active`, independent of the pod.
+3. **Amplify the genuine vulnerable window (identical for both legs).** Write-then-ack means
+   the *only* entries truly at risk on a SIGKILL are those **read into the PEL but not yet
+   published** to NATS at the kill instant (published-but-unacked entries already reached
+   NATS). On a fast leg that set is tiny and hard to catch, so the harness enlarges the **same
+   real** set with two prod-safe, defaulted chart knobs applied identically to baseline and
+   fixed:
+   - `connect.source.maxInFlight = 1` — serialize the NATS publisher, so PEL entries are
+     genuinely un-published (not merely awaiting `XAck`);
+   - `connect.source.readLimit = 2000` — read a large batch into the PEL that the serialized
+     publisher cannot drain before the kill.
 
-   The Lease holder
-   (`kubectl get lease <release>-<source-lease> -o jsonpath='{.spec.holderIdentity}'`) is
-   used **only** to pick which pod to SIGKILL; the PEL snapshot filters by `CID`:
-   `XPENDING app.events cdc_propagator - + <big> <CID>` → pending **stream entry IDs**;
-   `XRANGE` each → their `event_id` fields = set `S` (at-risk ids). This is the correction
-   that makes `S` non-empty and the oracle meaningful in **both** runs: in the fixed run the
-   surviving stable consumer name is exactly what the new leader re-attaches to and drains,
-   so `S` captured under `CID=cdc_propagator_active` is precisely the set that must be
-   replayed. Note `S` mixes truly-unpublished ids with published-but-not-yet-`XAck`'d ids
-   (the `commit_period=200ms` window, Q1) — accounted for below.
-4. **SIGKILL** the holder: `kubectl delete pod <holder> --grace-period=0 --force`.
-5. **Settle.** Wait until a *new* Lease holder is active. For the **fixed** run, also wait
-   until group PEL drains toward ~0 (success signal) or timeout. For the **baseline** run,
-   do **not** wait for PEL to drain (that would contradict the loss hypothesis, Q3) — wait a
-   bounded settle period after the new holder is active, then measure.
-6. **Measure — forward-leg PEL delta (pure Redis, causal proof).** Re-query the group PEL
-   under the run's consumer name: `XPENDING app.events cdc_propagator - + <big> <CID>`.
-   - **fixed:** `S` must have **drained** — the new leader re-attached to the same `CID`,
-     re-read those entries from `"0"`, re-published, and `XAck`'d them (⇒ PubAck'd to NATS,
-     by write-then-ack); total group pending → ~0.
-   - **baseline:** `S` must remain **stuck** under the dead consumer `CID` (orphaned; the new
-     leader consumes under a *different* name and never re-reads it).
-7. **Measure — end-to-end loss oracle (region-KV key membership).** At kill, map each `S`
-   entry to its `kv_key` via `XRANGE`. Each run's events SET distinct keys under a fresh
-   prefix `P_keys`. After the sink settles, `Loss_keys = P_keys \ present_in_region`.
-   - **fixed:** `Loss_keys == ∅` (all N applied).
-   - **baseline:** `Loss_keys ≠ ∅`, and `Loss_keys ⊆ S_keys` (the missing keys are exactly
-     the orphaned ones).
+   Both default to prod values (`256` / `50`); only the verifier changes them. They widen the
+   exposure *magnitude/probability*; they do not invent a new failure mode.
+4. **Arm on the stable current leader.** Poll the **current** Lease holder's PEL under this
+   run's consumer name `CID` (baseline: the holder's own pod name; fixed: the constant
+   `cdc_propagator_active`), re-reading the holder each iteration and requiring it **stable for
+   two consecutive polls** (a fresh rollout hands leadership around before it settles). Arm
+   when that PEL depth crosses a threshold; that holder is the kill target. Do **not** snapshot
+   entry-ids here — the live pod keeps `XAck`ing between any snapshot and the kill, so the set
+   alive at kill differs from the snapshot; the *residual after settle* is the correct measure.
+5. **SIGKILL** the holder, fail-closed: re-confirm `holder() == armed holder` immediately
+   before the kill (a leadership flip in the gap could otherwise kill a non-active pod and
+   never exercise failover — a false pass on the fixed leg); then
+   `kubectl delete pod <holder> --grace-period=0 --force`.
+6. **Settle.** Wait for a *new* Lease holder. For **fixed**, wait until the reused consumer's
+   PEL drains to 0. For **both**, then wait for the sink **adaptively** — poll region key count
+   until it stops growing (stable across several polls) or timeout — robust to variable sink
+   lag and any N (a fixed sleep would falsely inflate loss on the fixed leg).
+7. **Measure (two agreeing oracles, pure `redis-cli`).**
+   - **Forward-leg residual PEL (causal):** `residual` = entries still un-acked under `CID`
+     after settle. **baseline:** `CID` is the *dead pod name* (never reused) → its PEL is
+     orphaned forever, `residual > 0`. **fixed:** `CID` is the *stable name* (reused by the new
+     leader, which re-read it from `"0"`, re-published and acked) → `residual == 0`.
+   - **End-to-end region-KV membership:** each event SETs a distinct key under a fresh per-run
+     prefix; `loss_keys = N − present_in_region`. **baseline:** `> 0`; **fixed:** `== 0`.
 
-   This uses **only `kubectl exec … redis-cli`** — no in-cluster NATS CLI/creds, no envelope
-   parsing. Both measurements are exact by-ID / by-key membership within a per-run-unique
-   namespace, so they are immune to the dedup-window / retention / leftover-traffic
-   contamination that makes NATS aggregate counts unsafe (Q5). The PEL delta is the direct
-   forward-leg (Redis→NATS) proof; region-KV membership is the end-to-end no-loss confirmation.
+   Uses **only `kubectl exec … redis-cli`** — no NATS CLI/creds. Both are exact by-key / by-
+   consumer measurements within a per-run-unique namespace, immune to the dedup-window /
+   retention / leftover-traffic contamination that makes NATS aggregate counts unsafe (Q5).
 
 ### Assertions & causal claim (Q3)
 
-- **baseline** (`CID` = dead pod name): the new leader consumes under a **different**
-  consumer name (its own pod name), so `S` — captured under the dead pod's `CID` — is never
-  re-read. Assert (a) PEL: `S` **still pending** under the dead `CID`; (b) region:
-  `Loss_keys ≠ ∅` and `Loss_keys ⊆ S_keys` (missing region keys are exactly the orphaned
-  ones; undelivered `>` entries are still picked up by the new consumer, so they are *not*
-  lost). If `Loss_keys == ∅`, the kill missed the vulnerable window → **inconclusive,
-  retry**; never pass a baseline that didn't lose.
-- **fixed** (`CID` = `cdc_propagator_active`): the new leader re-attaches to the **same**
-  consumer name and drains its PEL from `"0"`. Assert (a) PEL: `S` **drained** under `CID`
-  (group pending → ~0); (b) region: `Loss_keys == ∅` (all N applied). Because `S` is captured
-  under the surviving stable `CID` (per the step-3 correction), it is non-empty and is
-  precisely the recovery claim — not a vacuous check.
+- **baseline:** assert `residual > 0` **and** `loss_keys > 0`. If either is 0 the kill missed
+  the window → **inconclusive, retry**; never pass a baseline that didn't lose.
+- **fixed:** assert `residual == 0` **and** `loss_keys == 0`.
 
-Tying loss/recovery to the **same kill-time set `S`**, captured under each run's real
-consumer name, is the causal proof: the fix *replays those specific entries* (PEL drains,
-region gains those keys) rather than the system merely passing in aggregate.
+The causal proof is the **agreement of the two independent oracles**: in the baseline run the
+count orphaned in the dead consumer's PEL equals the count missing from region
+(observed `residual == loss_keys == 757` of 5000) — the orphaned-PEL entries are *exactly* the
+data lost downstream, tying the pod-scoped consumer identity directly to the loss. The fixed
+run reverses both to 0 under an equal-or-larger at-risk depth.
 
 ## Falsifiability
 
-If the **fixed** run still shows `Loss_keys ≠ ∅` (or `S` does not drain from the PEL), the stable name alone
-is insufficient on the deployed image — recovery would need an explicit
+If the **fixed** run still shows `loss_keys > 0` (or `residual` does not drain to 0), the
+stable name alone is insufficient on the deployed image — recovery would need an explicit
 `XAUTOCLAIM`/startup-replay (a Go change, out of scope for this pass). The lab is designed to
 surface that outcome, not paper over it.
 
