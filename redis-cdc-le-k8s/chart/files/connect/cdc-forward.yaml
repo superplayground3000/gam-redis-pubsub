@@ -38,7 +38,7 @@ input:
     start_from_oldest: false
     commit_period: 200ms
     timeout: 500ms
-    limit: 50
+    limit: {{ .Values.connect.source.readLimit | default 50 }}
     auto_replay_nacks: true
 
 pipeline:
@@ -106,4 +106,4 @@ output:
     headers:
       Nats-Msg-Id: ${! meta("event_id") }
       Content-Type: application/json
-    max_in_flight: 256
+    max_in_flight: {{ .Values.connect.source.maxInFlight | default 256 }}

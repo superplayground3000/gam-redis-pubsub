@@ -146,6 +146,17 @@ connect:
     # (backlog read from "0"), deduped downstream by Nats-Msg-Id. Set to __POD__
     # only to reproduce the pre-fix message-loss baseline.
     consumerClientId: cdc_propagator_active
+    # Max concurrent un-acked NATS publishes for the forward output. 256 in prod.
+    # The failover verifier lowers this (e.g. 1) so the input reads batches into its
+    # Redis PEL faster than the serialized publisher can drain them — forming a
+    # deterministic, catchable un-acked PEL to SIGKILL against. Does not change the
+    # loss mechanism, only widens the vulnerable window.
+    maxInFlight: 256
+    # Redis XREADGROUP batch size (input `limit`). 50 in prod. The failover verifier
+    # raises this so the reader pulls a large chunk into its PEL that the serialized
+    # publisher (maxInFlight:1) cannot drain before the SIGKILL — enlarging the genuine
+    # read-but-unpublished in-flight set that an ungraceful failover strands.
+    readLimit: 50
     lease:
       name: connect-source-elector # Lease object name (run through rrcs.name)
       duration: 6s
