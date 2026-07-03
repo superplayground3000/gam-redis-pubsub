@@ -120,33 +120,48 @@ key prefix** per run (e.g. `lb:failover:{run:<runid>:kNNN}` with `event_id = <ru
    until group PEL drains toward ~0 (success signal) or timeout. For the **baseline** run,
    do **not** wait for PEL to drain (that would contradict the loss hypothesis, Q3) — wait a
    bounded settle period after the new holder is active, then measure.
-6. **Measure (forward-leg oracle).** Read `KV_CDC` via an ephemeral consumer, collect the
-   set `NATS_present` = `{ eid ∈ P : a KV_CDC message has envelope/Msg-Id event_id == eid }`.
-   `Loss = P \ NATS_present`.
-7. **Corroborate (end-to-end).** After the sink also settles, region-Redis key membership
-   for the run's key prefix should equal `P \ Loss`.
+6. **Measure — forward-leg PEL delta (pure Redis, causal proof).** Re-query the group PEL
+   under the run's consumer name: `XPENDING app.events cdc_propagator - + <big> <CID>`.
+   - **fixed:** `S` must have **drained** — the new leader re-attached to the same `CID`,
+     re-read those entries from `"0"`, re-published, and `XAck`'d them (⇒ PubAck'd to NATS,
+     by write-then-ack); total group pending → ~0.
+   - **baseline:** `S` must remain **stuck** under the dead consumer `CID` (orphaned; the new
+     leader consumes under a *different* name and never re-reads it).
+7. **Measure — end-to-end loss oracle (region-KV key membership).** At kill, map each `S`
+   entry to its `kv_key` via `XRANGE`. Each run's events SET distinct keys under a fresh
+   prefix `P_keys`. After the sink settles, `Loss_keys = P_keys \ present_in_region`.
+   - **fixed:** `Loss_keys == ∅` (all N applied).
+   - **baseline:** `Loss_keys ≠ ∅`, and `Loss_keys ⊆ S_keys` (the missing keys are exactly
+     the orphaned ones).
+
+   This uses **only `kubectl exec … redis-cli`** — no in-cluster NATS CLI/creds, no envelope
+   parsing. Both measurements are exact by-ID / by-key membership within a per-run-unique
+   namespace, so they are immune to the dedup-window / retention / leftover-traffic
+   contamination that makes NATS aggregate counts unsafe (Q5). The PEL delta is the direct
+   forward-leg (Redis→NATS) proof; region-KV membership is the end-to-end no-loss confirmation.
 
 ### Assertions & causal claim (Q3)
 
 - **baseline** (`CID` = dead pod name): the new leader consumes under a **different**
   consumer name (its own pod name), so `S` — captured under the dead pod's `CID` — is never
-  re-read. Assert `Loss ≠ ∅` and every lost id ∈ `S` (loss originates only from the stranded
-  PEL; undelivered `>` entries are still picked up by the new consumer, so they are *not*
-  lost). If `Loss == ∅`, the kill missed the vulnerable window → **inconclusive, retry**;
-  never pass a baseline that didn't lose.
+  re-read. Assert (a) PEL: `S` **still pending** under the dead `CID`; (b) region:
+  `Loss_keys ≠ ∅` and `Loss_keys ⊆ S_keys` (missing region keys are exactly the orphaned
+  ones; undelivered `>` entries are still picked up by the new consumer, so they are *not*
+  lost). If `Loss_keys == ∅`, the kill missed the vulnerable window → **inconclusive,
+  retry**; never pass a baseline that didn't lose.
 - **fixed** (`CID` = `cdc_propagator_active`): the new leader re-attaches to the **same**
-  consumer name and drains its PEL from `"0"`. Assert `Loss == ∅` and `S ⊆ NATS_present`
-  (the exact ids stranded at kill were replayed). Because `S` here is captured under the
-  surviving stable `CID` (per the step-3 correction), this set is non-empty and is precisely
-  the recovery claim — not a vacuous check.
+  consumer name and drains its PEL from `"0"`. Assert (a) PEL: `S` **drained** under `CID`
+  (group pending → ~0); (b) region: `Loss_keys == ∅` (all N applied). Because `S` is captured
+  under the surviving stable `CID` (per the step-3 correction), it is non-empty and is
+  precisely the recovery claim — not a vacuous check.
 
-Tying loss/recovery to the **same kill-time PEL id set `S`**, captured under each run's real
-consumer name, is the causal proof: the fix *replays those specific ids* rather than the
-system merely passing in aggregate.
+Tying loss/recovery to the **same kill-time set `S`**, captured under each run's real
+consumer name, is the causal proof: the fix *replays those specific entries* (PEL drains,
+region gains those keys) rather than the system merely passing in aggregate.
 
 ## Falsifiability
 
-If the **fixed** run still shows `Loss ≠ ∅` (or `S ⊄ NATS_present`), the stable name alone
+If the **fixed** run still shows `Loss_keys ≠ ∅` (or `S` does not drain from the PEL), the stable name alone
 is insufficient on the deployed image — recovery would need an explicit
 `XAUTOCLAIM`/startup-replay (a Go change, out of scope for this pass). The lab is designed to
 surface that outcome, not paper over it.
@@ -156,7 +171,7 @@ surface that outcome, not paper over it.
 - `chart/files/connect/cdc-forward.yaml` (1-line change)
 - `chart/values.yaml` + `chart/values-dev.yaml` (new `connect.source.consumerClientId`)
 - `scripts/verify-failover.sh` (+ any small helper under `scripts/lib`)
-- A run report under `reports/` capturing both runs' `P`, `S`, `Loss`, `NATS_present`
+- A run report under `reports/` capturing both runs' `N`, `S`/`S_keys`, PEL-drain state, `Loss_keys`
 - This spec
 
 ## Non-goals
