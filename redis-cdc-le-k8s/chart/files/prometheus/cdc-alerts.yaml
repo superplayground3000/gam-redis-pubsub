@@ -13,8 +13,8 @@
 # this window to >= 2x ackWait. There is intentionally NO keep_firing_for: a window
 # larger than the cadence already holds the alert firing continuously, and stacking
 # both would leave the alert firing ~(window + keep_firing_for) after the poison is
-# gone. As written the alert clears ~one window (≈2m, ±one scrape interval) after
-# the last redelivery.
+# gone. As written the alert clears ~one window (≈2m, ±one evaluation interval)
+# after the last redelivery.
 #
 # METRIC NAME: cdc_unprocessable is a Redpanda Connect `metric` counter (base name
 # cdc_unprocessable); depending on exposition it scrapes as cdc_unprocessable or
