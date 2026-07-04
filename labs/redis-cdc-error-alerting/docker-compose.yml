@@ -37,5 +37,16 @@ services:
         echo "nats-init: stream + durable pull consumer created"
     networks: [lab]
 
+  connect:
+    image: hpdevelop/connect:4.92.0-claudefix
+    depends_on:
+      redis: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    command: ["run","/etc/connect/config.yaml"]
+    volumes:
+      - ./connect/config.yaml:/etc/connect/config.yaml:ro
+    healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:4195/ping || exit 1"], interval: 5s, timeout: 3s, retries: 10 }
+    networks: [lab]
+
 networks:
   lab: {}
