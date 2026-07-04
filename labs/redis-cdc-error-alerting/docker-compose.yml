@@ -48,5 +48,25 @@ services:
     healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:4195/ping || exit 1"], interval: 5s, timeout: 3s, retries: 10 }
     networks: [lab]
 
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    depends_on: [connect]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+    ports: ["${PROM_PORT:-19090}:9090"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../redis-cdc-le-k8s/chart/files/prometheus/cdc-alerts.yaml:/etc/prometheus/rules/cdc-alerts.yaml:ro
+    networks: [lab]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    ports: ["${ALERTMANAGER_PORT:-19093}:9093"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks: [lab]
+
 networks:
   lab: {}
