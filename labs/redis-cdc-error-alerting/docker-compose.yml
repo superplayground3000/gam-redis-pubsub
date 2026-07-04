@@ -1,0 +1,41 @@
+name: lab-redis-cdc-error-alerting
+
+# Validates the redis-cdc-le-k8s chart's Grafana dashboard + unprocessable-message
+# alert. The chart's cdc-alerts.yaml and cdc-dashboard.json are bind-mounted (not
+# copied) so the lab tests exactly what ships. See RESEARCH.md.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck: { test: ["CMD","redis-cli","ping"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js","-m","8222"]
+    ports: ["${NATS_MONITOR_PORT:-18222}:8222"]
+    healthcheck: { test: ["CMD","wget","-qO-","http://localhost:8222/healthz"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats-init:
+    image: natsio/nats-box:0.14.5
+    depends_on: { nats: { condition: service_healthy } }
+    restart: "no"
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        set -e
+        nats --server nats://nats:4222 stream add LAB_CDC \
+          --subjects "kv.cdc.>" --storage file --retention limits \
+          --discard old --max-msgs=-1 --max-bytes=-1 --max-age=1h \
+          --dupe-window=5m --replicas=1 --max-msg-size=-1 --defaults
+        nats --server nats://nats:4222 consumer add LAB_CDC cdc_sink \
+          --pull --ack explicit --deliver all --replay instant \
+          --filter "kv.cdc.>" --max-deliver=-1 --wait=30s --max-pending=1024 \
+          --max-waiting=512 --no-headers-only --defaults
+        echo "nats-init: stream + durable pull consumer created"
+    networks: [lab]
+
+networks:
+  lab: {}
