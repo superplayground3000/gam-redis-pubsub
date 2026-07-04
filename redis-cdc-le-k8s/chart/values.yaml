@@ -82,7 +82,10 @@ nats:
       # uses whatever the durable was created with — so these live here and are
       # applied by the nats-init Job's `nats consumer add` (and by the manual
       # scripts/create-consumer.sh).
-      ackWait: "30s"        # redelivery timeout if the sink hasn't acked
+      ackWait: "30s"        # redelivery timeout if the sink hasn't acked. COUPLING:
+                            # the CDCUnprocessableMessages alert window in
+                            # files/prometheus/cdc-alerts.yaml must stay >= 2x this.
+                            # If you raise ackWait, raise that window too.
       maxAckPending: 1024    # max un-acked msgs in flight (sink throughput knob)
       maxDeliver: -1         # -1 = redeliver forever until acked
     maxAge: "1h"
@@ -282,3 +285,18 @@ resources:
     limits:
       cpu: 250m
       memory: 128Mi
+
+# Observability artifacts for an EXISTING cluster monitoring stack. The chart ships
+# a Grafana dashboard, a PrometheusRule alert, and a ServiceMonitor — but NOT
+# Prometheus/Grafana/Alertmanager. Opt-in: the ServiceMonitor/PrometheusRule need
+# the prometheus-operator CRDs to exist, so this defaults to false.
+observability:
+  enabled: false
+  serviceMonitor:
+    interval: 15s
+    labels: {}          # match the operator's serviceMonitorSelector, e.g. { release: kube-prometheus-stack }
+  prometheusRule:
+    labels: {}          # match the operator's ruleSelector (CRD metadata only)
+  dashboard:
+    folder: ""          # optional Grafana sidecar target folder
+    labels: {}          # extra ConfigMap labels beyond grafana_dashboard: "1"
