@@ -88,5 +88,18 @@ services:
     profiles: ["gen"]     # not started by default `up`; run on demand via the test script
     networks: [lab]
 
+  grafana:
+    image: grafana/grafana:11.2.0
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports: ["${GRAFANA_PORT:-13000}:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../redis-cdc-le-k8s/chart/files/grafana:/var/lib/grafana/dashboards:ro
+    networks: [lab]
+
 networks:
   lab: {}
