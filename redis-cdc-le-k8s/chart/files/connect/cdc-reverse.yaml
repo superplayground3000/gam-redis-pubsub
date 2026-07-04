@@ -76,9 +76,20 @@ pipeline:
         #   those. Legacy / in-flight create/update messages carry a plain body and no
         #   enc marker, so the else branch passes them through unchanged (a rolling
         #   upgrade or a replay of pre-encoding JetStream messages won't fail the decode).
-        meta body    = if this.op == "create" || this.op == "update" {
-          if this.enc.or("") == "gzip:base64" { this.body.decode("base64").decompress("gzip") } else { this.body }
+        # OP-GATE the body decode; on failure set decode_failed so the switch's
+        # first branch counts it as unprocessable (reason=decode_error) and nacks —
+        # WITHOUT ever reaching the apply logic. .catch(null) turns a bad
+        # base64/gzip body into null instead of throwing mid-mapping.
+        # Single source for the "carries a gzip:base64 body to decode" gate, so the
+        # decode branch and the decode_failed flag can never drift apart.
+        let is_encoded = (this.op == "create" || this.op == "update") && this.enc.or("") == "gzip:base64"
+        let decoded = if this.op == "create" || this.op == "update" {
+          if $is_encoded {
+            this.body.decode("base64").decompress("gzip").catch(null)
+          } else { this.body }
         }
+        meta body = $decoded
+        meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
     {{- if .Values.connect.contentLog.enabled }}
     # Dump exactly what is about to be applied to region Redis (the op switch below
     # turns these into SET / DEL / rename-EVAL). body holds the full value payload.
@@ -100,6 +111,16 @@ pipeline:
           root.body_len = meta("body").or("").length()
     {{- end }}
     - switch:
+        - check: meta("decode_failed") == "yes"
+          processors:
+            # Permanent poison: the gzip:base64 body could not be decoded. Count it,
+            # then throw to nack (redelivered under maxDeliver=-1 until removed).
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  reason: decode_error
+            - mapping: 'root = throw("decode_error: undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?")))'
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
             # Best-effort latency telemetry, emitted BEFORE the SET. ts-bearing
@@ -183,6 +204,11 @@ pipeline:
                 labels:
                   op: rename
         - processors:
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  reason: unknown_op
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
 
 output:
