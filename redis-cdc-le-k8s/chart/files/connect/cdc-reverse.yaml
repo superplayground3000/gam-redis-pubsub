@@ -83,11 +83,17 @@ pipeline:
         # Single source for the "carries a gzip:base64 body to decode" gate, so the
         # decode branch and the decode_failed flag can never drift apart.
         let is_encoded = (this.op == "create" || this.op == "update") && this.enc.or("") == "gzip:base64"
+        # NOTE the trailing `else { null }`: a Bloblang `let` bound to an
+        # if-WITHOUT-else leaves the variable UNDEFINED when the condition is false
+        # (delete/rename), and the next line's `$decoded` reference would then throw
+        # "variable undefined" and nack every delete/rename forever. `else { null }`
+        # makes $decoded null for those ops (meta body stays effectively unset; the
+        # delete/rename switch branches read only kv_key/old_key/new_key).
         let decoded = if this.op == "create" || this.op == "update" {
           if $is_encoded {
             this.body.decode("base64").decompress("gzip").catch(null)
           } else { this.body }
-        }
+        } else { null }
         meta body = $decoded
         meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
     {{- if .Values.connect.contentLog.enabled }}
