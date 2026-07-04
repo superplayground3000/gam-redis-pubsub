@@ -1,0 +1,15 @@
+{{- if .Values.observability.enabled }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "cdc-alerts") }}
+  labels:
+    app: cdc-observability
+    {{- with .Values.observability.prometheusRule.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+spec:
+  {{- /* cdc-alerts.yaml is a `groups:` document; .Files.Get returns it raw (Helm
+         does NOT render {{ $labels }} inside files/). Indent it under spec. */}}
+  {{- .Files.Get "files/prometheus/cdc-alerts.yaml" | nindent 2 }}
+{{- end }}
