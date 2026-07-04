@@ -62,10 +62,18 @@ services:
 
   alertmanager:
     image: prom/alertmanager:v0.27.0
+    depends_on:
+      alert-sink: { condition: service_healthy }
     command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
     ports: ["${ALERTMANAGER_PORT:-19093}:9093"]
     volumes:
       - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks: [lab]
+
+  alert-sink:
+    build: ./alert-sink
+    ports: ["${ALERT_SINK_PORT:-19099}:9099"]
+    healthcheck: { test: ["CMD","wget","-qO-","http://localhost:9099/healthz"], interval: 3s, timeout: 2s, retries: 10 }
     networks: [lab]
 
 networks:
