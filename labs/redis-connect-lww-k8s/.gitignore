@@ -1,7 +1,0 @@
-# Built Go binaries
-writer/writer
-collector/collector
-# Rendered manifests
-out/
-# Local run output
-reports/*.json

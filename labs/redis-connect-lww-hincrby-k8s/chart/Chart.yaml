@@ -1,6 +1,0 @@
-apiVersion: v2
-name: redis-connect-lww-hincrby-k8s
-description: HINCRBY-safe multi-writer LWW CDC lab (set/delete/rename) — fork of redis-connect-lww-multi-k8s
-type: application
-version: 0.1.0
-appVersion: "1.0.0"

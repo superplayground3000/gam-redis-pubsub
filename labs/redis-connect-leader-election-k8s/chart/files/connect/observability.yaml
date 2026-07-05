@@ -1,9 +1,0 @@
-http:
-  address: 0.0.0.0:4195
-  enabled: true
-logger:
-  level: INFO
-  format: json
-  add_timestamp: true
-metrics:
-  prometheus: {}

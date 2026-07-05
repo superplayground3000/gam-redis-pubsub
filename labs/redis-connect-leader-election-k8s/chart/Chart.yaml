@@ -1,6 +1,0 @@
-apiVersion: v2
-name: redis-connect-leader-election-k8s
-description: Best-effort active-gating PoC — client-go leader election in front of Redpanda Connect streams mode
-type: application
-version: 0.1.0
-appVersion: "1.0.0"

@@ -1,8 +1,0 @@
-redis-connect-leader-election-k8s installed.
-
-N connect pods run streams mode (empty boot); each has an elector sidecar that
-POSTs the consuming pipeline only while it holds the Lease. Verify with:
-
-  scripts/verify-election.sh
-
-Watch live:  scripts/dashboard-forward.sh  -> http://<host>:8080

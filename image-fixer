@@ -1,8 +1,0 @@
-Giving a codebase, the skill must follow codebase's instruction to build image and fix the critical vulnerabilities.
-Requirements:
-1. Use trivy to scan image (build image first by following codebase instructions)
-2. list all cirtical vulnerabilities and propose fix for each, provide your plan to codex for a review
-3. provide your final fix plan to user for a review, including what will be changed (image version, package version, code), what feature might be unstable, what feature might be unusable
-4. If it's tedious work like chainging base image, changing minor version of packages, use Minimax subagents to do them. If Minimax can't handle the problem, fallback to Sonnet.
-5. A fixed image must fulfill these criteria: image is runnable, image does not contain critical vulneribilities
-6. Fixed image must be tagged with hpdevelop/REPO_NAME:VERSION-claudefix
