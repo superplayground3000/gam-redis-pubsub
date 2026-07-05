@@ -4,7 +4,7 @@
 
 **Goal:** A self-contained docker-compose lab that runs a distilled Redpanda Connect sink pipeline (same metric names as the chart) fed by a Go traffic generator, and an automated `verify-alert.sh` that proves the chart's `CDCUnprocessableMessages` alert fires on poison traffic, stays green on healthy traffic, clears on recovery, and the Grafana dashboard reflects it — all consuming the chart's single-source `cdc-alerts.yaml` and `cdc-dashboard.json` directly (no copies).
 
-**Architecture:** `labs/redis-cdc-error-alerting/` compose stack: `redis` + `nats` (JetStream) + `nats-init` (stream+durable pull consumer) + `connect` (distilled sink, metrics on :4195) + `prometheus` (scrapes connect, loads the chart's alert file) + `alertmanager` (→ webhook) + `alert-sink` (Go, records fired alerts) + `grafana` (provisioned with the chart's dashboard) + `generator` (Go, healthy/poison/mixed traffic). The chart's alert and dashboard are **bind-mounted** from `../../redis-cdc-le-k8s/chart/files/...`, so the lab validates exactly what ships.
+**Architecture:** `labs/redis-cdc-error-alerting/` compose stack: `redis` + `nats` (JetStream) + `nats-init` (stream+durable pull consumer) + `connect` (distilled sink, metrics on :4195) + `prometheus` (scrapes connect, loads the chart's alert file) + `alertmanager` (→ webhook) + `alert-sink` (Go, records fired alerts) + `grafana` (provisioned with the chart's dashboard) + `generator` (Go, healthy/poison/mixed traffic). The chart's alert and dashboard are **bind-mounted** from `../../chart/files/...`, so the lab validates exactly what ships.
 
 **Tech Stack:** Docker Compose, Redpanda Connect `hpdevelop/connect:4.92.0-claudefix`, NATS JetStream, Redis, Prometheus, Alertmanager, Grafana, Go (nats.go), bash.
 
@@ -34,8 +34,8 @@ labs/redis-cdc-error-alerting/
   scripts/verify-alert.sh
 ```
 Single-source bind mounts (in compose, relative to the lab dir):
-- `../../redis-cdc-le-k8s/chart/files/prometheus/cdc-alerts.yaml` → prometheus rules
-- `../../redis-cdc-le-k8s/chart/files/grafana` → grafana dashboards dir
+- `../../chart/files/prometheus/cdc-alerts.yaml` → prometheus rules
+- `../../chart/files/grafana` → grafana dashboards dir
 
 ---
 
@@ -294,7 +294,7 @@ receivers:
     ports: ["${PROM_PORT:-19090}:9090"]
     volumes:
       - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - ../../redis-cdc-le-k8s/chart/files/prometheus/cdc-alerts.yaml:/etc/prometheus/rules/cdc-alerts.yaml:ro
+      - ../../chart/files/prometheus/cdc-alerts.yaml:/etc/prometheus/rules/cdc-alerts.yaml:ro
     networks: [lab]
 
   alertmanager:
@@ -703,7 +703,7 @@ providers:
     ports: ["${GRAFANA_PORT:-13000}:3000"]
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ../../redis-cdc-le-k8s/chart/files/grafana:/var/lib/grafana/dashboards:ro
+      - ../../chart/files/grafana:/var/lib/grafana/dashboards:ro
     networks: [lab]
 ```
 
