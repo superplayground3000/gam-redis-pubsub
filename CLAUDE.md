@@ -3,15 +3,15 @@
 Go CDC lab `redis-cdc-le-k8s`: central Redis Stream → Redpanda Connect (source leg) → NATS
 JetStream → Connect (sink leg) → region Redis KV, with K8s-Lease leader election. Single Go
 binary `app` (subcommands: writer, verifier, elector, latency-calculator, dashboard). Helm
-chart in `chart/`, Go code in `internal/`, scripts in `scripts/`. No Makefile, no CI —
-verification is manual and mandatory.
+chart in `chart/`, Go code in `internal/`, scripts in `scripts/`. CI runs only the fast
+tiers (L0+L1); the docker/kind tiers are manual and mandatory —
+`scripts/run-all-tests.sh` is the single entrypoint.
 
 ## Always follow
 
 - Read `rules/00-diagnostic.md` once per session (what breaks here and why).
-- Read `rules/05-invariants.md` **before any change to code, chart, or pipelines** — it defines
-  what is binding after every change (pre-existing shortfalls live in its "Known gaps" lists
-  and are follow-up work, not violations) and the exact test each change requires.
+- Read `rules/05-invariants.md` **before any change to code, chart, or pipelines** — all four
+  invariants are binding after every change; it defines the exact test each change requires.
 - Read `rules/10-model-dispatch.md` before spawning subagents or choosing models.
 - Read `rules/20-judgment-rubric.md` before declaring any work complete.
 - Read `rules/30-delegation-prompts.md` when writing a subagent prompt.
@@ -32,8 +32,11 @@ verification is manual and mandatory.
 
 ## Verification quick reference (details: `rules/05-invariants.md`)
 
+- All levels: `scripts/run-all-tests.sh` (L0→L3; `SKIP_L2=1`/`SKIP_L3=1` to skip docker
+  tiers, `RUN_FAILOVER=1` adds L4)
 - Unit: `go test ./...` (<10 s)
 - Chart render: `helm lint chart/ && helm template chart/ >/dev/null` (seconds)
+- Lab alert proof (L2): `labs/redis-cdc-error-alerting/scripts/verify-alert.sh` (~7 min)
 - Kind e2e: `scripts/build-images.sh --kind --kind-name=cdc` then
   `RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh` (~5 min)
 - Failover chaos: `scripts/verify-failover.sh` (~12 min; required for consumer-id/group, lease,
