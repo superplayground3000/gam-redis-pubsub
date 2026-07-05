@@ -1,0 +1,105 @@
+name: lab-redis-cdc-error-alerting
+
+# Validates the redis-cdc-le-k8s chart's Grafana dashboard + unprocessable-message
+# alert. The chart's cdc-alerts.yaml and cdc-dashboard.json are bind-mounted (not
+# copied) so the lab tests exactly what ships. See RESEARCH.md.
+
+services:
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck: { test: ["CMD","redis-cli","ping"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js","-m","8222"]
+    ports: ["${NATS_MONITOR_PORT:-18222}:8222"]
+    healthcheck: { test: ["CMD","wget","-qO-","http://localhost:8222/healthz"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats-init:
+    image: natsio/nats-box:0.14.5
+    depends_on: { nats: { condition: service_healthy } }
+    restart: "no"
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        set -e
+        nats --server nats://nats:4222 stream add LAB_CDC \
+          --subjects "kv.cdc.>" --storage file --retention limits \
+          --discard old --max-msgs=-1 --max-bytes=-1 --max-age=1h \
+          --dupe-window=5m --replicas=1 --max-msg-size=-1 --defaults
+        nats --server nats://nats:4222 consumer add LAB_CDC cdc_sink \
+          --pull --ack explicit --deliver all --replay instant \
+          --filter "kv.cdc.>" --max-deliver=-1 --wait=30s --max-pending=1024 \
+          --max-waiting=512 --no-headers-only --defaults
+        echo "nats-init: stream + durable pull consumer created"
+    networks: [lab]
+
+  connect:
+    image: hpdevelop/connect:4.92.0-claudefix
+    depends_on:
+      redis: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    command: ["run","/etc/connect/config.yaml"]
+    volumes:
+      - ./connect/config.yaml:/etc/connect/config.yaml:ro
+    healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:4195/ping || exit 1"], interval: 5s, timeout: 3s, retries: 10 }
+    networks: [lab]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    depends_on: [connect]
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=2h
+    ports: ["${PROM_PORT:-19090}:9090"]
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../../chart/files/prometheus/cdc-alerts.yaml:/etc/prometheus/rules/cdc-alerts.yaml:ro
+    networks: [lab]
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    depends_on:
+      alert-sink: { condition: service_healthy }
+    command: ["--config.file=/etc/alertmanager/alertmanager.yml"]
+    ports: ["${ALERTMANAGER_PORT:-19093}:9093"]
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks: [lab]
+
+  alert-sink:
+    build: ./alert-sink
+    ports: ["${ALERT_SINK_PORT:-19099}:9099"]
+    healthcheck: { test: ["CMD","wget","-qO-","http://localhost:9099/healthz"], interval: 3s, timeout: 2s, retries: 10 }
+    networks: [lab]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    ports: ["${GRAFANA_PORT:-13000}:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../chart/files/grafana:/var/lib/grafana/dashboards:ro
+    networks: [lab]
+
+  generator:
+    build: ./generator
+    depends_on:
+      nats-init: { condition: service_completed_successfully }
+    environment:
+      NATS_URL: nats://nats:4222
+      MODE: ${GEN_MODE:-mixed}
+      RATE: ${GEN_RATE:-20}
+      DURATION: ${GEN_DURATION:-0}
+    profiles: ["gen"]     # not started by default `up`; run on demand via the test script
+    networks: [lab]
+
+networks:
+  lab: {}
