@@ -48,7 +48,9 @@ func Run(args []string) {
 		metrics.Register(mux)
 		log.Printf("metrics listening on %s", metricsAddr)
 		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
-			log.Printf("metrics server: %v", err)
+			// Fail fast: a pod that looks healthy but serves no cdc_latency_seconds
+			// silently breaks INV-2's scrape guarantee (Codex review finding).
+			log.Fatalf("metrics server: %v", err)
 		}
 	}()
 
