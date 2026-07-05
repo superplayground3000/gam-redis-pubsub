@@ -1,3 +1,4 @@
+{{- if .Values.connect.source.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -146,3 +147,9 @@ spec:
     - name: http
       port: 4195
       targetPort: 4195
+    # Elector sidecar metrics (elector_leading / elector_post_total …); scraped
+    # by the observability ServiceMonitor's `elector` endpoint.
+    - name: elector
+      port: 8090
+      targetPort: 8090
+{{- end }}

@@ -5,6 +5,7 @@ top level. The per-leg pipeline ConfigMaps below hold ONLY input/pipeline/output
 (a valid streams stream config); the elector sidecar POSTs one to its local
 connect via the streams REST API while it holds the Lease.
 */}}
+{{- if or .Values.connect.source.enabled .Values.connect.sink.enabled }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -14,6 +15,8 @@ metadata:
 data:
   observability.yaml: |-
 {{ tpl (.Files.Get "files/connect/observability.yaml") . | indent 4 }}
+{{- end }}
+{{- if .Values.connect.source.enabled }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -24,6 +27,8 @@ metadata:
 data:
   pipeline.yaml: |-
 {{ tpl (.Files.Get (printf "files/connect/%s-forward.yaml" .Values.profile)) . | indent 4 }}
+{{- end }}
+{{- if .Values.connect.sink.enabled }}
 ---
 apiVersion: v1
 kind: ConfigMap
@@ -34,3 +39,4 @@ metadata:
 data:
   pipeline.yaml: |-
 {{ tpl (.Files.Get (printf "files/connect/%s-reverse.yaml" .Values.profile)) . | indent 4 }}
+{{- end }}
