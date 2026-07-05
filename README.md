@@ -29,7 +29,9 @@ What this fork adds:
   because the `nats_jetstream` input only *attaches*, never creates.
 - Redis defaults to `--protected-mode no` (`redis.protectedMode`).
 
-See `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` for the design.
+See the design specs under `docs/superpowers/specs/` (mono-binary consolidation,
+typed CDC, stable-consumer failover, observability) and the proof writeup in
+`docs/failover-report/REPORT.md` for the design.
 
 ## Run it (kind)
 
@@ -156,7 +158,8 @@ kind delete cluster --name cdc
 
 ## Further reading
 
-- `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` — this fork's design.
+- `docs/failover-report/REPORT.md` — this fork's SIGKILL-failover fix, proof, and architecture diagrams.
+- `docs/superpowers/specs/` — the incremental design specs behind this fork.
 - `RESEARCH.md` — the property, wire contract, and order-insensitive PASS bar (base).
 - `../labs/no-lww-simple-cdc/` — the CDC base lab.
 - `../labs/redis-connect-leader-election-k8s/` — the leader-election base lab.

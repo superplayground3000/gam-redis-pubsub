@@ -8,7 +8,8 @@ profile: cdc
 # disables prefixing for back-compat with any existing values overrides
 # that reference the unprefixed names.
 #
-# Length budget: see docs/superpowers/specs/2026-06-03-rrcs-k8s-resource-name-prefix-design.md §2.1.
+# Length budget: keep the prefix short — the verifier-Job template enforces a
+# 57-char name budget at render time (see below).
 # Binding case is the harness-generated verifier Job
 # (verifier-<epoch>): default "lab-" leaves ample headroom for a custom
 # prefix. The verifier-Job template fails loud at render time if you exceed
