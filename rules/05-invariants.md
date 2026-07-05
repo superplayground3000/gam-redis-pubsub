@@ -1,8 +1,14 @@
 # 05-invariants.md — Repo Invariants That Must Hold After Every Change
 
-These four invariants are the owner's standing requirements (2026-07-05). Every change to this
-repo must leave all four true. Each invariant lists: what must be true, the load-bearing
-code/config that makes it true, and the exact command that proves it.
+These four invariants are the owner's standing requirements (2026-07-05). Each one contains
+two kinds of statements — read them differently:
+
+- **Binding now:** must hold after every change, starting today. Violating one blocks
+  completion.
+- **Target state / Known gaps:** the intended end state. Items in a "Known gaps" list are
+  pre-existing shortfalls: they are NOT violations, changes must not widen them, and closing
+  them is standing follow-up work. When a gap is closed, remove it from the list (with
+  evidence) and the corresponding target becomes binding.
 
 If a change makes any "load-bearing" item false, either restore it or get explicit user
 approval — do not silently redesign a guarantee.
@@ -14,7 +20,8 @@ table says, search the repo for the quoted key before concluding the table is wr
 
 ## INV-1 — At-least-once delivery, source and sink, in Kubernetes
 
-**Statement:** Every message XADDed to the central Redis stream is applied to the region Redis
+**Statement (binding — holds today, must keep holding):** Every message XADDed to the central
+Redis stream is applied to the region Redis
 at least once, provided the Redis stream and NATS JetStream themselves are not corrupted.
 Duplicates are allowed (absorbed by idempotency); loss is not.
 
@@ -53,9 +60,13 @@ in this fence-free/no-LWW lab (`docs/nats-jetstream-and-redis-kv-message-flow.md
 
 ## INV-2 — Problem-message metrics, seconds histograms, and Grafana visualization
 
-**Statement:** (a) every message the pipeline cannot process is visible in a metric;
+**Target state:** (a) every message the pipeline cannot process is visible in a metric;
 (b) performance histograms are exposed in **seconds**; (c) the Grafana dashboard shipped in the
-chart visualizes both.
+chart visualizes both. (a) and (b) hold today and are binding; for (c) the dashboard covers the
+failure metrics but not yet the histograms — that is gap 1 below, not a violation.
+
+**Binding now:** never regress a load-bearing item below, and any metric or failure path you
+ADD must appear on the dashboard in the same change.
 
 ### Load-bearing items
 
@@ -92,8 +103,15 @@ An agent asked to "improve observability" should work this list top-down.
 
 ## INV-3 — Every helm chart component individually enable/disable-able
 
-**Statement:** each deployable component in `chart/` can be turned off via values, and
-`helm template` with a component disabled emits none of its resources.
+**Target state:** each deployable component in `chart/` can be turned off via values, and
+`helm template` with a component disabled emits none of its resources. This is NOT yet true —
+the missing toggles listed below are pre-existing gaps, not violations.
+
+**Binding now (every chart change):**
+1. Any NEW component template ships with an `enabled:` toggle (default chosen deliberately,
+   dependent Service/ConfigMap/RBAC guarded too) in the same change. No exceptions.
+2. Never remove or break an existing toggle (prove with the L1 renders below).
+3. The missing-toggles list below may only shrink, never grow.
 
 ### Current state (2026-07-05)
 
@@ -108,11 +126,7 @@ RBAC, connect ConfigMaps are always rendered. Target values shape when adding th
 `rbac.enabled` (default all `true`), guarding the whole template file with
 `{{- if .Values.<component>.enabled }}`.
 
-### Rules for chart changes
-
-1. **Any new component template must ship with an `enabled:` toggle (default chosen deliberately) in the same change.** No exceptions.
-2. When adding a toggle, also guard dependent resources (Service, ConfigMap, RBAC of that component).
-3. Use the existing project skill `.claude/skills/helm-chart-review/` for any chart/values review.
+Use the existing project skill `.claude/skills/helm-chart-review/` for any chart/values review.
 
 ### How to verify (L1, seconds)
 
@@ -128,8 +142,9 @@ Then L3 (`verify-cdc.sh`) if the disabled-by-default set changed, to prove the d
 
 ## INV-4 — A test suite runs after every change
 
-**Statement:** every change is verified before being declared done, at the level the change
-warrants. Full e2e runs on a kind cluster; fast verification uses containers.
+**Statement (binding):** every change is verified before being declared done, at the level the
+change warrants, using the ladder below. The container-based fast tier (L2) is a pre-existing
+gap — until it is built, its row tells you what to substitute.
 
 ### Verification ladder
 

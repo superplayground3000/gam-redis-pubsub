@@ -9,8 +9,9 @@ verification is manual and mandatory.
 ## Always follow
 
 - Read `rules/00-diagnostic.md` once per session (what breaks here and why).
-- Read `rules/05-invariants.md` **before any change to code, chart, or pipelines** — it lists
-  the four invariants that must hold after every change and the exact test each requires.
+- Read `rules/05-invariants.md` **before any change to code, chart, or pipelines** — it defines
+  what is binding after every change (pre-existing shortfalls live in its "Known gaps" lists
+  and are follow-up work, not violations) and the exact test each change requires.
 - Read `rules/10-model-dispatch.md` before spawning subagents or choosing models.
 - Read `rules/20-judgment-rubric.md` before declaring any work complete.
 - Read `rules/30-delegation-prompts.md` when writing a subagent prompt.
