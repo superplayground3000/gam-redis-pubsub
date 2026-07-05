@@ -139,7 +139,7 @@ Then L3 (`verify-cdc.sh`) if the disabled-by-default set changed, to prove the d
 **Statement:** every change is verified before being declared done, at the level the change
 warrants, using the ladder below. `scripts/run-all-tests.sh` is the single entrypoint
 (L0→L1→L2→L3; `SKIP_L2=1`/`SKIP_L3=1` to skip the docker tiers, `RUN_FAILOVER=1` adds L4).
-CI (`.github/workflows/ci.yaml`) enforces L0+L1 on every push/PR; L2-L4 are run manually —
+CI (`.github/workflows/ci.yaml`) enforces L0+L1 on every PR and push to master; L2-L4 are run manually —
 deliberate scope for now, an L3 nightly would strengthen it further.
 
 ### Verification ladder

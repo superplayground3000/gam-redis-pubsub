@@ -19,8 +19,9 @@ Backups are working-tree safety nets; they do not need to be committed.
   "Required"/verification columns are unchanged; changing what a row requires is still
   ask-first.
 - Clarify ambiguous wording without changing intent.
-- Update the "Known gaps" lists in `rules/05-invariants.md` when a gap is closed — with
-  verification evidence in the same session.
+- If a Known-gaps regime is ever reinstated in `rules/05-invariants.md` (none exists since the
+  2026-07-05 strict restore), update its lists only with verification evidence in the same
+  session.
 
 ## What requires asking the user first
 
