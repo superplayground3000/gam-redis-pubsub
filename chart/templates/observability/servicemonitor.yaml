@@ -9,8 +9,9 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  # Namespace-scoped isolation: only this release's namespace. Selects BOTH Connect
-  # legs by their app label; queries are further scoped by namespace/job in PromQL.
+  # Namespace-scoped isolation: only this release's namespace. Selects both Connect
+  # legs plus the writer and latency-calculator Services by their app label;
+  # queries are further scoped by namespace/job in PromQL.
   namespaceSelector:
     matchNames:
       - {{ .Release.Namespace }}
@@ -18,9 +19,16 @@ spec:
     matchExpressions:
       - key: app
         operator: In
-        values: [connect-source, connect-sink]
+        values: [connect-source, connect-sink, writer, latency-calculator]
   endpoints:
+    # `http` matches connect (4195), writer (8081), latency-calculator (8082) —
+    # every selected Service names its metrics port `http`.
     - port: http
+      path: /metrics
+      interval: {{ .Values.observability.serviceMonitor.interval }}
+    # `elector` exists only on the connect Services (sidecar on 8090); Services
+    # without a port of this name are simply not scraped by this endpoint.
+    - port: elector
       path: /metrics
       interval: {{ .Values.observability.serviceMonitor.interval }}
 {{- end }}

@@ -20,6 +20,33 @@
     { "id": 3, "title": "Unprocessable rate by reason", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
       "targets": [ { "expr": "sum by (reason) (increase({__name__=~\"cdc_unprocessable(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" } ] },
     { "id": 4, "title": "Connect processor errors (context)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "targets": [ { "expr": "sum(rate({__name__=~\"processor_error(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "processor_error/s" } ] }
+      "targets": [ { "expr": "sum(rate({__name__=~\"processor_error(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "processor_error/s" } ] },
+    { "id": 5, "title": "Forward-leg JetStream publish failures", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "description": "cdc_forward_publish_failed: publishes that errored and were NACKed back to the redis_streams input for replay (no ack, no loss). Nonzero means NATS is rejecting/unreachable while the source keeps retrying.",
+      "targets": [ { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_publish_failed(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" } ] },
+    { "id": 6, "title": "Connect processing latency p50/p95/p99 (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "Connect timing histograms (use_histogram_timing: true). Metric name says _ns but the histogram buckets record SECONDS in this Connect build — treat values as seconds.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum by (le) (rate(processor_latency_ns_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum by (le) (rate(processor_latency_ns_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum by (le) (rate(processor_latency_ns_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "p99" }
+      ] },
+    { "id": 7, "title": "End-to-end CDC latency percentiles (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "cdc_latency_seconds from the latency-calculator (region XADD timestamp delta, rolling window). Its job label differs from the connect legs, so this panel scopes by namespace only.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [ { "expr": "cdc_latency_seconds{namespace=~\"$namespace\",op=\"overall\"}", "legendFormat": "{{quantile}}" } ] },
+    { "id": 8, "title": "Writer throughput & errors (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "description": "cdc_writer_* from the writer's own job (scoped by namespace only — the $job variable tracks the connect legs).",
+      "targets": [
+        { "expr": "sum by (op) (rate(cdc_writer_ops_total{namespace=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "{{op}}" },
+        { "expr": "sum(rate(cdc_writer_errors_total{namespace=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "errors" }
+      ] },
+    { "id": 9, "title": "Elector leadership & lease ops", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "description": "elector_leading per pod (1 = holds the Lease; exactly one per leg) and stream POST/DELETE error rate. Scoped by namespace only.",
+      "targets": [
+        { "expr": "elector_leading{namespace=~\"$namespace\"}", "legendFormat": "leading {{pod}}" },
+        { "expr": "sum(rate(elector_post_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval])) + sum(rate(elector_delete_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval]))", "legendFormat": "lease-op errors/s" }
+      ] }
   ]
 }

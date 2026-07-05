@@ -97,13 +97,29 @@ pipeline:
 
 output:
   label: __POD__
-  nats_jetstream:
-    urls:
-      - "{{ include "rrcs.nats.url" . }}"
-    auth:
-      user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }}
-    subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
-    headers:
-      Nats-Msg-Id: ${! meta("event_id") }
-      Content-Type: application/json
-    max_in_flight: {{ .Values.connect.source.maxInFlight | default 256 }}
+  fallback:
+    # Child 1 — the real publish. Every load-bearing setting (Nats-Msg-Id dedup
+    # header, publish-then-XACK ordering via the input's commit_period) lives
+    # here unchanged.
+    - nats_jetstream:
+        urls:
+          - "{{ include "rrcs.nats.url" . }}"
+        auth:
+          user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }}
+        subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
+        headers:
+          Nats-Msg-Id: ${! meta("event_id") }
+          Content-Type: application/json
+        max_in_flight: {{ .Values.connect.source.maxInFlight | default 256 }}
+    # Child 2 — reached only when the JetStream publish failed. Count it, then
+    # reject: the message is NACKed back to the redis_streams input, which
+    # replays it (auto_replay_nacks) — the entry is never XACKed here, so the
+    # at-least-once write-then-ack guarantee is unchanged; this branch only
+    # makes the failure visible (INV-2: forward-leg publish-failure metric).
+    - reject: 'jetstream publish failed: ${! metadata("fallback_error") }'
+      processors:
+        - metric:
+            type: counter
+            name: cdc_forward_publish_failed
+            labels:
+              reason: publish_error

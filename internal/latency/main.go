@@ -5,6 +5,7 @@ package latency
 import (
 	"context"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -38,6 +39,18 @@ func Run(args []string) {
 	windowSec := envInt("WINDOW_SEC", 60)
 	intervalSec := envInt("INTERVAL_SEC", 10)
 	reportPath := env("REPORT_PATH", "/reports/latency-report.json")
+	metricsAddr := env("METRICS_ADDR", ":8082")
+
+	// Scrapeable percentiles (INV-2): same numbers as the JSON report.
+	metrics := &MetricsServer{}
+	go func() {
+		mux := http.NewServeMux()
+		metrics.Register(mux)
+		log.Printf("metrics listening on %s", metricsAddr)
+		if err := http.ListenAndServe(metricsAddr, mux); err != nil {
+			log.Printf("metrics server: %v", err)
+		}
+	}()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -91,6 +104,7 @@ func Run(args []string) {
 			nowMs := t.UnixMilli()
 			win.Evict(nowMs)
 			rep := BuildReport(win, nowMs, cfg)
+			metrics.Update(rep)
 			if err := WriteReportAtomic(reportPath, rep); err != nil {
 				log.Printf("write report: %v", err)
 				tickErr = true
