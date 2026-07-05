@@ -14,6 +14,11 @@ spec:
     metadata:
       labels:
         {{- include "rrcs.podLabels" (dict "root" $ "app" "connect-sink") | nindent 8 }}
+      annotations:
+        # Roll the pods when any connect ConfigMap changes: the elector POSTs
+        # the pipeline only when it wins the Lease, so without a rollout a
+        # helm upgrade that edits the pipeline never reaches the running leg.
+        checksum/connect-config: {{ include (print $.Template.BasePath "/connect-configmaps.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink-elector") }}
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
