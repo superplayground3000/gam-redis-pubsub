@@ -47,6 +47,10 @@ Written 2026-07-05 by the governance session that created `rules/` and `CLAUDE.m
 4. Grafana latency/histogram panels + a forward-leg publish-failure metric (INV-2 gap list).
 5. CI workflow (see §1.2).
 6. Writer/elector metrics scraping (ServiceMonitor covers only connect legs).
+7. **After items 1–6 empty every "Known gaps" list in `rules/05-invariants.md`:** restore the
+   strict gate version — relabel the "Target state" sections as binding and remove the ratchet
+   carve-outs. The owner pre-approved this reversion on 2026-07-05 (recorded in the 05 header);
+   cite that line when making the edit, no fresh approval needed.
 
 ## 5. Honest limitations of this harness and rule set
 

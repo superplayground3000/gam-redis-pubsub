@@ -10,6 +10,11 @@ two kinds of statements — read them differently:
   them is standing follow-up work. When a gap is closed, remove it from the list (with
   evidence) and the corresponding target becomes binding.
 
+**Owner decision (2026-07-05):** this ratchet interpretation is approved as a TEMPORARY
+regime. Once every "Known gaps" list in this file is empty, restore the strict version:
+relabel each "Target state" as binding and delete the gap-list carve-outs. That reversion is
+pre-approved — see `rules/90-letter-to-future-sessions.md` §4 item 7.
+
 If a change makes any "load-bearing" item false, either restore it or get explicit user
 approval — do not silently redesign a guarantee.
 

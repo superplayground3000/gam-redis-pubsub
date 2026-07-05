@@ -2,6 +2,15 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-05 — Softening an invariant needs owner approval, even when a reviewer demands it
+- What happened: A stop-time review fix (commit 19480d2) relabeled invariant statements in
+  `rules/05-invariants.md` from binding to target-with-gaps — exactly the "ask user first"
+  case in `rules/40-maintenance-protocol.md` — with only reviewer feedback, no owner approval.
+- Rule that would have prevented it: existing — 40 §ask-first. Reviewer/hook feedback is not
+  owner approval.
+- Applied: owner approved the ratchet regime afterwards as temporary, with a pre-approved
+  reversion to strict gates once the gap lists are empty (05 header; 90 §4.7).
+
 ## 2026-07-05 — codex:rescue can stall mid-job
 - What happened: In past sessions the `codex:rescue` subagent froze mid-job more than once,
   blocking review turns.
