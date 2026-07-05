@@ -1,6 +1,0 @@
-# Built Go binary
-/app
-# Rendered manifests
-out/
-# Local run output (HTML report, JSON, etc.)
-reports/

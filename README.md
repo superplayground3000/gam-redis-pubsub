@@ -1,146 +1,162 @@
-# Redis Fan-out Validation Stack
+# redis-cdc-le-k8s
 
-驗證「central Redis → N 個獨立 edge Redis 」event-driven 資料同步架構的最小可運行環境。
-A minimal but realistic stack to validate central → N edge Redis event-driven data sync.
+Redpanda Connect CDC chart = the fence-free CDC relay of `../labs/no-lww-simple-cdc`
+**plus** Kubernetes-Lease leader election (active/standby) on both connect legs,
+from `../labs/redis-connect-leader-election-k8s`.
 
----
+## What this demonstrates
 
-## 1. Pub/Sub vs Streams — 你該用哪個?
+A fence-free CDC relay: a writer emits each `create`/`update`/`delete`/`rename`
+as a CDC envelope on a central Redis Stream; a Redpanda Connect **source** leg
+publishes to NATS JetStream (with `Nats-Msg-Id` dedup); a Connect **sink** leg
+binds a durable **pull consumer**, switches on `op`, and applies
+`SET`/`DEL`/rename-Lua to **region** Redis KV — with **no last-write-wins fence**.
 
-| 特性 Feature           | `PUBLISH/SUBSCRIBE`              | `XADD/XREADGROUP` (Streams)        |
-| ---------------------- | -------------------------------- | ---------------------------------- |
-| 持久化 Persistence     | ❌ fire-and-forget                | ✅ append-only log                  |
-| 訂閱者離線 Offline sub | 訊息直接丟失 lost                | 上線後可繼續消費 catch-up          |
-| ACK / 重試 Retry       | ❌                                | ✅ XACK + XPENDING                  |
-| Consumer group         | ❌                                | ✅ 多 consumer 分片消費             |
-| Replay 重播            | ❌                                | ✅ 從任意 offset 重讀               |
-| 延遲 Latency           | 最低                             | 微高一些(寫 AOF + ack overhead)  |
-| 適用 Use case          | cache invalidate、即時通知       | **資料同步、event sourcing、ETL**  |
+What this fork adds:
 
-**結論**:你的場景(central → N clusters 同步資料)**必須用 Streams**。Pub/Sub 在 relay 重啟、edge 短暫 down、網路抖動的情況下會直接掉資料。本 stack 預設使用 Streams,relay.py 底部保留 pub/sub 變體供對照。
+- **Leader election on both legs.** Each connect leg runs `replicas: 3`
+  (1 active + 2 standbys — HA quorum) in *streams mode* (empty boot) with an
+  **elector sidecar**. Only the holder of the leg's coordination.k8s.io **Lease**
+  POSTs the consuming pipeline to its local connect over the streams REST API;
+  standbys hold no stream (`/ready` is 200 — healthy but idle). Exactly one active
+  pod consumes per leg ⇒ clean active/standby failover and no cross-pod
+  double-processing. (Within the active sink pod, `pipeline.threads` still
+  processes a batch concurrently, so same-key ops in one batch may reorder — fine
+  for this no-LWW lab; set sink `threads: 1` for strict per-key ordering.)
+- **RBAC** granting each elector get/list/watch/create/update/patch on `leases`.
+- **Pull-consumer by default** (`bind: true`): the durable consumer is
+  pre-created server-side (the `nats-init` Job, or `scripts/create-consumer.sh`),
+  because the `nats_jetstream` input only *attaches*, never creates.
+- Redis defaults to `--protected-mode no` (`redis.protectedMode`).
 
----
+See `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` for the design.
 
-## 2. 架構元件 Components
-
-```
-loadgen ─XADD→ redis-central [Stream: events] ─XREADGROUP→ relay ─pipeline→ redis-edge-{1,2,3}
-                                                                            ↑
-                                                            validator ──────┘
-```
-
-- **redis-central**: 寫入端,持有 `events` Stream
-- **redis-edge-{1,2,3}**: 三個獨立 Redis 實例,代表 N 個 edge clusters
-- **relay**: 用 consumer group 從 central 拉事件,pipeline fan-out 到每個 edge,XACK
-- **loadgen**: pipelined XADD 產生負載
-- **validator**: 等所有 edge `DBSIZE` 達標 + 隨機抽樣比對值
-
----
-
-## 3. 起動 Quickstart
+## Run it (kind)
 
 ```bash
-docker compose up -d redis-central redis-edge-1 redis-edge-2 redis-edge-3 relay
-docker compose logs -f relay
+kind create cluster --name cdc
+scripts/build-images.sh --kind --kind-name=cdc   # writer/verifier/dashboard/elector → kind
+# NATS auth fixtures are committed; regenerate only on a fresh checkout if missing:
+#   scripts/gen-nats-auth.sh --force
+RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh
 ```
 
-各 Redis 對外 port:
-- central: `6380`
-- edge-1: `6381` / edge-2: `6382` / edge-3: `6383`
+`verify-cdc.sh` boots the chart (`profile=cdc`), runs the verifier Job, and exits
+0 only when all three checks pass (dedup, per-op-under-quiescence, idempotent
+replay).
 
-可用 `redis-cli -p 6380` 從 host 連入觀察。
+## Body encoding & backward-safe upgrade
 
----
+The CDC body inside the NATS envelope can be carried as a plain string
+(`connect.bodyEncoding: "none"`, the default) or **gzip-then-base64**
+(`"gzip:base64"`). Plain `content().string()` both bloats and *silently corrupts*
+non-UTF-8/binary values (Go's JSON encoder rewrites invalid bytes to U+FFFD);
+`gzip:base64` carries the raw bytes losslessly and smaller. The **sink leg
+auto-detects** the format per message via the envelope's `enc` field, so it always
+consumes both — only the **source leg** honors the flag.
 
-## 4. 分量級驗證 Tiered validation
+`values-dev.yaml` enables `gzip:base64` (kind installs are fresh, so both legs start
+new together — safe). Because this is a wire-format change, **upgrading an existing
+deployment is reader-first** — the sink must understand the new format before the
+source produces it:
 
 ```bash
-./scripts/run-tier.sh smoke    # 1 萬筆 — 約數秒
-./scripts/run-tier.sh stress   # 10 萬筆 — 數十秒
-./scripts/run-tier.sh scale    # 100 萬筆 — 數分鐘
+# 1. Deploy this chart with encoding still OFF; roll BOTH legs.
+#    Sink becomes decode-capable while the source still emits plain bodies (safe in any order).
+helm upgrade cdc ./chart -n cdc-k8s --set profile=cdc --set connect.bodyEncoding=none
+kubectl -n cdc-k8s rollout restart deploy/lab-connect-sink deploy/lab-connect-source
+
+# 2. Flip encoding ON; roll ONLY the source. Every sink already decodes.
+helm upgrade cdc ./chart -n cdc-k8s --set profile=cdc --set connect.bodyEncoding=gzip:base64
+kubectl -n cdc-k8s rollout restart deploy/lab-connect-source
 ```
 
-每個 tier 會自動:
-1. 啟動 stack
-2. `FLUSHALL` 所有 edge + 清空 central stream(乾淨起點)
-3. 重啟 relay
-4. 用 loadgen 推 N 筆事件
-5. validator 等收斂並抽樣比對
+(The chart has no configmap-checksum annotation, so pods must be rolled to re-POST a
+changed pipeline — the elector POSTs only on lease acquisition.)
 
-### 預期觀察指標 What to look at
-
-| 量級       | 預期 loadgen 速率        | 預期收斂時間          | 注意點                                  |
-| ---------- | ------------------------ | --------------------- | --------------------------------------- |
-| 1 萬       | ~50k–100k/s              | < 5s                  | 純粹確認 pipeline 正確                  |
-| 10 萬      | ~50k–100k/s              | 10–30s                | relay 是否單核飽和?觀察 CPU            |
-| 100 萬     | ~50k–100k/s 持續         | 1–5 分鐘              | 記憶體:central stream 約 200–400 MB    |
-
-對 1M 量級,實測時請 `docker stats` 觀察 relay 容器 CPU,若單核打滿就是 relay 已成 bottleneck,水平擴(下方第 6 節)。
-
----
-
-## 5. 故意製造失敗來驗證可靠性 Failure injection
-
-驗證 Streams 真的不丟資料:
+## Inspect leader election
 
 ```bash
-# 在 loadgen 進行到一半時殺掉 relay
-docker compose --profile tools run --rm loadgen python loadgen.py --count 100000 &
-sleep 2
-docker compose kill relay
-sleep 5
-docker compose up -d relay
-# 之後跑 validator 應該還是 100,000 筆全部到齊
+kubectl -n cdc-k8s get lease                       # holderIdentity = active pod per leg
+kubectl -n cdc-k8s get pods -l app=connect-sink    # 3 replicas; 1 active, 2 standby
 ```
 
-對比:把 relay 改成 pub/sub 模式做同樣實驗,validator 一定會 timeout 或回報 count 不足。
+## Pre-create the pull consumer by hand
 
-其他可測情境:
-- `docker compose stop redis-edge-2` 然後寫入,啟回後該 edge 仍會 catch up(因為 relay 會重試直到 pipeline 成功)
-- 用 `redis-cli -p 6380 XLEN events` 觀察 stream 長度
-- 用 `XPENDING events relay-group` 看有沒有未 ack 的事件堆積
-
----
-
-## 6. 擴展到真正的 cluster mode
-
-目前每個 "cluster" 是單節點。要切到真 Redis Cluster:
-
-**每個 edge 改為 3 master + 3 replica**
-
-關鍵調整:
-- image 啟用 `--cluster-enabled yes --cluster-config-file nodes.conf`
-- 6 個容器 + 用 `redis-cli --cluster create` 一次性 bootstrap
-- relay 端的 client 換成 `RedisCluster.from_url(...)` 而不是 `Redis.from_url(...)`(`redis-py` 內建支援)
-- 注意 cluster mode 下 pipeline 必須同 hash slot,跨 slot 寫入需用 `cluster_pipeline` 或自行 group by slot
-
-通常 edge cluster 升級到 cluster mode 比 central 重要(讀寫擴展性),central 可以維持 sentinel 即可(寫入單點瓶頸由 stream 自然消化)。
-
-**水平擴 relay**:在 docker-compose 加 `relay-2`、`relay-3`,共用同一個 `CONSUMER_GROUP=relay-group`,Redis 會自動把 stream entries 分給不同 consumer。讓總 fan-out 吞吐線性提升。
-
----
-
-## 7. 進階觀察 Useful redis-cli queries
+The bundled `nats-init` Job creates/reconciles the durable pull consumer
+automatically. For an **external** NATS (or after `nats consumer rm`), form the
+command manually — it never auto-runs unless you set `RUN=1`:
 
 ```bash
-# 看 stream 長度
-docker exec rf-central redis-cli XLEN events
-
-# 看 consumer group 進度
-docker exec rf-central redis-cli XINFO GROUPS events
-
-# 看是否有未 ack 的 pending entries
-docker exec rf-central redis-cli XPENDING events relay-group
-
-# 看 keyspace notification(pub/sub 變體用)
-docker exec rf-central redis-cli PSUBSCRIBE '__keyevent@0__:*'
+scripts/create-consumer.sh                         # prints `nats consumer add … --pull …`
+NATS_CLI="nats --server nats://nats-1:4222 --creds /path/admin.creds" RUN=1 \
+  scripts/create-consumer.sh                       # actually create it
 ```
 
----
+## Drive it by hand
 
-## 8. 已知限制 Limitations
+`scripts/insert-msgs.sh` **prints** ready-to-run `redis-cli XADD` commands (one
+per op + a 5× dedup test) — copy and run them yourself; the script never executes
+them.
 
-- 單一 relay 是 SPOF;production 必須水平擴 + 健康檢查
-- Stream 沒有自動 trim,長跑會吃記憶體 → loadgen 已有 `--trim` 參數,production 用 `XADD ... MAXLEN ~ 1000000`
-- 沒有處理 schema evolution、事件去重、跨 region 延遲
-- Edge 是 standalone,未驗證真 cluster mode 的 slot 路由行為(見第 6 節)
+## Watch central vs region live
+
+```bash
+scripts/dashboard-forward.sh        # binds 0.0.0.0; open http://<host>:8080
+```
+
+The dashboard shows central/region key counts, divergence, per-op sink applies
+(summed across all sink pods, so the active leader's counts are always reflected),
+and a live region key-change feed.
+
+## HTML report
+
+```bash
+RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/gen-report.sh   # writes reports/cdc-report.html
+```
+
+## Latency calculator (optional)
+
+The sink leg emits a best-effort `cdc:latency` record (`op,kv_key,writer_ts,sink_ts`)
+to **region** Redis after each create/update. Enable the region-side calculator to
+turn that into a rolling p50/p95/p99 report:
+
+```bash
+helm upgrade ... --set latencyCalculator.enabled=true
+kubectl -n <ns> exec deploy/<prefix>latency-calculator -- cat /reports/latency-report.json
+```
+
+`latency_ms = sink_ts - writer_ts`. Only create/update are measured (delete/rename
+carry no body/ts). A persistently rising `dropped_negative` indicates central/region
+clock drift (NTP), not a CDC bug.
+
+### One module, one binary, one image
+
+All workloads live in a single Go module (`redis-cdc-le-k8s`): a `main.go`
+dispatcher plus `internal/{writer,verifier,elector,latency,dashboard}` subpackages.
+One `go build` produces a single binary `app` (no `go.work`) that selects its
+behavior by subcommand: `app writer`, `app verifier`, `app elector`,
+`app latency-calculator`, `app dashboard`. That binary ships in a single image
+(`redis-rrcs/cdc-apps`) whose entrypoint idles on `sleep infinity`; every k8s
+workload overrides `command:` to `["/usr/local/bin/app","<mode>"]` to pick its
+mode. Build with `scripts/build-images.sh [--kind --kind-name=...]`.
+
+## Validation note
+
+This is a Kubernetes lab, so the research-lab skill's `validate_lab.sh`
+(docker-compose) does not apply. `scripts/verify-cdc.sh` is the validation: exit
+0 requires dedup + per-op + replay all green.
+
+## Teardown
+
+```bash
+helm uninstall cdc -n cdc-k8s
+kind delete cluster --name cdc
+```
+
+## Further reading
+
+- `docs/superpowers/specs/2026-06-15-redis-cdc-le-k8s-design.md` — this fork's design.
+- `RESEARCH.md` — the property, wire contract, and order-insensitive PASS bar (base).
+- `../labs/no-lww-simple-cdc/` — the CDC base lab.
+- `../labs/redis-connect-leader-election-k8s/` — the leader-election base lab.

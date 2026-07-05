@@ -1,37 +1,6 @@
-.DS_Store
-.omc/
-
-# research-lab skill output: generated docker-compose labs
-
-# Python
-__pycache__/
-*.py[cod]
-*$py.class
-*.so
-.Python
-env/
-venv/
-.venv/
-*.egg-info/
-dist/
-build/
-.eggs/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-*.pyo
-pip-log.txt
-pip-delete-this-directory.txt
-
-# Go
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-*.test
-*.out
-go.sum
-go.work.sum
-vendor/
-/.worktrees
+# Built Go binary
+/app
+# Rendered manifests
+out/
+# Local run output (HTML report, JSON, etc.)
+reports/
