@@ -15,7 +15,7 @@
 - A user info is added but not enabled yet
   - set lb:company:standby:{employees:55688}
   - when ready, rename the key, change "standy" into "active"
-    - a delete followed by set might do the trick
+    - rename key directly to overwrite original key
 - A new group/item/employee is added
   - set a new key for new group/item/employee
 - All keys are going to be updated from time to time

@@ -2,14 +2,17 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
-  labels: { app: connect-source }
+  labels:
+    app: connect-source
 spec:
   replicas: {{ .Values.connect.source.replicas }}
   selector:
-    matchLabels: { app: connect-source }
+    matchLabels:
+      app: connect-source
   template:
     metadata:
-      labels: { app: connect-source }
+      labels:
+        {{- include "rrcs.podLabels" (dict "root" $ "app" "connect-source") | nindent 8 }}
     spec:
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
       {{- include "rrcs.scheduling" . | nindent 6 }}
@@ -69,9 +72,11 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
-  labels: { app: connect-source }
+  labels:
+    app: connect-source
 spec:
-  selector: { app: connect-source }
+  selector:
+    app: connect-source
   ports:
     - name: http
       port: 4195

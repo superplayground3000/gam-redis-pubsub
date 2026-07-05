@@ -23,6 +23,17 @@ images:
   pullPolicy: IfNotPresent  # global default; public images need this on kind.
   pullSecrets: []           # list of { name: <secret-name> }
 
+# Extra labels merged into spec.template.metadata.labels of EVERY workload
+# (all Deployments + the nats-init / verifier Jobs). The mandatory `app`
+# label is always added by the chart and cannot be overridden here — the
+# per-workload selector pins it and selectors are immutable after install.
+# Add team/owner/cost-center/etc. labels for policy, billing, or NetworkPolicy
+# selection. Block style keeps it easy to hand-edit:
+#   podLabels:
+#     team: payments
+#     app.kubernetes.io/part-of: rrcs
+podLabels: {}
+
 redis:
   image: redis:7.4-alpine          # used only in bundled mode
   central:
@@ -54,6 +65,13 @@ nats:
     subjectPrefix: "kv.cdc"
     consumer:
       durable: "cdc_sink"
+      # Server-side pull-consumer settings. In pull(bind) mode Redpanda
+      # Connect ignores deliver/ack_wait/max_ack_pending in the input YAML and
+      # uses whatever the durable was created with — so these live here and are
+      # applied by the nats-init Job's `nats consumer add`.
+      ackWait: "30s"        # redelivery timeout if the sink hasn't acked
+      maxAckPending: 1024    # max un-acked msgs in flight (sink throughput knob)
+      maxDeliver: -1         # -1 = redeliver forever until acked
     maxAge: "1h"
     maxBytes: "256MB"
     maxMsgSize: "1MB"

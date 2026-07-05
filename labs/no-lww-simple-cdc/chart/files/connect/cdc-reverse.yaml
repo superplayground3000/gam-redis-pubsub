@@ -1,4 +1,4 @@
-# cdc-reverse.yaml — single durable pull consumer; switch on op:
+# cdc-reverse.yaml — binds to a pre-created durable PULL consumer; switch on op:
 #   create/update -> SET kv_key body ; delete -> DEL kv_key ;
 #   rename -> EVAL cdc_rename.lua (native RENAME old->new, value-preserving) ;
 #   unknown -> throw -> nack.
@@ -13,13 +13,17 @@ input:
   label: jetstream_source
   nats_jetstream:
     urls: ["{{ include "rrcs.nats.url" . }}"]
-    auth: { user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }} }
-    subject: {{ include "rrcs.nats.stream.subjects" . | quote }}
+    auth:
+      user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
     durable: {{ .Values.nats.stream.consumer.durable | quote }}
-    deliver: all
-    ack_wait: 30s
-    max_ack_pending: 1024
+    # bind:true => attach to the EXISTING pull consumer the nats-init Job
+    # created server-side. Without bind, this input would instead create a
+    # durable PUSH consumer. In pull(bind) mode Redpanda Connect derives the
+    # subject from the consumer's FilterSubject and IGNORES deliver / ack_wait /
+    # max_ack_pending here — those are set on `nats consumer add` (see
+    # values nats.stream.consumer.*), so we don't repeat them.
+    bind: true
 
 pipeline:
   threads: 4
