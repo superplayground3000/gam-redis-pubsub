@@ -2,6 +2,28 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-06 — Subagents "complete" without delivering their final report
+- What happened: During the robustness-lab build, every reviewer subagent (and one Codex proxy)
+  went idle without its final message reaching the controller; each needed a follow-up
+  SendMessage nudge, costing a round-trip per task.
+- Rule that would have prevented it: tell every dispatched agent, in the prompt, to deliver its
+  report via SendMessage to "main" (idle ≠ delivered), and treat an idle notification with no
+  report as "nudge once, then read its report file from disk".
+- Applied: later dispatches in that session included the SendMessage instruction; pattern
+  recorded here for future multi-agent sessions.
+
+## 2026-07-06 — decode_error poison is not injectable via XADD; poison counters over-count by design
+- What happened: While designing `labs/robustness-test`, injection of undecodable bodies via the
+  central Redis stream silently produced VALID messages — the forward leg re-encodes `body` per
+  `connect.bodyEncoding`, so decode failures can only be created by publishing directly to
+  `kv.cdc.<op>` on NATS. Also, `maxDeliver: -1` + immediate NAK redelivery means one poison
+  message increments `cdc_unprocessable` thousands of times per minute until the stream is
+  purged — "delta == injected count" oracles are wrong by construction; use `>=` + purge.
+- Rule that would have prevented it: read the pipeline's encode/decode path end-to-end before
+  designing fault injection; assert `>=` for any counter tied to a redelivering failure branch.
+- Applied: `labs/robustness-test/RESEARCH.md` documents both; the lab's phase-4 oracle uses
+  `>=` then purges `KV_CDC`.
+
 ## 2026-07-05 — "helm upgrade succeeded" does not mean the new pipeline is running
 - What happened: L3 failed after a pipeline edit. The connect pods were 2 days old: helm
   upgraded the pipeline ConfigMap, but nothing rolled the pods, and the elector POSTs the
