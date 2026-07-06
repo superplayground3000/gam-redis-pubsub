@@ -59,7 +59,7 @@ labs/robustness-test/
 | 1 | A/B canary + source-leader SIGKILL | `scripts/verify-failover.sh` (baseline + fixed) | baseline loses messages AND fixed loses zero |
 | 2 | Sink-leader SIGKILL under live traffic | new; oracle modeled on verify-failover's pure-redis-cli membership check | new lease holder appears; region KV contains all N injected keys |
 | 3 | Standby SIGKILL (one non-holder pod per leg) under traffic | new | leadership unchanged; region KV contains all N keys |
-| 4 | Poison injection: XADD messages triggering `decode_error` and `unknown_op` (reasons per `chart/files/connect/cdc-reverse.yaml`) mixed with good ones | new | `cdc_unprocessable{reason=...}` on the sink leader's `:4195/metrics` increments by exactly the injected counts; good messages still applied to region KV |
+| 4 | Poison injection: `unknown_op` via XADD (`op` not in create/update/delete/rename); `decode_error` published directly to NATS subject `kv.cdc.create` with `enc: gzip:base64` + undecodable body (the forward leg re-encodes bodies, so XADD cannot produce a decode failure) | new; nats-box pod + publisher/admin creds Secrets, per the `nats-init` Job pattern | `cdc_unprocessable{reason=...}` on the sink leader's `:4195/metrics` increments by **at least** the injected count per reason (exact-once is impossible: unprocessable messages redeliver forever by design, `maxDeliver: -1`, ackWait 30s — INV-1 row 7); then purge `KV_CDC` to stop the error loop and prove good messages still apply to region KV |
 
 Exit 0 iff all five phases pass. Estimated runtime ~30 min (5+12+5+5+3).
 
