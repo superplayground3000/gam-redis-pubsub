@@ -30,7 +30,14 @@ trap cleanup EXIT
 h="$(holder "$SINK_LEASE")"; [[ -n "$h" ]] || die "no sink lease holder"
 kubectl -n "$NS" port-forward "pod/$h" "${LPORT}:4195" >/dev/null 2>&1 &
 PF_PID=$!
-sleep 3
+# fail fast if the port-forward never comes up (otherwise metric_sum reads 0s
+# and the run dies 90s later with a misleading delta message)
+pf_deadline=$(( $(date +%s) + 30 ))
+until curl -sf "http://127.0.0.1:${LPORT}/metrics" >/dev/null 2>&1; do
+  (( $(date +%s) < pf_deadline )) || die "port-forward to ${h}:4195 not serving metrics after 30s"
+  kill -0 "$PF_PID" 2>/dev/null || die "port-forward process died (pod ${h} gone?)"
+  sleep 1
+done
 
 # metric_sum <reason> — sum of all cdc_unprocessable series with that reason label
 metric_sum() {
