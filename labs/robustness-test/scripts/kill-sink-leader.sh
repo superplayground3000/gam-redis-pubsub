@@ -31,6 +31,11 @@ done
 log "SIGKILL sink leader $h at region_count=${cur}/${N}"
 kubectl -n "$NS" delete pod "$h" --grace-period=0 --force >/dev/null 2>&1 || true
 
+# prove the kill: the old leader pod must actually be gone before we accept a
+# new holder — otherwise a natural lease flip could masquerade as failover proof
+kubectl -n "$NS" wait --for=delete "pod/$h" --timeout=60s >/dev/null 2>&1 \
+  || die "sink leader pod $h still present 60s after forced delete — kill did not take effect"
+
 nh="$(wait_new_holder "$SINK_LEASE" "$h" "$FAILOVER_TIMEOUT_S")" || die "no new sink lease holder within ${FAILOVER_TIMEOUT_S}s"
 log "new sink leader: $nh"
 

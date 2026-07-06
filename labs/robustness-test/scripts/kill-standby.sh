@@ -25,16 +25,13 @@ log "leaders src=$hs sink=$hk; killing standbys src=$ss sink=$sk during N=$N tra
 xadd_batch "$runid" "$N" standby &
 XPID=$!
 kubectl -n "$NS" delete pod "$ss" "$sk" --grace-period=0 --force >/dev/null 2>&1 || true
-wait "$XPID"
+wait "$XPID" || die "background xadd_batch failed (traffic generation aborted)"
 
-# verify the kill took effect: both standby pod names must be gone (replacements
-# get new names). A silent no-op delete would otherwise fake a PASS on this
-# negative control.
-deadline=$(( $(date +%s) + 60 ))
-while kubectl -n "$NS" get pod "$ss" >/dev/null 2>&1 || kubectl -n "$NS" get pod "$sk" >/dev/null 2>&1; do
-  (( $(date +%s) < deadline )) || die "killed standby pods still present after 60s — kill did not take effect"
-  sleep 2
-done
+# verify the kill took effect: kubectl wait --for=delete treats only real
+# deletion/NotFound as success, so a transient API error cannot fake
+# disappearance (it makes wait fail -> loud die), unlike a bare `get` poll.
+kubectl -n "$NS" wait --for=delete "pod/$ss" "pod/$sk" --timeout=60s >/dev/null 2>&1 \
+  || die "killed standby pods still present after 60s — kill did not take effect"
 log "kill verified: $ss and $sk are gone"
 
 sleep 5

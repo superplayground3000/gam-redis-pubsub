@@ -31,7 +31,8 @@ xadd_batch() {
   for (( i=1; i<=n; i++ )); do
     echo "XADD $STREAM * event_id ${ks}-${runid}-${i} op create type string kv_key lb:robust:${ks}:{run:${runid}:k${i}} ts ${ts} body v${i}"
   done > "$cmds"
-  kubectl -n "$NS" exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null
+  kubectl -n "$NS" exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null \
+    || { local rc=$?; rm -f "$cmds"; return "$rc"; }
   rm -f "$cmds"
 }
 

@@ -40,7 +40,9 @@ REPORT_DIR="${REPORT_DIR:-reports/failover}"
 # flags to every helm invocation (e.g. RRCS_SET="connect.image=repo/img:tag").
 # Empty (default) = behavior unchanged.
 EXTRA_SET=()
+set -f
 for kv in ${RRCS_SET:-}; do EXTRA_SET+=(--set "$kv"); done
+set +f
 
 CENTRAL="deploy/${PREFIX}redis-central"
 REGION="deploy/${PREFIX}redis-region"

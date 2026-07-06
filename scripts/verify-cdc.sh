@@ -12,7 +12,9 @@ VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
 # flags to every helm invocation (e.g. RRCS_SET="connect.image=repo/img:tag").
 # Empty (default) = behavior unchanged.
 EXTRA_SET=()
+set -f
 for kv in ${RRCS_SET:-}; do EXTRA_SET+=(--set "$kv"); done
+set +f
 EPOCH="run-$(date +%s)"
 
 echo "[boot] helm upgrade --install ${RELEASE} (profile=cdc) ns=${NS}"
