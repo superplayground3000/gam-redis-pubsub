@@ -44,6 +44,17 @@ func Run(args []string) {
 		log.Fatalf("op-mix invalid: each of OP_CREATE/UPDATE/DELETE/RENAME must be >= 0 and their sum > 0 (got %+v)", mix)
 	}
 
+	// Optional key-prefix split: when KEY_PREFIXES is set, every key is prefixed by
+	// prefixes[entityID % N] so downstream can shard by the first colon segment.
+	// Empty/unset keeps behavior byte-for-byte identical to before this feature.
+	prefixes, err := parseKeyPrefixes(os.Getenv("KEY_PREFIXES"))
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
+	if len(prefixes) > 0 {
+		log.Printf("KEY_PREFIXES active: %v", prefixes)
+	}
+
 	rdb := rediscfg.New(rediscfg.Options{Addr: addr, Cluster: cluster, PoolSize: workers * 2})
 	defer rdb.Close()
 
@@ -60,7 +71,7 @@ func Run(args []string) {
 		w := &Worker{
 			ID: i, RDB: rdb, StreamKey: streamKey, StreamMaxLen: int64(streamMaxLen),
 			PipelineDepth: pipelineDepth, PayloadBytes: payloadBytes, KeySpaceSize: int64(keySpaceSize),
-			Mix: mix, HashRatio: hashRatio, Lim: lim, Counters: counters, State: state,
+			Mix: mix, HashRatio: hashRatio, Prefixes: prefixes, Lim: lim, Counters: counters, State: state,
 		}
 		wg.Add(1)
 		go func() { defer wg.Done(); w.Run(ctx) }()

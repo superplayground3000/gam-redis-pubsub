@@ -1,0 +1,8 @@
+reports/
+pipelines/reverse-*.yaml
+pipelines/forward.yaml
+pipelines/reverse.tpl.yaml
+nats-auth/
+full-run.log
+reports-smoke.log
+*.log

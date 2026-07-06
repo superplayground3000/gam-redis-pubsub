@@ -1,0 +1,33 @@
+# toolbox — long-lived nats-box (nats CLI + curl + jq) for all in-cluster control:
+# consumer create/info, toxiproxy API, stream purge/info. Under load we drive
+# everything via `kubectl exec` into here (port-forward drops frames when the node
+# is busy — kind-mode.md). Mounts admin creds for privileged nats ops.
+# Rendered with envsubst: ${NS}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-toolbox
+  namespace: ${NS}
+  labels: { app: lab-toolbox, lab: prefix-split }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: lab-toolbox } }
+  template:
+    metadata: { labels: { app: lab-toolbox, lab: prefix-split } }
+    spec:
+      containers:
+        - name: box
+          image: natsio/nats-box:0.14.5
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+          env:
+            - { name: NATS_URL, value: "nats://lab-nats:4222" }
+            - { name: NATS_CREDS, value: "/etc/nats-creds/admin/user.creds" }
+          volumeMounts:
+            - { name: admin-creds, mountPath: /etc/nats-creds/admin, readOnly: true }
+          resources:
+            requests: { cpu: "50m", memory: "64Mi" }
+            limits: { cpu: "500m", memory: "256Mi" }
+      volumes:
+        - name: admin-creds
+          secret: { secretName: lab-admin-creds }

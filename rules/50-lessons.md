@@ -2,6 +2,49 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-07 — Redpanda Connect's JetStream pull does NOT fill the ack window
+- What happened: The `by-key-prefix-split-topic` lab was built on the design's assumption that a
+  bind-mode `nats_jetstream` pull consumer keeps up to `maxAckPending` messages in flight, so
+  throughput under delay ≈ `maxAckPending / RTT`. Measurement refuted it: `nats consumer info`
+  showed `Outstanding Acks: 1 out of maximum 1024`, and `maxAckPending` 1024 vs 8192 gave the
+  SAME rate (3 msg/s under 370 ms RTT). Connect keeps ~1 fetch in flight per consumer pod;
+  throughput under delay is **concurrency ÷ RTT**, not window ÷ RTT. Splitting to N groups scales
+  linearly because it adds N concurrent consumers, not because it multiplies a window.
+- Rule that would have prevented it: never model pull-consumer throughput from `maxAckPending`
+  without measuring `Outstanding Acks`; treat consumer-pod count (concurrency), not the ack
+  window, as the throughput lever under latency. Reaching rate R under one-way delay d needs
+  ~`R·(2d+t_proc)` concurrent pods.
+- Applied: recorded in `labs/by-key-prefix-split-topic/VALIDATION.md` (F1–F3) and the D3 spec
+  `docs/superpowers/specs/2026-07-06-multi-subject-connect-groups-chart-design.md` (§10 capacity
+  model is concurrency-based; the `maxAckPending`-as-throughput-knob formula was withdrawn).
+
+## 2026-07-07 — NATS user JWTs are scoped to the EXACT durable name; keys are gitignored
+- What happened: The lab's per-prefix durables (`cdc_sink_<prefix>`) were rejected with
+  "permissions violation" — the chart's baked subscriber creds
+  (`chart/files/nats-auth/subscriber.creds`, minted by `scripts/gen-nats-auth.sh:150-158`) grant
+  JS-API perms bound to the literal durable `cdc_sink` (`$JS.API.CONSUMER.INFO.KV_CDC.cdc_sink`,
+  `$JS.ACK.KV_CDC.cdc_sink.>`, …). The account signing key lives under a gitignored `keys/`, so a
+  new user cannot be minted under the existing account either.
+- Rule that would have prevented it: before renaming/adding a NATS durable, check the subscriber
+  JWT's allowed subjects — they hard-code the durable name. Multi-consumer work needs the grant
+  regenerated with wildcard consumer perms (`$JS.API.CONSUMER.*.KV_CDC.*`, `$JS.ACK.KV_CDC.>`).
+- Applied: `labs/by-key-prefix-split-topic/scripts/setup-nats-auth.sh` regenerates a
+  wildcard-subscriber auth set and injects it at the k8s-object level (ConfigMap + Secrets), so
+  `chart/` stays byte-for-byte untouched; the D3 spec makes the grosser grant a first-class
+  requirement for native multi-group support.
+
+## 2026-07-07 — Calling a function via $(...) drops its global assignments (subshell)
+- What happened: The lab entrypoint gated its harness check with
+  `v=$(run_scenario S0 …)`; `run_scenario` sets the global `HARNESS_OK=1` on success, but command
+  substitution runs the function in a SUBSHELL, so `HARNESS_OK` never propagated — the S0 gate
+  aborted with rc 3 every run regardless of the measured numbers. Cost several full ~30-min lab
+  runs and a long detour re-tuning rates/targets that were never the problem. The sibling
+  `run_scenario S1 … >/dev/null` calls (plain redirect, no `$(...)`) worked fine.
+- Rule that would have prevented it: a bash function that mutates globals must be called
+  directly (optionally `>/dev/null`), never via `$(...)`/pipe/`&` — those fork a subshell and
+  discard the mutation. When a "gate never flips" despite correct data, suspect a subshell first.
+- Applied: fixed to a plain-redirect call; recorded here (generic bash trap, no repo rule change).
+
 ## 2026-07-06 — Subagents "complete" without delivering their final report
 - What happened: During the robustness-lab build, every reviewer subagent (and one Codex proxy)
   went idle without its final message reaching the controller; each needed a follow-up

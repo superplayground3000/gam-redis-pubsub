@@ -56,6 +56,7 @@ type Worker struct {
 	KeySpaceSize  int64
 	Mix           OpMix
 	HashRatio     float64 // fraction of non-rename ops routed to the hash key family
+	Prefixes      []string // optional KEY_PREFIXES: prepend prefixes[id%N]+":" to every key (empty = unchanged)
 	Lim           *Limiter
 	Counters      *Counters
 	State         *RunState
@@ -100,7 +101,7 @@ func (w *Worker) buildEvent(seq uint64) Event {
 	// string concept; hashes never rename here.
 	if op != "rename" && w.HashRatio > 0 && w.rng.Float64() < w.HashRatio {
 		id := w.rng.Int63n(w.KeySpaceSize)
-		key := w.hashKey(id)
+		key := applyKeyPrefix(w.Prefixes, id, w.hashKey(id))
 		switch op {
 		case "delete":
 			e := NewDeleteEvent(key) // DEL is type-agnostic; tag as hash so envelope metadata is honest
@@ -114,15 +115,17 @@ func (w *Worker) buildEvent(seq uint64) Event {
 	}
 	p := Patterns[w.rng.Intn(len(Patterns))]
 	id := w.rng.Int63n(w.KeySpaceSize)
+	standby := applyKeyPrefix(w.Prefixes, id, p.StandbyKey(id))
+	active := applyKeyPrefix(w.Prefixes, id, p.ActiveKey(id))
 	switch op {
 	case "create":
-		return NewCreateEvent(p.StandbyKey(id), w.PayloadBytes)
+		return NewCreateEvent(standby, w.PayloadBytes)
 	case "update":
-		return NewUpdateEvent(p.StandbyKey(id), w.PayloadBytes)
+		return NewUpdateEvent(standby, w.PayloadBytes)
 	case "delete":
-		return NewDeleteEvent(p.ActiveKey(id))
-	default: // rename: promote standby->active for the same entity (same slot)
-		return NewRenameEvent(p.StandbyKey(id), p.ActiveKey(id))
+		return NewDeleteEvent(active)
+	default: // rename: promote standby->active for the same entity (same slot, same prefix)
+		return NewRenameEvent(standby, active)
 	}
 }
 

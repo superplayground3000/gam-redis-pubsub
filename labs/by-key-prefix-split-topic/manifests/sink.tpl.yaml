@@ -1,0 +1,56 @@
+# sink leg (per-prefix) — Connect pod(s) in config-file mode running the lab reverse
+# pipeline for ONE prefix (pipelines/reverse-<prefix>.yaml, generated). Binds the
+# pre-created durable pull consumer cdc_sink_<prefix> (FilterSubject kv.cdc.<prefix>.>)
+# and reaches NATS THROUGH toxiproxy (the delayed leg). pod-group × topic = 1:1
+# (DESIGN R3). SINK_REPLICAS>1 exercises multiple pods sharing one pull consumer.
+# Rendered with envsubst: ${NS} ${CONNECT_IMAGE} ${PREFIX} ${SINK_REPLICAS}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-sink-${PREFIX}
+  namespace: ${NS}
+  labels: { app: lab-sink, prefix: "${PREFIX}", lab: prefix-split }
+spec:
+  replicas: ${SINK_REPLICAS}
+  selector: { matchLabels: { app: lab-sink, prefix: "${PREFIX}" } }
+  template:
+    metadata:
+      labels: { app: lab-sink, prefix: "${PREFIX}", lab: prefix-split }
+      annotations: { lab/config-sha: "${CONFIG_SHA}" }
+    spec:
+      containers:
+        - name: connect
+          image: ${CONNECT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["run", "/etc/connect/reverse.yaml"]
+          ports:
+            - { containerPort: 4195, name: http }
+          readinessProbe:
+            httpGet: { path: /ready, port: 4195 }
+            periodSeconds: 3
+            failureThreshold: 10
+          livenessProbe:
+            httpGet: { path: /ping, port: 4195 }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/connect, readOnly: true }
+            - { name: sub-creds, mountPath: /etc/nats-creds/subscriber, readOnly: true }
+          resources:
+            requests: { cpu: "1", memory: "512Mi" }
+            limits: { cpu: "2", memory: "1536Mi" }
+      volumes:
+        - name: config
+          configMap: { name: lab-sink-${PREFIX}-config }
+        - name: sub-creds
+          secret: { secretName: lab-subscriber-creds }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-sink-${PREFIX}
+  namespace: ${NS}
+  labels: { app: lab-sink, prefix: "${PREFIX}", lab: prefix-split }
+spec:
+  selector: { app: lab-sink, prefix: "${PREFIX}" }
+  ports:
+    - { name: http, port: 4195, targetPort: 4195 }

@@ -1,0 +1,62 @@
+# writer — the repo's Go writer (app writer) driving constant load. Mirrors the
+# chart writer env but (a) drops the initContainer gate on connect-source (DESIGN
+# F12 — the lab source is a separate Deployment) and (b) sets KEY_PREFIXES so every
+# entity's keys are prefixed by prefixes[id % N] (the repo Go change under test).
+# STREAM_MAXLEN raised to 500000 so app.events won't drop at 8-10k msg/s (DESIGN R5).
+# INITIAL_RATE=0: the harness sets the rate per scenario via POST /rate.
+# Rendered with envsubst: ${NS} ${APP_IMAGE} ${PREFIXES} ${WORKERS} ${KEY_SPACE_SIZE} ${MAX_RATE} ${PAYLOAD_BYTES}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-writer
+  namespace: ${NS}
+  labels: { app: lab-writer, lab: prefix-split }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: lab-writer } }
+  template:
+    metadata: { labels: { app: lab-writer, lab: prefix-split } }
+    spec:
+      containers:
+        - name: writer
+          image: ${APP_IMAGE}
+          imagePullPolicy: Never
+          command: ["app", "writer"]
+          env:
+            - { name: REDIS_ADDR, value: "lab-redis-central:6379" }
+            - { name: REDIS_CLUSTER, value: "false" }
+            - { name: STREAM_KEY, value: "app.events" }
+            - { name: STREAM_MAXLEN, value: "500000" }
+            - { name: INITIAL_RATE, value: "0" }
+            - { name: MAX_RATE, value: "${MAX_RATE}" }
+            - { name: WORKERS, value: "${WORKERS}" }
+            - { name: PIPELINE_DEPTH, value: "50" }
+            - { name: KEY_SPACE_SIZE, value: "${KEY_SPACE_SIZE}" }
+            - { name: PAYLOAD_BYTES, value: "${PAYLOAD_BYTES}" }
+            - { name: HASH_RATIO, value: "0.2" }
+            - { name: OP_CREATE, value: "40" }
+            - { name: OP_UPDATE, value: "40" }
+            - { name: OP_DELETE, value: "10" }
+            - { name: OP_RENAME, value: "10" }
+            - { name: HEALTH_ADDR, value: ":8081" }
+            # the feature under test — comma-separated prefixes for this scenario
+            - { name: KEY_PREFIXES, value: "${PREFIXES}" }
+          ports:
+            - { containerPort: 8081, name: http }
+          readinessProbe:
+            httpGet: { path: /healthz, port: 8081 }
+            periodSeconds: 3
+          resources:
+            requests: { cpu: "1", memory: "256Mi" }
+            limits: { cpu: "4", memory: "1Gi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-writer
+  namespace: ${NS}
+  labels: { app: lab-writer, lab: prefix-split }
+spec:
+  selector: { app: lab-writer }
+  ports:
+    - { name: http, port: 8081, targetPort: 8081 }

@@ -1,0 +1,56 @@
+# toxiproxy — TCP latency injector between the sink legs and NATS (DESIGN D1/D2).
+# Admin API on :8474; one proxy listener per prefix on :4223.. (created at runtime
+# via the API, see scripts). Sinks point their NATS URL at lab-toxiproxy:<listener>.
+# Latency toxics (185±15ms upstream+downstream) are added/removed per scenario
+# WITHOUT restarting sinks. Runs 0ms-toxic in S0 to prove the proxy itself is not
+# the bottleneck (DESIGN R1). Rendered with envsubst: ${NS}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-toxiproxy
+  namespace: ${NS}
+  labels: { app: lab-toxiproxy, lab: prefix-split }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: lab-toxiproxy } }
+  template:
+    metadata: { labels: { app: lab-toxiproxy, lab: prefix-split } }
+    spec:
+      containers:
+        - name: toxiproxy
+          image: ghcr.io/shopify/toxiproxy:2.9.0
+          imagePullPolicy: IfNotPresent
+          # -host 0.0.0.0 exposes the admin API cluster-wide; proxy listeners bind
+          # 0.0.0.0 automatically when created.
+          args: ["-host", "0.0.0.0"]
+          ports:
+            - { containerPort: 8474, name: admin }
+            - { containerPort: 4223, name: nats-p0 }
+            - { containerPort: 4224, name: nats-p1 }
+            - { containerPort: 4225, name: nats-p2 }
+            - { containerPort: 4226, name: nats-p3 }
+          readinessProbe:
+            httpGet: { path: /version, port: 8474 }
+            periodSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet: { path: /version, port: 8474 }
+            periodSeconds: 10
+          resources:
+            requests: { cpu: "250m", memory: "128Mi" }
+            limits: { cpu: "2", memory: "512Mi" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-toxiproxy
+  namespace: ${NS}
+  labels: { app: lab-toxiproxy, lab: prefix-split }
+spec:
+  selector: { app: lab-toxiproxy }
+  ports:
+    - { name: admin, port: 8474, targetPort: 8474 }
+    - { name: nats-p0, port: 4223, targetPort: 4223 }
+    - { name: nats-p1, port: 4224, targetPort: 4224 }
+    - { name: nats-p2, port: 4225, targetPort: 4225 }
+    - { name: nats-p3, port: 4226, targetPort: 4226 }

@@ -1,0 +1,56 @@
+# source leg — single Connect pod in config-file mode running the lab forward
+# pipeline (pipelines/forward.yaml, generated). Reads central app.events, publishes
+# kv.cdc.<prefix>.<op> to NATS (DIRECT to lab-nats — the source is NOT delayed; only
+# the sink pull/ack path is, per DESIGN §4.1). No elector: effectiveness experiment,
+# not HA. Config is mounted from a ConfigMap the harness builds from forward.yaml.
+# Rendered with envsubst: ${NS} ${CONNECT_IMAGE}.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: lab-source
+  namespace: ${NS}
+  labels: { app: lab-source, lab: prefix-split }
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: lab-source } }
+  template:
+    metadata:
+      labels: { app: lab-source, lab: prefix-split }
+      annotations: { lab/config-sha: "${CONFIG_SHA}" }
+    spec:
+      containers:
+        - name: connect
+          image: ${CONNECT_IMAGE}
+          imagePullPolicy: IfNotPresent
+          args: ["run", "/etc/connect/forward.yaml"]
+          ports:
+            - { containerPort: 4195, name: http }
+          readinessProbe:
+            httpGet: { path: /ready, port: 4195 }
+            periodSeconds: 3
+            failureThreshold: 5
+          livenessProbe:
+            httpGet: { path: /ping, port: 4195 }
+            periodSeconds: 10
+          volumeMounts:
+            - { name: config, mountPath: /etc/connect, readOnly: true }
+            - { name: pub-creds, mountPath: /etc/nats-creds/publisher, readOnly: true }
+          resources:
+            requests: { cpu: "2", memory: "512Mi" }
+            limits: { cpu: "8", memory: "2Gi" }
+      volumes:
+        - name: config
+          configMap: { name: lab-source-config }
+        - name: pub-creds
+          secret: { secretName: lab-publisher-creds }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: lab-source
+  namespace: ${NS}
+  labels: { app: lab-source, lab: prefix-split }
+spec:
+  selector: { app: lab-source }
+  ports:
+    - { name: http, port: 4195, targetPort: 4195 }
