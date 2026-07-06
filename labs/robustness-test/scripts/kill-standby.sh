@@ -27,6 +27,16 @@ XPID=$!
 kubectl -n "$NS" delete pod "$ss" "$sk" --grace-period=0 --force >/dev/null 2>&1 || true
 wait "$XPID"
 
+# verify the kill took effect: both standby pod names must be gone (replacements
+# get new names). A silent no-op delete would otherwise fake a PASS on this
+# negative control.
+deadline=$(( $(date +%s) + 60 ))
+while kubectl -n "$NS" get pod "$ss" >/dev/null 2>&1 || kubectl -n "$NS" get pod "$sk" >/dev/null 2>&1; do
+  (( $(date +%s) < deadline )) || die "killed standby pods still present after 60s — kill did not take effect"
+  sleep 2
+done
+log "kill verified: $ss and $sk are gone"
+
 sleep 5
 [[ "$(holder "$SRC_LEASE")" == "$hs" ]] || die "source leadership moved after standby kill (was $hs, now $(holder "$SRC_LEASE"))"
 [[ "$(holder "$SINK_LEASE")" == "$hk" ]] || die "sink leadership moved after standby kill (was $hk, now $(holder "$SINK_LEASE"))"
