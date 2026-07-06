@@ -35,6 +35,10 @@ spec:
               value: {{ .Values.latencyCalculator.intervalSec | quote }}
             - name: REPORT_PATH
               value: {{ .Values.latencyCalculator.reportPath | quote }}
+            - name: METRICS_ADDR
+              value: ":8082"
+          ports:
+            - containerPort: 8082
           volumeMounts:
             - name: reports
               mountPath: /reports
@@ -48,6 +52,22 @@ spec:
           {{- else }}
           emptyDir: {}
           {{- end }}
+---
+# Exposes the scrapeable latency percentiles (cdc_latency_seconds); selected by
+# the observability ServiceMonitor via the app label + `http` port name.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator") }}
+  labels:
+    app: latency-calculator
+spec:
+  selector:
+    app: latency-calculator
+  ports:
+    - name: http
+      port: 8082
+      targetPort: 8082
 {{- if .Values.latencyCalculator.persistence.enabled }}
 ---
 apiVersion: v1

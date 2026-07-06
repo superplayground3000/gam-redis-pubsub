@@ -15,6 +15,13 @@ helm upgrade --install "${RELEASE}" ./chart -n "${NS}" --create-namespace \
   --set profile=cdc -f "${VALUES_FILE}" --wait --timeout 5m
 RESOURCE_PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.resourcePrefix // "lab-"')"
 
+# The connect legs roll whenever a pipeline ConfigMap changes (checksum/connect-config
+# annotation), and helm --wait can return before the new ReplicaSet is observed.
+# Wait for both rollouts so the verifier doesn't race the leader election.
+for d in connect-source connect-sink; do
+  kubectl -n "${NS}" rollout status "deploy/${RESOURCE_PREFIX}${d}" --timeout=180s
+done
+
 JOB="verifier-${EPOCH}"
 echo "[verify] launching verifier Job ${JOB}"
 helm template "${RELEASE}" ./chart -n "${NS}" -s templates/verifier-job.yaml \

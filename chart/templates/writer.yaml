@@ -1,3 +1,4 @@
+{{- if .Values.writer.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -101,3 +102,4 @@ spec:
     - name: http
       port: 8081
       targetPort: 8081
+{{- end }}

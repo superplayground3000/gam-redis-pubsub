@@ -1,0 +1,21 @@
+# Minimal CI enforcing INV-4's fast tiers on every push/PR: L0 (go test) +
+# L1 (helm lint/template + toggle renders) via the same entrypoint used
+# locally. L2/L3 need docker/kind and stay manual for now (see
+# rules/05-invariants.md ladder); L3-nightly is the natural next step.
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: azure/setup-helm@v4
+      - name: L0 + L1 via single entrypoint
+        run: SKIP_L2=1 SKIP_L3=1 scripts/run-all-tests.sh

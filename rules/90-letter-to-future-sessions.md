@@ -40,25 +40,37 @@ Written 2026-07-05 by the governance session that created `rules/` and `CLAUDE.m
 
 ## 4. Incomplete work as of 2026-07-05 (priority order)
 
-1. `scripts/run-all-tests.sh` / Makefile (see §1.1).
-2. L2 docker-compose lab (spec exists; see §1.3).
-3. Missing chart toggles: `connect.source.enabled`, `connect.sink.enabled`, `writer.enabled`,
-   `dashboard.enabled`, `rbac.enabled` (INV-3 gap list).
-4. Grafana latency/histogram panels + a forward-leg publish-failure metric (INV-2 gap list).
-5. CI workflow (see §1.2).
-6. Writer/elector metrics scraping (ServiceMonitor covers only connect legs).
-7. **After items 1–6 empty every "Known gaps" list in `rules/05-invariants.md`:** restore the
-   strict gate version — relabel the "Target state" sections as binding and remove the ratchet
-   carve-outs. The owner pre-approved this reversion on 2026-07-05 (recorded in the 05 header);
-   cite that line when making the edit, no fresh approval needed.
+**Status update (2026-07-05, gap-closure session): items 1–7 are DONE.**
+
+1. ~~`scripts/run-all-tests.sh` / Makefile~~ — done (`scripts/run-all-tests.sh`, ladder
+   L0→L4 with SKIP_L2/SKIP_L3/RUN_FAILOVER knobs).
+2. ~~L2 docker-compose lab~~ — done (`labs/redis-cdc-error-alerting/`, `verify-alert.sh`
+   proof passed: healthy-clean / poison-fires-both-reasons+webhook / recovery-clears).
+3. ~~Missing chart toggles~~ — done (`connect.source.enabled`, `connect.sink.enabled`,
+   `writer.enabled`, `dashboard.enabled`, `rbac.enabled`; pipeline ConfigMaps guarded too).
+4. ~~Latency/histogram panels + forward-leg publish-failure metric~~ — done
+   (`cdc_forward_publish_failed` via output fallback-reject; p50/p95/p99 panels; note the
+   `_ns`-named histograms record **seconds** in the pinned build).
+5. ~~CI workflow~~ — done (`.github/workflows/ci.yaml`, L0+L1 per push/PR via the same
+   entrypoint). L3 nightly remains a worthwhile strengthening (needs a kind-capable runner).
+6. ~~Writer/elector metrics scraping~~ — done (ServiceMonitor selects writer +
+   latency-calculator, `elector` endpoint scrapes the sidecars; panels added; latency
+   percentiles also exposed as `cdc_latency_seconds`).
+7. ~~Strict-gate reversion~~ — **executed 2026-07-05** under the owner pre-approval that was
+   recorded in the 05 header (commit 59dcf6d) and in this item; `rules/05-invariants.md` is
+   binding-only again, with the ratchet history preserved in its header note.
+
+Remaining follow-up ideas (not gaps): L3 nightly CI; pruning old `__POD__`-era consumer
+names from the central stream's group after failover experiments (stale PEL entries block
+the verifier's quiescence check — see `rules/50-lessons.md` 2026-07-05).
 
 ## 5. Honest limitations of this harness and rule set
 
 - Model effort controls are not exposed here; only model selection. Rules referencing "effort"
   would be fiction — none do.
-- Nothing runs automatically: every guarantee in `rules/05-invariants.md` is enforced only by
-  agents actually following the rules. Until CI exists, a non-compliant session can break INV-1
-  and nothing will catch it before the next test run.
+- Only L0+L1 run automatically (CI, since 2026-07-05): the docker/kind tiers (L2-L4) are still
+  enforced solely by agents following the rules. A non-compliant session can break INV-1 and
+  nothing will catch it before the next manual L3/L4 run.
 - The at-least-once guarantee is conditional by design: it assumes Redis Stream and NATS
   JetStream storage are intact, and cross-key reordering (delete-vs-rename) is an accepted
   non-guarantee of the fence-free design — do not let a future session "fix" it into a fence

@@ -1,3 +1,4 @@
+{{- if .Values.connect.sink.enabled }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -13,6 +14,11 @@ spec:
     metadata:
       labels:
         {{- include "rrcs.podLabels" (dict "root" $ "app" "connect-sink") | nindent 8 }}
+      annotations:
+        # Roll the pods when any connect ConfigMap changes: the elector POSTs
+        # the pipeline only when it wins the Lease, so without a rollout a
+        # helm upgrade that edits the pipeline never reaches the running leg.
+        checksum/connect-config: {{ include (print $.Template.BasePath "/connect-configmaps.yaml") . | sha256sum }}
     spec:
       serviceAccountName: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink-elector") }}
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
@@ -150,3 +156,9 @@ spec:
     - name: http
       port: 4195
       targetPort: 4195
+    # Elector sidecar metrics (elector_leading / elector_post_total …); scraped
+    # by the observability ServiceMonitor's `elector` endpoint.
+    - name: elector
+      port: 8090
+      targetPort: 8090
+{{- end }}
