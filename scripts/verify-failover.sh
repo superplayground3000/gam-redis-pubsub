@@ -36,6 +36,11 @@ FAILOVER_TIMEOUT_S="${FAILOVER_TIMEOUT_S:-120}"
 DRAIN_TIMEOUT_S="${DRAIN_TIMEOUT_S:-240}"   # fixed run: max wait for the reused-consumer PEL to drain to 0
 SINK_TIMEOUT_S="${SINK_TIMEOUT_S:-300}"     # max wait for the sink to catch up (adaptive: until region stops growing)
 REPORT_DIR="${REPORT_DIR:-reports/failover}"
+# RRCS_SET: optional space-separated key=value pairs appended as extra --set
+# flags to every helm invocation (e.g. RRCS_SET="connect.image=repo/img:tag").
+# Empty (default) = behavior unchanged.
+EXTRA_SET=()
+for kv in ${RRCS_SET:-}; do EXTRA_SET+=(--set "$kv"); done
 
 CENTRAL="deploy/${PREFIX}redis-central"
 REGION="deploy/${PREFIX}redis-region"
@@ -72,7 +77,7 @@ run_one() {
     --set profile=cdc -f "$VALUES_FILE" \
     --set "connect.source.consumerClientId=${client_val}" \
     --set "connect.source.maxInFlight=${MAX_IN_FLIGHT}" \
-    --set "connect.source.readLimit=${READ_LIMIT}" --wait --timeout 5m
+    --set "connect.source.readLimit=${READ_LIMIT}" "${EXTRA_SET[@]}" --wait --timeout 5m
   kubectl -n "$NS" rollout restart "$SRC_DEPLOY"
   kubectl -n "$NS" rollout status "$SRC_DEPLOY" --timeout=180s
   local deadline=$(( $(date +%s) + FAILOVER_TIMEOUT_S ))

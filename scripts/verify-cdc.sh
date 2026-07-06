@@ -8,11 +8,16 @@ cd "${SCRIPT_DIR}/.."
 NS="${RRCS_NS:-cdc-k8s}"
 RELEASE="${RRCS_RELEASE:-cdc}"
 VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
+# RRCS_SET: optional space-separated key=value pairs appended as extra --set
+# flags to every helm invocation (e.g. RRCS_SET="connect.image=repo/img:tag").
+# Empty (default) = behavior unchanged.
+EXTRA_SET=()
+for kv in ${RRCS_SET:-}; do EXTRA_SET+=(--set "$kv"); done
 EPOCH="run-$(date +%s)"
 
 echo "[boot] helm upgrade --install ${RELEASE} (profile=cdc) ns=${NS}"
 helm upgrade --install "${RELEASE}" ./chart -n "${NS}" --create-namespace \
-  --set profile=cdc -f "${VALUES_FILE}" --wait --timeout 5m
+  --set profile=cdc -f "${VALUES_FILE}" "${EXTRA_SET[@]}" --wait --timeout 5m
 RESOURCE_PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.resourcePrefix // "lab-"')"
 
 # The connect legs roll whenever a pipeline ConfigMap changes (checksum/connect-config
@@ -25,7 +30,7 @@ done
 JOB="verifier-${EPOCH}"
 echo "[verify] launching verifier Job ${JOB}"
 helm template "${RELEASE}" ./chart -n "${NS}" -s templates/verifier-job.yaml \
-  -f "${VALUES_FILE}" --set profile=cdc \
+  -f "${VALUES_FILE}" --set profile=cdc "${EXTRA_SET[@]}" \
   --set verifier.run=true --set "verifier.jobName=${JOB}" --set "verifier.epoch=${EPOCH}" \
   | kubectl apply -n "${NS}" -f -
 
