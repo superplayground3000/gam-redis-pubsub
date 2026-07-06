@@ -15,7 +15,8 @@ Redis & NATS healthy), and unprocessable-message counting in metrics.
 
     labs/robustness-test/scripts/verify-robustness.sh
 
-Phases (~35 min total):
+Phases (~6-40 min total, depending on inconclusive-retry count and hardware;
+measured 5m57s on a warm kind cluster):
 0. Load images into kind; deploy with `connect.image=$CONNECT_IMAGE`; e2e
    correctness via `scripts/verify-cdc.sh` (verifier verdict.pass).
 1. A/B failover canary via `scripts/verify-failover.sh`: baseline (pod-scoped
