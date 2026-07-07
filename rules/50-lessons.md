@@ -2,6 +2,25 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
+- What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
+  lab-connect-sink-a" / "two-seg render missing name: cdc_forward_others" — but chart-identical
+  adjacent commits passed (9270ca3 PASS 03:01 vs ace230f FAIL 03:00), and three failures landed
+  on three different grep items. Root cause: `scripts/run-all-tests.sh` sets `set -o pipefail`;
+  `grep -q` exits at the first match, and once the multi-group renders grew past the 64 KB pipe
+  buffer (~105 KB, match near line 1000), helm's remaining write takes SIGPIPE → exit 141 →
+  pipefail reports the pipeline failed on a GOOD render. Proven locally: `helm template … |
+  dd bs=1024 count=1` → PIPESTATUS `141 0` on both helm 3.21 and 4.2.2. The negated checks
+  (`if helm … | grep -q; then fail`) had the worse polarity: the same race silently PASSES a
+  broken render.
+- Rule that would have prevented it: in any pipefail script, never pipe a producer into
+  `grep -q` (or any early-exit reader) when the producer's output can exceed the pipe buffer —
+  capture once (`OUT=$(cmd)`) and grep the variable, or drop `-q` so grep drains its input.
+  A CI-only "missing X" that passes locally and moves between items is a SIGPIPE flake, not a
+  render bug.
+- Applied: `scripts/run-all-tests.sh` L1 now captures every render once and greps herestrings;
+  header comment in the L1 block warns against reintroducing live pipes.
+
 ## 2026-07-07 — Redpanda Connect's JetStream pull does NOT fill the ack window
 - What happened: The `by-key-prefix-split-topic` lab was built on the design's assumption that a
   bind-mode `nats_jetstream` pull consumer keeps up to `maxAckPending` messages in flight, so

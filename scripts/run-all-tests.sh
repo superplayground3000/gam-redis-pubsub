@@ -33,8 +33,13 @@ go test ./... || fail L0
 pass L0
 
 echo "[run-all-tests] == L1: helm lint + template + toggle renders =="
+# Every render below is captured once and grepped as a variable. Never pipe a
+# live `helm template` into `grep -q` here: under pipefail, grep -q exits at
+# the first match, helm takes SIGPIPE (exit 141) once the render outgrows the
+# pipe buffer, and the check flakes FAIL on a good render — or, negated,
+# silently masks a real failure (bit CI on 2026-07-07, rules/50-lessons.md).
 helm lint chart/ || fail L1
-helm template chart/ >/dev/null || fail L1
+DEFAULT_OUT=$(helm template chart/) || fail L1
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
@@ -43,11 +48,13 @@ for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
          rbac.enabled:lab-connect-source-elector \
          latencyCalculator.enabled:lab-latency-calculator; do
   key="${t%%:*}"; res="${t#*:}"
-  if helm template chart/ --set "$key=false" | grep -q "name: $res"; then
+  OFF_OUT=$(helm template chart/ --set "$key=false") || fail L1
+  if grep -q "name: $res" <<<"$OFF_OUT"; then
     echo "[run-all-tests] toggle $key=false still renders $res"
     fail L1
   fi
-  if ! helm template chart/ --set "$key=true" | grep -q "name: $res"; then
+  ON_OUT=$(helm template chart/ --set "$key=true") || fail L1
+  if ! grep -q "name: $res" <<<"$ON_OUT"; then
     echo "[run-all-tests] $key=true does not render $res"
     fail L1
   fi
@@ -58,35 +65,36 @@ done
 MG=(--set connect.sinkGroups[0].name=a --set connect.sinkGroups[0].prefixes[0]=prefix-a
     --set connect.sinkGroups[1].name=b --set connect.sinkGroups[1].prefixes[0]=prefix-b
     --set connect.sinkGroups[2].name=others --set connect.sinkGroups[2].catchAll=true)
-helm template chart/ "${MG[@]}" >/dev/null || fail L1
+MG_OUT=$(helm template chart/ "${MG[@]}") || fail L1
 # Each enabled group renders its own sink Deployment, elector, and pipeline CM.
 for res in lab-connect-sink-others lab-connect-sink-a lab-connect-sink-b \
            lab-connect-sink-a-pipeline lab-connect-sink-b-pipeline \
            lab-connect-sink-a-elector lab-connect-sink-b-elector; do
-  helm template chart/ "${MG[@]}" | grep -q "name: $res" \
+  grep -q "name: $res" <<<"$MG_OUT" \
     || { echo "[run-all-tests] multi-group render missing $res"; fail L1; }
 done
 # Prefix routing turns on the kv_prefix publish subject AND the unrouted counter.
 # (kv_prefix appears only under prefix routing — in the publish subject + mapping.)
-helm template chart/ "${MG[@]}" | grep 'subject:' | grep -q kv_prefix \
+grep 'subject:' <<<"$MG_OUT" | grep kv_prefix >/dev/null \
   || { echo "[run-all-tests] prefix-routed publish subject missing"; fail L1; }
-helm template chart/ "${MG[@]}" | grep -q 'cdc_forward_unrouted' \
+grep -q 'cdc_forward_unrouted' <<<"$MG_OUT" \
   || { echo "[run-all-tests] cdc_forward_unrouted counter missing under prefix routing"; fail L1; }
 # Default (no groups) must NOT emit the prefix subject or the unrouted counter.
-if helm template chart/ | grep -q kv_prefix; then
+if grep -q kv_prefix <<<"$DEFAULT_OUT"; then
   echo "[run-all-tests] default render leaked prefix routing"; fail L1
 fi
-if helm template chart/ | grep -q cdc_forward_unrouted; then
+if grep -q cdc_forward_unrouted <<<"$DEFAULT_OUT"; then
   echo "[run-all-tests] default render leaked cdc_forward_unrouted"; fail L1
 fi
 # INV-3 per-group toggle: disabling group b drops ITS objects, keeps group a,
 # and drops cdc_sink_b from the nats-init durable set.
-if helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -q 'name: lab-connect-sink-b$'; then
+MGOFF_OUT=$(helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false) || fail L1
+if grep -q 'name: lab-connect-sink-b$' <<<"$MGOFF_OUT"; then
   echo "[run-all-tests] sinkGroups[b].enabled=false still renders connect-sink-b"; fail L1
 fi
-helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -q 'name: lab-connect-sink-a$' \
+grep -q 'name: lab-connect-sink-a$' <<<"$MGOFF_OUT" \
   || { echo "[run-all-tests] disabling group b wrongly dropped group a"; fail L1; }
-if helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -oE "SINK_GROUPS='[^']*'" | grep -q cdc_sink_b; then
+if grep -oE "SINK_GROUPS='[^']*'" <<<"$MGOFF_OUT" | grep cdc_sink_b >/dev/null; then
   echo "[run-all-tests] disabled group b still provisions durable cdc_sink_b"; fail L1
 fi
 # Fail-loud validation (§7): illegal prefix, illegal name, and unimplemented mode
@@ -110,22 +118,23 @@ fi
 TSG=(--set connect.sinkGroups[0].name=caveat --set 'connect.sinkGroups[0].prefixes[0]=tg:caveat'
      --set connect.sinkGroups[1].name=g2m    --set 'connect.sinkGroups[1].prefixes[0]=tg:g2m'
      --set connect.sinkGroups[2].name=others --set connect.sinkGroups[2].catchAll=true)
-helm template chart/ "${TSG[@]}" >/dev/null || fail L1
+TSG_OUT=$(helm template chart/ "${TSG[@]}") || fail L1
 for want in 'kv.cdc.tg.caveat.>' 'kv.cdc.tg.g2m.>' 'kv.cdc.others.>' \
             '"tg:caveat":"tg.caveat"' 'name: lab-connect-sink-others' 'name: cdc_forward_others'; do
-  helm template chart/ "${TSG[@]}" | grep -qF "$want" \
+  grep -qF "$want" <<<"$TSG_OUT" \
     || { echo "[run-all-tests] two-seg render missing $want"; fail L1; }
 done
-helm template chart/ "${TSG[@]}" | grep -oE "SINK_GROUPS='[^']*'" | grep -q 'cdc_sink_others' \
+grep -oE "SINK_GROUPS='[^']*'" <<<"$TSG_OUT" | grep 'cdc_sink_others' >/dev/null \
   || { echo "[run-all-tests] others durable missing from nats-init"; fail L1; }
 # default render must stay clean of ALL two-seg machinery
-if helm template chart/ | grep -qE 'cdc_forward_others|let routes'; then
+if grep -qE 'cdc_forward_others|let routes' <<<"$DEFAULT_OUT"; then
   echo "[run-all-tests] default render leaked two-seg routing"; fail L1
 fi
 # no-catchAll render: a set-miss must count as unrouted, not others (match the
 # metric block, not the explanatory comment that also names the counter)
 MG2=(--set connect.sinkGroups[0].name=caveat --set 'connect.sinkGroups[0].prefixes[0]=tg:caveat')
-if helm template chart/ "${MG2[@]}" | grep -q 'name: cdc_forward_others'; then
+MG2_OUT=$(helm template chart/ "${MG2[@]}") || fail L1
+if grep -q 'name: cdc_forward_others' <<<"$MG2_OUT"; then
   echo "[run-all-tests] cdc_forward_others rendered WITHOUT a catchAll group"; fail L1
 fi
 # fail-loud grammar/structure set (§ two-seg): each render must exit nonzero
