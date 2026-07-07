@@ -23,7 +23,7 @@
 # apply out of order — accepted by this lab's no-LWW, order-insensitive design
 # (SET/DEL/rename-Lua are idempotent). Set threads: 1 for strict per-key ordering.
 input:
-  label: jetstream_source
+  label: __POD__
   nats_jetstream:
     urls:
       - "{{ include "rrcs.nats.url" . }}"
