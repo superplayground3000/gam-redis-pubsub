@@ -80,33 +80,58 @@ pipeline:
         meta op       = meta("op").or("update")     # used for the subject interpolation
         meta event_id = $eid                          # used for the Nats-Msg-Id header
         {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
-        # Prefix routing (design D3 §3.1a): derive the key-prefix segment so the
-        # publish subject becomes <subjectPrefix>.<kv_prefix>.<op> and per-group
-        # durables can filter kv.cdc.<prefix>.>. The segment is the part before the
-        # first ':' of the key; rename/delete may carry an empty kv_key, so fall
-        # back to new_key, then to "unknown" (a subject NO group filters, so the
-        # message parks in the stream instead of vanishing — surfaced by the
-        # cdc_forward_unrouted counter added with the per-group dashboard work).
-        let raw_key    = meta("kv_key").or(meta("new_key")).or("")
-        let seg        = $raw_key.split(":").index(0)
-        meta kv_prefix = if $seg == null || $seg == "" { "unknown" } else { $seg }
+        # Prefix routing (first-two-segment, set-based): match the key's first
+        # TWO ':'-segments, then its first ONE, against the configured prefix
+        # set (rrcs.connect.routeMap: raw prefix -> subject token, ':' -> '.').
+        # A hit publishes to <subjectPrefix>.<token>.<op>, which exactly one
+        # group's durable filters (<subjectPrefix>.<token>.>). NO hit => token
+        # "others" (<subjectPrefix>.others.<op>): consumed by the catchAll group
+        # when one is deployed, otherwise it parks in the stream — either way
+        # counted by the switch below via kv_prefix_reason. rename/delete may
+        # omit kv_key, so fall back to new_key (.or() fires on ABSENT metadata);
+        # a key with no derivable first segment is "empty_prefix" (malformed).
+        # kv_prefix_reason is internal: the NATS output sends only explicit
+        # headers, so neither meta leaves this process.
+        let raw_key = meta("kv_key").or(meta("new_key")).or("")
+        let segs    = $raw_key.split(":")
+        let p1      = $segs.index(0)
+        let p2      = $segs.slice(0, 2).join(":")
+        let routes  = {{ include "rrcs.connect.routeMap" . }}
+        let hit     = $routes.get($p2).or($routes.get($p1))
+        meta kv_prefix        = $hit.or("others")
+        meta kv_prefix_reason = if $p1 == "" { "empty_prefix" } else if $hit == null { "no_match" } else { "matched" }
         {{- end }}
     {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
-    # cdc_forward_unrouted (INV-2 / design §3.1): fires when no key-prefix could be
-    # derived (empty/rename-without-key), so the event publishes to
-    # kv.cdc.unknown.<op> — a subject NO sink group filters. The message parks in
-    # the stream instead of vanishing; this counter makes the routing miss LOUD
-    # (dashboard panel + CDCForwardUnrouted alert). The `switch` passes every other
-    # message through untouched. Gated on prefix routing so the default
-    # (non-prefix) render is byte-identical.
+    # Routing-miss visibility (INV-2). empty_prefix (no derivable key segment —
+    # malformed event) is ALWAYS cdc_forward_unrouted. A set-miss (no_match) is
+    # cdc_forward_others when a catchAll group consumes kv.cdc.others.> (routed,
+    # legitimate traffic), but cdc_forward_unrouted when NO catchAll exists (the
+    # event parks unconsumed => the CDCForwardUnrouted alert fires, unchanged).
+    # The `switch` passes every message through untouched. Gated on prefix
+    # routing so the default (non-prefix) render is byte-identical.
     - switch:
-        - check: meta("kv_prefix") == "unknown"
+        - check: meta("kv_prefix_reason") == "empty_prefix"
           processors:
             - metric:
                 type: counter
                 name: cdc_forward_unrouted
                 labels:
                   reason: empty_prefix
+        - check: meta("kv_prefix_reason") == "no_match"
+          processors:
+            {{- if eq (include "rrcs.connect.hasCatchAll" .) "true" }}
+            - metric:
+                type: counter
+                name: cdc_forward_others
+                labels:
+                  reason: no_match
+            {{- else }}
+            - metric:
+                type: counter
+                name: cdc_forward_unrouted
+                labels:
+                  reason: no_match
+            {{- end }}
     {{- end }}
     {{- if .Values.connect.contentLog.enabled }}
     # Dump the self-contained JSON envelope about to be published to JetStream,
