@@ -130,3 +130,18 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
   `SECONDS`, `LINENO`, …), even when the target image uses busybox — the script may later run
   under bash. Renamed to `SINK_GROUPS`.
 - Applied: recorded only (naming hygiene; no rule file gained a new binding clause).
+
+## 2026-07-07 — Bloblang `let` vars need `$`; render/L1/L2 can't catch it — L3 did
+- What happened: The D3 forward-leg prefix derivation wrote `raw_key.split(...)` /
+  `if seg == ...` instead of `$raw_key` / `$seg`. Bloblang reads a bare identifier
+  as `this.<field>` (JSON field access on the message), not the `let` variable, so
+  it threw at runtime ("unable to reference message as structured (with
+  'this.raw_key')") and NOTHING routed. `helm template`, `helm lint`, and the L2
+  docker lab all passed — none execute the pipeline. Only the kind L3 (verify-cdc)
+  surfaced it. The design spec's own pseudocode carried the same omission, so
+  copying it propagated the bug.
+- Rule that would have prevented it: existing — `05-invariants.md` "Connect
+  pipeline YAML → L1 + L3". Bloblang edits are semantically unverified until L3;
+  never trust a spec's Bloblang snippet without running it. When referencing a
+  `let x`, it is ALWAYS `$x`; a bare `x` means `this.x`.
+- Applied: recorded only (reinforces the existing L3 requirement for pipeline edits).
