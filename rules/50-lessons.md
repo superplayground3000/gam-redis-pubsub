@@ -145,3 +145,29 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
   never trust a spec's Bloblang snippet without running it. When referencing a
   `let x`, it is ALWAYS `$x`; a bare `x` means `this.x`.
 - Applied: recorded only (reinforces the existing L3 requirement for pipeline edits).
+
+## 2026-07-07 — Test-quiescence heuristics must outlast the ackWait redelivery horizon
+- What happened: `verify-failover-prefix.sh` declared the region "settled" after the key count
+  was stable for 3 polls × 3 s = 9 s, then asserted zero loss. A message that was in-flight
+  (delivered, unacked) on the SIGKILLed sink leader redelivers only after the consumer's
+  ackWait (30 s), so the count legitimately sat at 19999/20000 for longer than the settle
+  window — a FALSE FAIL blamed on INV-1 while a post-hoc scan showed all 20000 keys present.
+  The script had passed the previous day by timing luck (kill landed elsewhere in the window).
+- Rule that would have prevented it: any "stopped growing" heuristic in a delivery test must
+  either (a) break early only on the COMPLETE expected count, or (b) require stability strictly
+  longer than the slowest recovery mechanism it waits on (here: ackWait redelivery, 30 s).
+  Fixed to complete-count fast-path + 45 s stability before concluding shortfall.
+- Applied: `scripts/verify-failover-prefix.sh` settle loop (commit 49ba20d); recorded here for
+  any future settle/quiesce loops (verify-failover.sh has a similar loop if ever refactored).
+
+## 2026-07-07 — Cross-model final review caught a validation gap all same-model reviews missed
+- What happened: seven per-task Claude reviews approved the two-seg routing work; the Codex
+  whole-branch review then found a real Important gap — an implicit whole-stream sink group
+  (filter kv.cdc.>) could coexist with prefix-routed groups, double-delivering every routed
+  subject, and the L1 fixture itself blessed that shape. Probe-confirmed, then fixed
+  (fail-loud; explicit filterSubject stays the operator-owned escape hatch).
+- Rule that would have prevented it: none purely — task-scoped reviews can't see cross-config
+  interactions the plan never mentioned. The provider-routing rule's mandatory cross-model
+  final review is what caught it; keep it.
+- Applied: `_helpers.tpl` whole-stream guard (commit 344ef76); reinforces
+  `~/.claude/rules/subagent-provider-routing.md` (final review → Codex).
