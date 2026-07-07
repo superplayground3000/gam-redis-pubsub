@@ -306,6 +306,7 @@ in this pass); the 57-char name budget.
 {{- $seenPrefixes := dict -}}
 {{- $catchAllCount := 0 -}}
 {{- $anyPrefixedEnabled := false -}}
+{{- $wholeStream := list -}}
 {{- range $g := $groups -}}
 {{-   $name := $g.name | default "default" -}}
 {{-   if not (regexMatch $tokenRe $name) -}}
@@ -358,6 +359,9 @@ in this pass); the 57-char name budget.
 {{-     if $enabled -}}{{- $catchAllCount = add1 $catchAllCount -}}{{- end -}}
 {{-     $filter = printf "%s.others.>" $prefix -}}
 {{-   end -}}
+{{-   if and $enabled (not $prefixed) (eq $filterSubject "") (not $catchAll) -}}
+{{-     $wholeStream = append $wholeStream $name -}}
+{{-   end -}}
 {{-   $durable := $baseDurable -}}
 {{-   $deployBase := "connect-sink" -}}
 {{-   $pipelineBase := "connect-sink-pipeline" -}}
@@ -404,6 +408,9 @@ in this pass); the 57-char name budget.
 {{- end -}}
 {{- if and (gt $catchAllCount 0) (not $anyPrefixedEnabled) -}}
 {{-   fail "connect.sinkGroups: a catchAll group requires at least one enabled group with prefixes — without prefix routing the forward leg publishes <subjectPrefix>.<op> and the catch-all filter <subjectPrefix>.others.> would never match" -}}
+{{- end -}}
+{{- if and (gt (len $wholeStream) 0) $anyPrefixedEnabled -}}
+{{-   fail (printf "connect.sinkGroups: group(s) %v filter the WHOLE stream (%s.>) while prefix-routed groups are enabled — every routed subject would be consumed TWICE (double delivery). Use catchAll: true for a catch-all group, or an explicit filterSubject if you really mean to tap the whole stream." $wholeStream $prefix) -}}
 {{- end -}}
 {{- range $p1x, $own1 := $seenPrefixes -}}
 {{-   if not (contains ":" $p1x) -}}

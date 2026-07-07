@@ -224,6 +224,9 @@ connect:
   #                    catchAll group, unmatched events park on kv.cdc.others.<op>
   #                    and fire CDCForwardUnrouted (reason=no_match).
   #     (none)      => the group filters the whole stream kv.cdc.> (the default).
+  #                    Fail-loud when any prefixes group is enabled alongside it —
+  #                    a whole-stream consumer would double-receive every routed
+  #                    subject. Use catchAll (or an explicit filterSubject) instead.
   #   mode:      "ha" (default) = Lease-elected single active puller per group
   #              (INV-1 row 10 held per group). "shared" (concurrent pullers) is a
   #              documented follow-up (§10.4) and currently fails-loud at render.
