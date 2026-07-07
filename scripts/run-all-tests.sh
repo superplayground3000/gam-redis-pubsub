@@ -2,7 +2,7 @@
 # Single verification entrypoint for the ladder in rules/05-invariants.md:
 #   L0  go test ./...                              (<10 s, always)
 #   L1  helm lint + template + toggle renders      (seconds, always)
-#   L2  labs/redis-cdc-error-alerting proof        (~7 min; skip: SKIP_L2=1)
+#   L2  routing harness + error-alerting lab proof (~8 min; skip: SKIP_L2=1)
 #   L3  kind e2e build-images + verify-cdc         (~5 min; skip: SKIP_L3=1)
 #   L4  failover chaos                             (~12 min; opt-in: RUN_FAILOVER=1)
 # CI runs this with SKIP_L2=1 SKIP_L3=1 (no docker-heavy tiers on PR).
@@ -99,12 +99,55 @@ for bad in 'connect.sinkGroups[1].prefixes[0]=Bad.Prefix' \
     echo "[run-all-tests] expected fail-loud render for '$bad' but it succeeded"; fail L1
   fi
 done
+
+# ── First-two-segment routing + others catch-all ──
+TSG=(--set connect.sinkGroups[0].name=caveat --set 'connect.sinkGroups[0].prefixes[0]=tg:caveat'
+     --set connect.sinkGroups[1].name=g2m    --set 'connect.sinkGroups[1].prefixes[0]=tg:g2m'
+     --set connect.sinkGroups[2].name=others --set connect.sinkGroups[2].catchAll=true)
+helm template chart/ "${TSG[@]}" >/dev/null || fail L1
+for want in 'kv.cdc.tg.caveat.>' 'kv.cdc.tg.g2m.>' 'kv.cdc.others.>' \
+            '"tg:caveat":"tg.caveat"' 'name: lab-connect-sink-others' 'name: cdc_forward_others'; do
+  helm template chart/ "${TSG[@]}" | grep -qF "$want" \
+    || { echo "[run-all-tests] two-seg render missing $want"; fail L1; }
+done
+helm template chart/ "${TSG[@]}" | grep -oE "SINK_GROUPS='[^']*'" | grep -q 'cdc_sink_others' \
+  || { echo "[run-all-tests] others durable missing from nats-init"; fail L1; }
+# default render must stay clean of ALL two-seg machinery
+if helm template chart/ | grep -qE 'cdc_forward_others|let routes'; then
+  echo "[run-all-tests] default render leaked two-seg routing"; fail L1
+fi
+# no-catchAll render: a set-miss must count as unrouted, not others (match the
+# metric block, not the explanatory comment that also names the counter)
+MG2=(--set connect.sinkGroups[0].name=caveat --set 'connect.sinkGroups[0].prefixes[0]=tg:caveat')
+if helm template chart/ "${MG2[@]}" | grep -q 'name: cdc_forward_others'; then
+  echo "[run-all-tests] cdc_forward_others rendered WITHOUT a catchAll group"; fail L1
+fi
+# fail-loud grammar/structure set (§ two-seg): each render must exit nonzero
+for badset in \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=a:b:c" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=Tg:caveat" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=others" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=others:x" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=unknown" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=tg:caveat" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].prefixes[0]=tg" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].catchAll=true --set connect.sinkGroups[1].prefixes[0]=q" \
+  "--set connect.sinkGroups[1].name=z --set connect.sinkGroups[1].catchAll=true --set connect.sinkGroups[2].name=z2 --set connect.sinkGroups[2].catchAll=true"; do
+  # shellcheck disable=SC2086
+  if helm template chart/ "${MG2[@]}" $badset >/dev/null 2>&1; then
+    echo "[run-all-tests] expected fail-loud render for '$badset' but it succeeded"; fail L1
+  fi
+done
+if helm template chart/ --set connect.sinkGroups[0].name=others --set connect.sinkGroups[0].catchAll=true >/dev/null 2>&1; then
+  echo "[run-all-tests] catchAll without any prefixed group should fail-loud"; fail L1
+fi
 pass L1
 
 echo "[run-all-tests] == L2: error-alerting lab proof =="
 if [ "${SKIP_L2:-0}" = "1" ]; then
   skip L2 "SKIP_L2=1"
 else
+  scripts/test-forward-routing.sh || fail L2
   labs/redis-cdc-error-alerting/scripts/verify-alert.sh || fail L2
   docker compose -f labs/redis-cdc-error-alerting/docker-compose.yml down -v >/dev/null 2>&1
   pass L2
