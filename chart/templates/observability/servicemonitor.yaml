@@ -9,9 +9,14 @@ metadata:
     {{- toYaml . | nindent 4 }}
     {{- end }}
 spec:
-  # Namespace-scoped isolation: only this release's namespace. Selects both Connect
-  # legs plus the writer and latency-calculator Services by their app label;
-  # queries are further scoped by namespace/job in PromQL.
+  # Namespace-scoped isolation: only this release's namespace. Selects the source
+  # leg, EVERY enabled sink group's Service (connect-sink for the sole "default"
+  # group, connect-sink-<name> per additional group — design D3), plus the writer
+  # and latency-calculator. Each sink group's Service name becomes a distinct
+  # Prometheus `job` label, so a stuck group is attributable without a per-group
+  # metric label (design §8, ServiceMonitor-scrape-identity option); the $job
+  # dashboard variable and `by (job)` panels break metrics out per group. Queries
+  # are further scoped by namespace/job in PromQL.
   namespaceSelector:
     matchNames:
       - {{ .Release.Namespace }}
@@ -19,7 +24,7 @@ spec:
     matchExpressions:
       - key: app
         operator: In
-        values: [connect-source, connect-sink, writer, latency-calculator]
+        values: [connect-source, {{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ $g.appLabel }}, {{ end }}{{ end }}writer, latency-calculator]
   endpoints:
     # `http` matches connect (4195), writer (8081), latency-calculator (8082) —
     # every selected Service names its metrics port `http`.

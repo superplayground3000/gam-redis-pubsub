@@ -48,6 +48,53 @@ for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
     fail L1
   fi
 done
+
+# ── Multi-subject sink groups (design D3) ──
+# A 3-group set: a catch-all "default" plus two prefix-routed groups.
+MG=(--set connect.sinkGroups[0].name=default
+    --set connect.sinkGroups[1].name=a --set connect.sinkGroups[1].prefixes[0]=prefix-a
+    --set connect.sinkGroups[2].name=b --set connect.sinkGroups[2].prefixes[0]=prefix-b)
+helm template chart/ "${MG[@]}" >/dev/null || fail L1
+# Each enabled group renders its own sink Deployment, elector, and pipeline CM.
+for res in lab-connect-sink lab-connect-sink-a lab-connect-sink-b \
+           lab-connect-sink-a-pipeline lab-connect-sink-b-pipeline \
+           lab-connect-sink-a-elector lab-connect-sink-b-elector; do
+  helm template chart/ "${MG[@]}" | grep -q "name: $res" \
+    || { echo "[run-all-tests] multi-group render missing $res"; fail L1; }
+done
+# Prefix routing turns on the kv_prefix publish subject AND the unrouted counter.
+# (kv_prefix appears only under prefix routing — in the publish subject + mapping.)
+helm template chart/ "${MG[@]}" | grep 'subject:' | grep -q kv_prefix \
+  || { echo "[run-all-tests] prefix-routed publish subject missing"; fail L1; }
+helm template chart/ "${MG[@]}" | grep -q 'cdc_forward_unrouted' \
+  || { echo "[run-all-tests] cdc_forward_unrouted counter missing under prefix routing"; fail L1; }
+# Default (no groups) must NOT emit the prefix subject or the unrouted counter.
+if helm template chart/ | grep -q kv_prefix; then
+  echo "[run-all-tests] default render leaked prefix routing"; fail L1
+fi
+if helm template chart/ | grep -q cdc_forward_unrouted; then
+  echo "[run-all-tests] default render leaked cdc_forward_unrouted"; fail L1
+fi
+# INV-3 per-group toggle: disabling group a drops ITS objects, keeps group b,
+# and drops cdc_sink_a from the nats-init durable set.
+if helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -q 'name: lab-connect-sink-a$'; then
+  echo "[run-all-tests] sinkGroups[a].enabled=false still renders connect-sink-a"; fail L1
+fi
+helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -q 'name: lab-connect-sink-b$' \
+  || { echo "[run-all-tests] disabling group a wrongly dropped group b"; fail L1; }
+if helm template chart/ "${MG[@]}" --set connect.sinkGroups[1].enabled=false | grep -oE "SINK_GROUPS='[^']*'" | grep -q cdc_sink_a; then
+  echo "[run-all-tests] disabled group a still provisions durable cdc_sink_a"; fail L1
+fi
+# Fail-loud validation (§7): illegal prefix, illegal name, and unimplemented mode
+# must each fail the render (exit nonzero).
+for bad in 'connect.sinkGroups[1].prefixes[0]=Bad.Prefix' \
+           'connect.sinkGroups[1].name=UPPER' \
+           'connect.sinkGroups[1].mode=shared'; do
+  if helm template chart/ --set connect.sinkGroups[0].name=default \
+       --set connect.sinkGroups[1].name=z --set "$bad" >/dev/null 2>&1; then
+    echo "[run-all-tests] expected fail-loud render for '$bad' but it succeeded"; fail L1
+  fi
+done
 pass L1
 
 echo "[run-all-tests] == L2: error-alerting lab proof =="

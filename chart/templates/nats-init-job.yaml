@@ -2,9 +2,11 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  # Hash-suffixed so a changed stream config or image yields a NEW Job name
-  # rather than failing `helm upgrade` on the immutable completed Job (spec §5.2).
-  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) | sha256sum | trunc 8))) }}
+  # Hash-suffixed so a changed stream config, image, or sink-group set yields a
+  # NEW Job name rather than failing `helm upgrade` on the immutable completed Job
+  # (spec §5.2). sinkGroups/sinkDefaults are in the hash (design §4 item 4) so
+  # adding/removing a group actually re-runs the per-group consumer reconcile.
+  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s|%s|%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) (toYaml .Values.connect.sinkGroups) (toYaml (.Values.connect.sinkDefaults | default dict)) | sha256sum | trunc 8))) }}
   labels:
     app: nats-init
 spec:
@@ -85,90 +87,132 @@ spec:
               fi
               nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM"
 
-              # ── Pull consumer (cdc-reverse binds to this with bind:true) ──
-              # The nats_jetstream input does NOT create a pull consumer; it
-              # only attaches. We create/reconcile it here with admin creds so
-              # all consumer params live server-side (input YAML ignores them in
-              # pull/bind mode). The standalone scripts/create-consumer.sh forms
-              # the same command for external NATS / manual recreation.
-              CONSUMER={{ .Values.nats.stream.consumer.durable | quote }}
-              DESIRED_MAXPENDING={{ .Values.nats.stream.consumer.maxAckPending | quote }}
-              DESIRED_MAXDELIVER={{ .Values.nats.stream.consumer.maxDeliver | quote }}
-              # Best-effort normalize the desired ack_wait (a string like "30s")
-              # to nanoseconds so we can diff it against the consumer's
-              # .config.ack_wait (always nanoseconds). Handles a single unit
-              # (ms/s/m/h) or a bare integer (already ns). The raw string is ALSO
-              # passed verbatim to `consumer add --wait`, which accepts the full
-              # Go duration grammar (e.g. "1m30s", "100us") — so anything to_ns
-              # can't normalize still CREATES correctly; we just emit "ERR" and
-              # skip ack_wait drift detection for it rather than failing. Express
-              # ackWait as a single unit if you want it auto-reconciled on drift.
+              # ── Per-group pull consumers (cdc-reverse binds each with bind:true) ──
+              # The nats_jetstream input does NOT create a pull consumer; it only
+              # ATTACHES. We create/reconcile one durable PER enabled sinkGroup here
+              # with admin creds (all params live server-side; the input ignores them
+              # in pull/bind mode). scripts/create-consumer.sh is the manual fallback.
+              #
+              # IDEMPOTENCY CONTRACT (docs/superpowers/specs/idempotemcy-pull-consumer.md):
+              #   * Re-running with UNCHANGED config is a strict NO-OP — the consumer's
+              #     delivery state (ack floor / PEL / position) is never touched. So
+              #     running this Job many times cannot disturb an established consumer.
+              #   * MUTABLE drift (filter_subject, ack_wait, max_ack_pending,
+              #     max_deliver — all mutable per the doc §4) is applied IN PLACE with
+              #     `consumer edit`, NOT delete+recreate, so the ack floor / PEL survive
+              #     and no stream replay is triggered.
+              #   * Only an IMMUTABLE change (an existing PUSH consumer — push<->pull is
+              #     immutable) forces delete+recreate, the sole path that resets
+              #     delivery state. This never happens on a steady-state re-run.
+              #
+              # GROUPS: one line, records ';'-separated, fields '|'-separated —
+              #   DURABLE|FILTER(csv)|MAXPENDING|ACKWAIT|MAXDELIVER
+              SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s|%s|%v|%s|%v;" $g.durable $g.filter $g.maxAckPending $g.ackWait $g.maxDeliver }}{{ end }}{{ end }}'
+              DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s " $g.durable }}{{ end }}{{ end }}'
+              BASE_DURABLE={{ .Values.nats.stream.consumer.durable | quote }}
+
+              # Normalize a desired ack_wait ("30s") to ns to diff it against the
+              # consumer's .config.ack_wait (always ns). Single unit (ms/s/m/h) or
+              # bare int; "ERR" => skip ack_wait drift only (still edits/creates with
+              # the raw --wait string, which accepts the full Go duration grammar).
               to_ns() {
-                n=${1%%[a-z]*}   # leading integer part
-                u=${1#"$n"}      # trailing unit (may be empty)
+                n=${1%%[a-z]*}; u=${1#"$n"}
                 case "$n" in ''|*[!0-9]*) echo "ERR"; return;; esac
                 case "$u" in
                   ms) echo $(( n * 1000000 ));;
                   s)  echo $(( n * 1000000000 ));;
                   m)  echo $(( n * 60000000000 ));;
                   h)  echo $(( n * 3600000000000 ));;
-                  '') echo "$n";;   # bare integer = already nanoseconds
+                  '') echo "$n";;
                   *)  echo "ERR";;
                 esac
               }
-              DESIRED_ACKWAIT={{ .Values.nats.stream.consumer.ackWait | quote }}
-              DESIRED_ACKWAIT_NS=$(to_ns "$DESIRED_ACKWAIT")
-              if [ "$DESIRED_ACKWAIT_NS" = "ERR" ]; then
-                echo "warn: cannot normalize ackWait=$DESIRED_ACKWAIT to ns (compound or non-ms/s/m/h unit); the consumer is still created with it, but ack_wait drift won't be auto-detected. Use a single-unit duration (e.g. 30s, 1m) for full reconcile." >&2
-              fi
-              if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER" --json >/tmp/cons.json 2>/dev/null; then
-                # bind:true attaches to whatever the server has, so the
-                # server-side config is authoritative. Recreate (delete+add) on
-                # any drift that bind cannot fix at runtime:
-                #   - PUSH consumer (has deliver_subject): bind can't attach.
-                #   - filter_subject drift: e.g. a subjectPrefix change would
-                #     leave the consumer filtering the OLD subjects, silently
-                #     dropping every event (same failure the stream-subject
-                #     reconcile above guards against).
-                #   - ack_wait / max_ack_pending / max_deliver drift from values.
-                DELIVER=$(jq -r '.config.deliver_subject // ""' /tmp/cons.json)
-                CUR_FILTER=$(jq -r '.config.filter_subject // ""' /tmp/cons.json)
-                CUR_ACKWAIT=$(jq -r '.config.ack_wait' /tmp/cons.json)
-                CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
-                CUR_MAXDELIVER=$(jq -r '.config.max_deliver' /tmp/cons.json)
-                if [ -n "$DELIVER" ]; then
-                  echo "consumer $CONSUMER is PUSH (deliver=$DELIVER); recreating as pull"
-                  NEED_CREATE=1
-                elif [ "$CUR_FILTER" != "$DESIRED_SUBJECTS" ] \
-                  || { [ "$DESIRED_ACKWAIT_NS" != "ERR" ] && [ "$CUR_ACKWAIT" != "$DESIRED_ACKWAIT_NS" ]; } \
-                  || [ "$CUR_MAXPENDING" != "$DESIRED_MAXPENDING" ] \
-                  || [ "$CUR_MAXDELIVER" != "$DESIRED_MAXDELIVER" ]; then
-                  echo "pull consumer $CONSUMER drifted (filter[$CUR_FILTER]->[$DESIRED_SUBJECTS] ackwait[$CUR_ACKWAIT]->[$DESIRED_ACKWAIT_NS] maxpending[$CUR_MAXPENDING]->[$DESIRED_MAXPENDING] maxdeliver[$CUR_MAXDELIVER]->[$DESIRED_MAXDELIVER]); recreating"
-                  NEED_CREATE=1
-                else
-                  echo "pull consumer $CONSUMER already up to date"
-                  NEED_CREATE=0
+              # sort a csv so a multi-prefix filter compares order-independently.
+              sort_csv() { printf '%s' "$1" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//'; }
+
+              echo "$SINK_GROUPS" | tr ';' '\n' | while IFS='|' read -r CONSUMER DESIRED_FILTER DESIRED_MAXPENDING DESIRED_ACKWAIT DESIRED_MAXDELIVER; do
+                [ -z "$CONSUMER" ] && continue
+                DESIRED_ACKWAIT_NS=$(to_ns "$DESIRED_ACKWAIT")
+                if [ "$DESIRED_ACKWAIT_NS" = "ERR" ]; then
+                  echo "warn: cannot normalize ackWait=$DESIRED_ACKWAIT to ns for $CONSUMER; it is still created/edited with that value, but ack_wait drift won't be auto-detected. Use a single-unit duration (e.g. 30s, 1m)." >&2
                 fi
-                if [ "$NEED_CREATE" = 1 ]; then
-                  nats --server "$SERVER" --creds "$CREDS" consumer rm "$STREAM" "$CONSUMER" --force
+                # --filter can repeat (a multi-prefix group => union filter).
+                FILTER_ARGS=""; OLDIFS=$IFS; IFS=','
+                for f in $DESIRED_FILTER; do FILTER_ARGS="$FILTER_ARGS --filter $f"; done
+                IFS=$OLDIFS
+                DESIRED_FILTER_SORTED=$(sort_csv "$DESIRED_FILTER")
+
+                ACTION=create
+                if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER" --json >/tmp/cons.json 2>/dev/null; then
+                  DELIVER=$(jq -r '.config.deliver_subject // ""' /tmp/cons.json)
+                  if [ -n "$DELIVER" ]; then
+                    # IMMUTABLE push<->pull change: the ONLY delete+recreate path.
+                    echo "$CONSUMER is PUSH (deliver=$DELIVER); delete+recreate as pull (immutable change — delivery-state reset is unavoidable here)"
+                    nats --server "$SERVER" --creds "$CREDS" consumer rm "$STREAM" "$CONSUMER" --force
+                    ACTION=create
+                  else
+                    CUR_FILTER=$(jq -r 'if ((.config.filter_subjects // []) | length) > 0 then (.config.filter_subjects | join(",")) else (.config.filter_subject // "") end' /tmp/cons.json)
+                    CUR_FILTER_SORTED=$(sort_csv "$CUR_FILTER")
+                    CUR_ACKWAIT=$(jq -r '.config.ack_wait' /tmp/cons.json)
+                    CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
+                    CUR_MAXDELIVER=$(jq -r '.config.max_deliver' /tmp/cons.json)
+                    if [ "$CUR_FILTER_SORTED" != "$DESIRED_FILTER_SORTED" ] \
+                      || { [ "$DESIRED_ACKWAIT_NS" != "ERR" ] && [ "$CUR_ACKWAIT" != "$DESIRED_ACKWAIT_NS" ]; } \
+                      || [ "$CUR_MAXPENDING" != "$DESIRED_MAXPENDING" ] \
+                      || [ "$CUR_MAXDELIVER" != "$DESIRED_MAXDELIVER" ]; then
+                      ACTION=edit
+                    else
+                      ACTION=none
+                      echo "pull consumer $CONSUMER already up to date (filter[$CUR_FILTER_SORTED] ackwait[$CUR_ACKWAIT] maxpending[$CUR_MAXPENDING] maxdeliver[$CUR_MAXDELIVER])"
+                    fi
+                  fi
                 fi
-              else
-                NEED_CREATE=1
-              fi
-              if [ "$NEED_CREATE" = 1 ]; then
-                echo "creating pull consumer $CONSUMER (filter [$DESIRED_SUBJECTS])"
-                nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
-                  --pull \
-                  --filter "$DESIRED_SUBJECTS" \
-                  --ack explicit \
-                  --deliver all \
-                  --replay instant \
-                  --wait {{ .Values.nats.stream.consumer.ackWait }} \
-                  --max-pending {{ .Values.nats.stream.consumer.maxAckPending }} \
-                  --max-deliver={{ .Values.nats.stream.consumer.maxDeliver }} \
-                  --defaults
-              fi
-              nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
+
+                if [ "$ACTION" = edit ]; then
+                  # MUTABLE drift → in-place edit; ack floor / PEL / position preserved.
+                  echo "pull consumer $CONSUMER drifted; editing IN PLACE (filter->[$DESIRED_FILTER_SORTED] ackwait->[$DESIRED_ACKWAIT_NS] maxpending->[$DESIRED_MAXPENDING] maxdeliver->[$DESIRED_MAXDELIVER])"
+                  nats --server "$SERVER" --creds "$CREDS" consumer edit "$STREAM" "$CONSUMER" \
+                    $FILTER_ARGS \
+                    --wait "$DESIRED_ACKWAIT" \
+                    --max-pending "$DESIRED_MAXPENDING" \
+                    --max-deliver="$DESIRED_MAXDELIVER" \
+                    --force
+                elif [ "$ACTION" = create ]; then
+                  echo "creating pull consumer $CONSUMER (filter [$DESIRED_FILTER_SORTED])"
+                  nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
+                    --pull \
+                    $FILTER_ARGS \
+                    --ack explicit \
+                    --deliver all \
+                    --replay instant \
+                    --wait "$DESIRED_ACKWAIT" \
+                    --max-pending "$DESIRED_MAXPENDING" \
+                    --max-deliver="$DESIRED_MAXDELIVER" \
+                    --defaults
+                fi
+                nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
+              done
+
+              # ── Orphan pruning (design §4 item 3) ──────────────────────────────
+              # Scaling sinkGroups DOWN must delete the now-unbound durables (an
+              # unbound pull consumer accrues num_pending forever). Only ever touch
+              # OUR family ($BASE_DURABLE / ${BASE_DURABLE}_*); a foreign consumer is
+              # never removed. Best-effort: if the list can't be read, prune nothing
+              # (safe — never a false delete). This is reconcile-completeness only; it
+              # never touches a consumer that is still in the desired set.
+              EXISTING=$(nats --server "$SERVER" --creds "$CREDS" consumer ls "$STREAM" --names 2>/dev/null || true)
+              for existing in $EXISTING; do
+                case "$existing" in
+                  "$BASE_DURABLE"|"$BASE_DURABLE"_*) ;;
+                  *) continue;;
+                esac
+                keep=0
+                for d in $DESIRED_DURABLES; do [ "$existing" = "$d" ] && keep=1 && break; done
+                if [ "$keep" = 0 ]; then
+                  echo "orphan prune: removing unbound consumer $existing (no longer in sinkGroups)"
+                  nats --server "$SERVER" --creds "$CREDS" consumer rm "$STREAM" "$existing" --force
+                fi
+              done
           volumeMounts:
             - name: admin-creds
               mountPath: /etc/nats-creds/admin

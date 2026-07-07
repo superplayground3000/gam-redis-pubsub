@@ -79,6 +79,35 @@ pipeline:
         }
         meta op       = meta("op").or("update")     # used for the subject interpolation
         meta event_id = $eid                          # used for the Nats-Msg-Id header
+        {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
+        # Prefix routing (design D3 §3.1a): derive the key-prefix segment so the
+        # publish subject becomes <subjectPrefix>.<kv_prefix>.<op> and per-group
+        # durables can filter kv.cdc.<prefix>.>. The segment is the part before the
+        # first ':' of the key; rename/delete may carry an empty kv_key, so fall
+        # back to new_key, then to "unknown" (a subject NO group filters, so the
+        # message parks in the stream instead of vanishing — surfaced by the
+        # cdc_forward_unrouted counter added with the per-group dashboard work).
+        let raw_key    = meta("kv_key").or(meta("new_key")).or("")
+        let seg        = raw_key.split(":").index(0)
+        meta kv_prefix = if seg == null || seg == "" { "unknown" } else { seg }
+        {{- end }}
+    {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
+    # cdc_forward_unrouted (INV-2 / design §3.1): fires when no key-prefix could be
+    # derived (empty/rename-without-key), so the event publishes to
+    # kv.cdc.unknown.<op> — a subject NO sink group filters. The message parks in
+    # the stream instead of vanishing; this counter makes the routing miss LOUD
+    # (dashboard panel + CDCForwardUnrouted alert). The `switch` passes every other
+    # message through untouched. Gated on prefix routing so the default
+    # (non-prefix) render is byte-identical.
+    - switch:
+        - check: meta("kv_prefix") == "unknown"
+          processors:
+            - metric:
+                type: counter
+                name: cdc_forward_unrouted
+                labels:
+                  reason: empty_prefix
+    {{- end }}
     {{- if .Values.connect.contentLog.enabled }}
     # Dump the self-contained JSON envelope about to be published to JetStream,
     # plus the op/event_id meta that drive subject interpolation and the

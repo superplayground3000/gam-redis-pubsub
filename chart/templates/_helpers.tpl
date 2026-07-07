@@ -244,12 +244,152 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 
 {{/*
 rrcs.nats.stream.publishSubject — subject connect-source publishes each CDC event
-to: <subjectPrefix>.<op>. The ".${! meta(\"op\") }" suffix is a Redpanda Connect
-interpolation evaluated at publish time, not by Helm.
+to. Legacy (no prefix routing): <subjectPrefix>.<op>. When ANY enabled sinkGroup
+routes by key-prefix (rrcs.connect.prefixRouting == "true", D3 §3), it becomes
+<subjectPrefix>.<kv_prefix>.<op> so messages split into per-prefix subjects the
+per-group durables filter on. The ".${! meta(...) }" tokens are Redpanda Connect
+interpolations evaluated at publish time, not by Helm. The default render (no
+prefix groups) is byte-identical to the pre-D3 <subjectPrefix>.<op>.
 */}}
 {{- define "rrcs.nats.stream.publishSubject" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
+{{- if eq (include "rrcs.connect.prefixRouting" .) "true" -}}
+{{- printf "%s.${! meta(\"kv_prefix\") }.${! meta(\"op\") }" $p -}}
+{{- else -}}
 {{- printf "%s.${! meta(\"op\") }" $p -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sinkGroups — normalized sink-group list (multi-subject support, D3).
+Emits a YAML array; consume it with fromYamlArray:
+  {{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}
+When .Values.connect.sinkGroups is empty/unset the chart synthesises ONE group
+named "default" whose every field resolves to today's legacy single-sink values
+(connect.sink.* + nats.stream.consumer.*), so the default render is byte-for-byte
+identical to the pre-D3 chart (design §1). Field resolution precedence:
+  group value  ->  connect.sinkDefaults  ->  legacy connect.sink.* / consumer.*
+Each element carries: name enabled isDefault prefixed durable filter streamID
+replicas ackWait maxAckPending maxDeliver leaseDuration renewDeadline retryPeriod
+deployBase pipelineBase saBase appLabel.
+Validation (fail-loud at render): DNS-1123 + NATS-token name/prefix (design §7),
+prefixes XOR filterSubject, mode ("ha" only in this pass), and the 57-char name
+budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
+*/}}
+{{- define "rrcs.connect.sinkGroups" -}}
+{{- $root := . -}}
+{{- $v := .Values -}}
+{{- $prefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
+{{- $defs := $v.connect.sinkDefaults | default dict -}}
+{{- $defLease := $defs.lease | default dict -}}
+{{- $defCons := $defs.consumer | default dict -}}
+{{- $legSink := $v.connect.sink -}}
+{{- $legLease := $legSink.lease -}}
+{{- $legCons := $v.nats.stream.consumer -}}
+{{- $baseDurable := $legCons.durable -}}
+{{- $tokenRe := "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" -}}
+{{- $groups := $v.connect.sinkGroups -}}
+{{- if not $groups -}}
+{{-   $groups = list (dict "name" "default" "enabled" $legSink.enabled) -}}
+{{- end -}}
+{{- $out := list -}}
+{{- range $g := $groups -}}
+{{-   $name := $g.name | default "default" -}}
+{{-   if not (regexMatch $tokenRe $name) -}}
+{{-     fail (printf "connect.sinkGroups: group name %q is not a valid NATS+DNS token (^[a-z0-9]([a-z0-9-]*[a-z0-9])?$: lowercase alnum + dash, no leading/trailing dash)" $name) -}}
+{{-   end -}}
+{{-   $isDefault := eq $name "default" -}}
+{{-   $mode := $g.mode | default "ha" -}}
+{{-   if not (has $mode (list "ha")) -}}
+{{-     fail (printf "connect.sinkGroups[%s].mode=%q — only \"ha\" is implemented in this pass; \"shared\" (concurrent pullers on one durable) is a documented follow-up (design §10.4)." $name $mode) -}}
+{{-   end -}}
+{{-   $enabled := $g.enabled -}}
+{{-   if eq (kindOf $enabled) "invalid" -}}{{- $enabled = true -}}{{- end -}}
+{{-   $prefixes := $g.prefixes | default list -}}
+{{-   $filterSubject := $g.filterSubject | default "" -}}
+{{-   if and (gt (len $prefixes) 0) (ne $filterSubject "") -}}
+{{-     fail (printf "connect.sinkGroups[%s]: set only ONE of prefixes or filterSubject, not both" $name) -}}
+{{-   end -}}
+{{-   $prefixed := gt (len $prefixes) 0 -}}
+{{-   $filter := printf "%s.>" $prefix -}}
+{{-   if $prefixed -}}
+{{-     $subs := list -}}
+{{-     range $p := $prefixes -}}
+{{-       if not (regexMatch $tokenRe $p) -}}
+{{-         fail (printf "connect.sinkGroups[%s].prefixes: %q is not a valid NATS+DNS token (^[a-z0-9]([a-z0-9-]*[a-z0-9])?$)" $name $p) -}}
+{{-       end -}}
+{{-       $subs = append $subs (printf "%s.%s.>" $prefix $p) -}}
+{{-     end -}}
+{{-     $filter = join "," $subs -}}
+{{-   else if ne $filterSubject "" -}}
+{{-     $filter = $filterSubject -}}
+{{-   end -}}
+{{-   $durable := $baseDurable -}}
+{{-   $deployBase := "connect-sink" -}}
+{{-   $pipelineBase := "connect-sink-pipeline" -}}
+{{-   $saBase := $legLease.name -}}
+{{-   $streamID := $legSink.streamID -}}
+{{-   if not $isDefault -}}
+{{-     $durable = printf "%s_%s" $baseDurable $name -}}
+{{-     $deployBase = printf "connect-sink-%s" $name -}}
+{{-     $pipelineBase = printf "connect-sink-%s-pipeline" $name -}}
+{{-     $saBase = printf "connect-sink-%s-elector" $name -}}
+{{-     $streamID = printf "reverse_leg_%s" $name -}}
+{{-   end -}}
+{{-   $fullName := printf "%s%s" $root.Values.resourcePrefix $deployBase -}}
+{{-   if gt (len $fullName) 57 -}}
+{{-     fail (printf "connect.sinkGroups[%s]: derived resource name %q (%d chars) exceeds the 57-char budget — shorten resourcePrefix or the group name" $name $fullName (len $fullName)) -}}
+{{-   end -}}
+{{-   $glease := $g.lease | default dict -}}
+{{-   $gcons := $g.consumer | default dict -}}
+{{-   $elem := dict
+             "name" $name
+             "enabled" $enabled
+             "isDefault" $isDefault
+             "prefixed" $prefixed
+             "durable" $durable
+             "filter" $filter
+             "streamID" ($g.streamID | default $streamID)
+             "replicas" ($g.replicas | default $defs.replicas | default $legSink.replicas)
+             "ackWait" ($gcons.ackWait | default $defCons.ackWait | default $legCons.ackWait)
+             "maxAckPending" ($gcons.maxAckPending | default $defCons.maxAckPending | default $legCons.maxAckPending)
+             "maxDeliver" ($gcons.maxDeliver | default $defCons.maxDeliver | default $legCons.maxDeliver)
+             "leaseDuration" ($glease.duration | default $defLease.duration | default $legLease.duration)
+             "renewDeadline" ($glease.renewDeadline | default $defLease.renewDeadline | default $legLease.renewDeadline)
+             "retryPeriod" ($glease.retryPeriod | default $defLease.retryPeriod | default $legLease.retryPeriod)
+             "deployBase" $deployBase
+             "pipelineBase" $pipelineBase
+             "saBase" $saBase
+             "appLabel" $deployBase -}}
+{{-   $out = append $out $elem -}}
+{{- end -}}
+{{- $out | toYaml -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.prefixRouting — "true" iff any ENABLED sinkGroup routes by key-prefix.
+Gates the forward leg's kv_prefix subject segment (design §3): a pure default /
+non-prefix install stays on the legacy <subjectPrefix>.<op> subject and grant.
+*/}}
+{{- define "rrcs.connect.prefixRouting" -}}
+{{- $any := false -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if and $g.enabled $g.prefixed -}}{{- $any = true -}}{{- end -}}
+{{- end -}}
+{{- ternary "true" "false" $any -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.anySinkEnabled — "true" iff at least one sinkGroup is enabled. Used
+where the chart previously keyed off connect.sink.enabled (e.g. the shared
+observability ConfigMap). Default single-group => equals connect.sink.enabled.
+*/}}
+{{- define "rrcs.connect.anySinkEnabled" -}}
+{{- $any := false -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if $g.enabled -}}{{- $any = true -}}{{- end -}}
+{{- end -}}
+{{- ternary "true" "false" $any -}}
 {{- end -}}
 
 {{- define "rrcs.nats.credsSecret.publisher" -}}

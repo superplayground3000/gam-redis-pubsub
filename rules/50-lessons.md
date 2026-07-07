@@ -117,3 +117,16 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
 - Rule that would have prevented it: treat consumer identity as a load-bearing invariant and
   require the failover test for changes to it.
 - Applied: `rules/05-invariants.md` INV-1 row 2 (L4 required).
+
+## 2026-07-07 — `GROUPS` is a bash special variable; chart-embedded shell must avoid it
+- What happened: The D3 multi-subject nats-init Job stored its per-group record list in a shell
+  var named `GROUPS`. Harmless in production (nats-box runs busybox `sh`, where `GROUPS` is a
+  normal variable) but latent: under bash, `GROUPS` is the read-only supplementary-GID array, so
+  `GROUPS="…"` is silently ignored and `$GROUPS` expands to the primary GID (`1000`). A local
+  behavioral test run under bash reconciled a consumer literally named `1000` before the cause
+  was found.
+- Rule that would have prevented it: when embedding shell in chart templates, never name a
+  variable after a shell special/reserved name (`GROUPS`, `PWD`, `UID`, `IFS`, `PPID`, `RANDOM`,
+  `SECONDS`, `LINENO`, …), even when the target image uses busybox — the script may later run
+  under bash. Renamed to `SINK_GROUPS`.
+- Applied: recorded only (naming hygiene; no rule file gained a new binding clause).

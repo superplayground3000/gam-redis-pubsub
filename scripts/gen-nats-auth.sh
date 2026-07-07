@@ -143,18 +143,27 @@ nsc add user --account "${ACCOUNT_NAME}" --name publisher \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user subscriber"
-# The sink (cdc-reverse) binds to a server-side PULL consumer (bind:true), so it
-# must publish pull requests to $JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>.
-# CONSUMER.*CREATE.* remain only for back-compat with non-bind (push) configs;
-# in pull/bind mode the consumer is created by the nats-init Job (admin creds).
+# The sink (cdc-reverse) binds to server-side PULL consumers (bind:true), so it
+# must ACK and publish pull requests ($JS.API.CONSUMER.MSG.NEXT / INFO) for the
+# durable(s) it binds. Multi-subject support (design D3) splits the sink into N
+# per-group durables named cdc_sink / cdc_sink_<group>, so the grant is scoped to
+# ANY consumer on the stream via the single-token wildcard '*' (one token = the
+# durable name) rather than the exact DURABLE_NAME.
+#
+# SECURITY TRADE-OFF (design §5.3): this is strictly BROADER — the subscriber can
+# INFO / MSG.NEXT / ACK any consumer on ${STREAM_NAME}. Acceptable for this
+# single-tenant CDC stream (every consumer belongs to the same sink role). For a
+# SHARED / multi-tenant stream, prefer an enumerated per-group grant or a
+# per-group creds user (one file per durable) so one group cannot pull another's.
+#
+# CONSUMER.*CREATE.* are dropped: in pull/bind mode the sink never CREATES a
+# consumer — the nats-init Job (admin creds) provisions them. bind:true only
+# attaches. (Re-add them here if you ever run a non-bind/push sink.)
 nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
-  --allow-pub '$JS.ACK.'"${STREAM_NAME}"'.'"${DURABLE_NAME}"'.>' \
+  --allow-pub '$JS.ACK.'"${STREAM_NAME}"'.>' \
   --allow-pub '$JS.API.STREAM.INFO.'"${STREAM_NAME}" \
-  --allow-pub '$JS.API.CONSUMER.DURABLE.CREATE.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
-  --allow-pub '$JS.API.CONSUMER.CREATE.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
-  --allow-pub '$JS.API.CONSUMER.CREATE.'"${STREAM_NAME}"'.'"${DURABLE_NAME}"'.>' \
-  --allow-pub '$JS.API.CONSUMER.INFO.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
-  --allow-pub '$JS.API.CONSUMER.MSG.NEXT.'"${STREAM_NAME}"'.'"${DURABLE_NAME}" \
+  --allow-pub '$JS.API.CONSUMER.INFO.'"${STREAM_NAME}"'.*' \
+  --allow-pub '$JS.API.CONSUMER.MSG.NEXT.'"${STREAM_NAME}"'.*' \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user admin"

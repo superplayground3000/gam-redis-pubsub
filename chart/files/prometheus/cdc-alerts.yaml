@@ -39,3 +39,27 @@ groups:
             maxDeliver=-1 these redeliver until removed. Inspect the JetStream durable
             consumer and the poison message. The alert clears ~2m after the last
             redelivery once the poison is cleared.
+      # Forward-leg routing miss (multi-subject / design §3.1). Fires when the
+      # source cannot derive a key-prefix and publishes to kv.cdc.unknown.<op>,
+      # which NO sink group filters — the event parks in the stream unconsumed.
+      # Only ever nonzero when prefix routing is configured (the counter is emitted
+      # by a gated processor). METRIC NAME: cdc_forward_unrouted scrapes as
+      # cdc_forward_unrouted or _total; the full-string __name__ regex matches both
+      # and excludes the OpenMetrics _created series.
+      - alert: CDCForwardUnrouted
+        expr: |
+          sum by (namespace, job, reason) (
+            increase({__name__=~"cdc_forward_unrouted(_total)?"}[5m])
+          ) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC forward leg produced unroutable events (reason={{ $labels.reason }})"
+          description: >-
+            The CDC forward leg in namespace {{ $labels.namespace }} (job {{ $labels.job }})
+            published events with no derivable key-prefix to kv.cdc.unknown.<op>, a
+            subject no sink group filters — they accumulate in the stream unconsumed.
+            Check the writer's key format / prefix derivation (design §3.1). Add a
+            sink group that filters the missing prefix, or fix the key so a prefix
+            can be derived.

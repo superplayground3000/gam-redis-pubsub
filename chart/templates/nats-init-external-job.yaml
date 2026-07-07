@@ -84,8 +84,8 @@ spec:
               SERVER={{ include "rrcs.nats.url" . | quote }}
               CREDS="/etc/nats-creds/manage/user.creds"
               STREAM={{ .Values.nats.stream.name | quote }}
-              CONSUMER={{ .Values.nats.stream.consumer.durable | quote }}
-              FILTER='{{ include "rrcs.nats.stream.subjects" . }}'
+              DESIRED_MAXDELIVER={{ .Values.nats.stream.consumer.maxDeliver | quote }}
+              DESIRED_MAXPENDING={{ .Values.nats.stream.consumer.maxAckPending | quote }}
 
               # The external stream is USER-OWNED — the chart never creates or
               # reconciles it. Fail clearly if it is missing so the operator
@@ -93,75 +93,71 @@ spec:
               # appears (creating a consumer on a non-existent stream errors).
               if ! nats --server "$SERVER" --creds "$CREDS" stream info "$STREAM" >/dev/null 2>&1; then
                 echo "ERROR: external stream '$STREAM' not found on $SERVER (or creds lack \$JS.API.STREAM.INFO.$STREAM)." >&2
-                echo "Create the stream first — it must bind subjects '$FILTER'. The chart does NOT reconcile external streams." >&2
+                echo "Create the stream first — it must bind subjects '{{ include "rrcs.nats.stream.subjects" . }}'. The chart does NOT reconcile external streams." >&2
                 exit 1
               fi
 
-              # Pull consumer: create if absent, otherwise VALIDATE. The external
-              # consumer is user-owned, so we never edit or delete it (unlike the
-              # bundled nats-init Job, which fully reconciles its own). But we must
-              # not report success while leaving a consumer the sink cannot use.
-              # We FAIL LOUDLY (and tell the operator to fix it) when an existing
-              # consumer is PUSH (bind:true can't attach), has a stale
-              # filter_subject (subjectPrefix changed → every event dropped), or
-              # weakens at-least-once delivery (ack_policy != explicit, or a
-              # max_deliver that differs from values and can drop messages).
-              if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER" --json >/tmp/cons.json 2>/dev/null; then
-                DELIVER=$(jq -r '.config.deliver_subject // ""' /tmp/cons.json)
-                CUR_FILTER=$(jq -r '.config.filter_subject // ""' /tmp/cons.json)
-                if [ -n "$DELIVER" ]; then
-                  echo "ERROR: consumer '$CONSUMER' on '$STREAM' is PUSH (deliver_subject=$DELIVER); the sink uses bind:true and needs a PULL consumer." >&2
-                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job (or scripts/create-consumer.sh) to recreate it as pull." >&2
-                  exit 1
+              sort_csv() { printf '%s' "$1" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//'; }
+
+              # One durable PER enabled sinkGroup (design D3). For an EXTERNAL NATS
+              # the consumers are user-owned, so we CREATE if absent but only
+              # VALIDATE (never edit/delete) existing ones — failing loud when one
+              # is unusable (PUSH), stale (wrong filter), or weakens at-least-once
+              # (ack_policy != explicit, or a divergent max_deliver). One line,
+              # records ';'-separated: DURABLE|FILTER(csv)|ACKWAIT
+              SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s|%s|%s;" $g.durable $g.filter $g.ackWait }}{{ end }}{{ end }}'
+              echo "$SINK_GROUPS" | tr ';' '\n' | while IFS='|' read -r CONSUMER FILTER DESIRED_ACKWAIT; do
+                [ -z "$CONSUMER" ] && continue
+                FILTER_SORTED=$(sort_csv "$FILTER")
+                FILTER_ARGS=""; OLDIFS=$IFS; IFS=','
+                for f in $FILTER; do FILTER_ARGS="$FILTER_ARGS --filter $f"; done
+                IFS=$OLDIFS
+                if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER" --json >/tmp/cons.json 2>/dev/null; then
+                  DELIVER=$(jq -r '.config.deliver_subject // ""' /tmp/cons.json)
+                  CUR_FILTER=$(jq -r 'if ((.config.filter_subjects // []) | length) > 0 then (.config.filter_subjects | join(",")) else (.config.filter_subject // "") end' /tmp/cons.json)
+                  CUR_FILTER_SORTED=$(sort_csv "$CUR_FILTER")
+                  if [ -n "$DELIVER" ]; then
+                    echo "ERROR: consumer '$CONSUMER' on '$STREAM' is PUSH (deliver_subject=$DELIVER); the sink uses bind:true and needs a PULL consumer." >&2
+                    echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job (or scripts/create-consumer.sh) to recreate it as pull." >&2
+                    exit 1
+                  fi
+                  if [ "$CUR_FILTER_SORTED" != "$FILTER_SORTED" ]; then
+                    echo "ERROR: consumer '$CONSUMER' filter [$CUR_FILTER_SORTED] != desired [$FILTER_SORTED] (stale — e.g. subjectPrefix or the group's prefixes changed). The sink would silently drop every event." >&2
+                    echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job, or realign the consumer's filter manually." >&2
+                    exit 1
+                  fi
+                  CUR_ACKPOLICY=$(jq -r '.config.ack_policy // ""' /tmp/cons.json)
+                  CUR_MAXDELIVER=$(jq -r '.config.max_deliver' /tmp/cons.json)
+                  if [ "$CUR_ACKPOLICY" != "explicit" ]; then
+                    echo "ERROR: consumer '$CONSUMER' ack_policy=[$CUR_ACKPOLICY] but the sink requires 'explicit' — it acks on success and relies on nack->redelivery for at-least-once delivery; any other policy silently loses or mis-acks on a processing failure." >&2
+                    echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job (or scripts/create-consumer.sh), which creates it with --ack explicit." >&2
+                    exit 1
+                  fi
+                  if [ "$CUR_MAXDELIVER" != "$DESIRED_MAXDELIVER" ]; then
+                    echo "ERROR: consumer '$CONSUMER' max_deliver=[$CUR_MAXDELIVER] != desired [$DESIRED_MAXDELIVER] — this changes the redelivery/loss posture the sink expects (default -1 = redeliver until acked; a finite cap drops a still-failing message -> silent data loss)." >&2
+                    echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job, or set nats.stream.consumer.maxDeliver to match if that posture is intentional." >&2
+                    exit 1
+                  fi
+                  CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
+                  if [ "$CUR_MAXPENDING" != "$DESIRED_MAXPENDING" ]; then
+                    echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values $DESIRED_MAXPENDING (throughput only; still usable, not changing a user-owned consumer)." >&2
+                  fi
+                  echo "pull consumer '$CONSUMER' already exists on '$STREAM' with desired filter [$FILTER_SORTED], ack_policy=explicit, max_deliver=$CUR_MAXDELIVER; usable"
+                else
+                  echo "creating pull consumer '$CONSUMER' (filter [$FILTER_SORTED]) on external stream '$STREAM'"
+                  nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
+                    --pull \
+                    $FILTER_ARGS \
+                    --ack explicit \
+                    --deliver all \
+                    --replay instant \
+                    --wait "$DESIRED_ACKWAIT" \
+                    --max-pending "$DESIRED_MAXPENDING" \
+                    --max-deliver="$DESIRED_MAXDELIVER" \
+                    --defaults
                 fi
-                if [ "$CUR_FILTER" != "$FILTER" ]; then
-                  echo "ERROR: consumer '$CONSUMER' filter_subject [$CUR_FILTER] != desired [$FILTER] (stale — e.g. nats.stream.subjectPrefix changed). The sink would silently drop every event." >&2
-                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job, or realign the consumer's filter manually." >&2
-                  exit 1
-                fi
-                # A PULL consumer with the right filter is necessary but NOT
-                # sufficient — these two params decide whether at-least-once
-                # delivery actually holds, so they are fail-closed too (still
-                # never mutating a user-owned consumer):
-                #   ack_policy MUST be "explicit": the sink acks on success and
-                #     relies on nack->redelivery; "none" drops on a processing
-                #     failure, "all" acks earlier un-acked messages with it.
-                #   max_deliver MUST match values: the sink's no-loss posture is
-                #     "redeliver until acked" (default -1); a finite cap TERMINATES
-                #     a still-failing message -> silent divergence / data loss.
-                CUR_ACKPOLICY=$(jq -r '.config.ack_policy // ""' /tmp/cons.json)
-                CUR_MAXDELIVER=$(jq -r '.config.max_deliver' /tmp/cons.json)
-                if [ "$CUR_ACKPOLICY" != "explicit" ]; then
-                  echo "ERROR: consumer '$CONSUMER' ack_policy=[$CUR_ACKPOLICY] but the sink requires 'explicit' — it acks on success and relies on nack->redelivery for at-least-once delivery; any other policy silently loses or mis-acks on a processing failure." >&2
-                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job (or scripts/create-consumer.sh), which creates it with --ack explicit." >&2
-                  exit 1
-                fi
-                if [ "$CUR_MAXDELIVER" != {{ .Values.nats.stream.consumer.maxDeliver | quote }} ]; then
-                  echo "ERROR: consumer '$CONSUMER' max_deliver=[$CUR_MAXDELIVER] != desired [{{ .Values.nats.stream.consumer.maxDeliver }}] — this changes the redelivery/loss posture the sink expects (default -1 = redeliver until acked; a finite cap drops a still-failing message -> silent data loss)." >&2
-                  echo "The chart will not mutate a user-owned consumer. Delete it and re-run this Job, or set nats.stream.consumer.maxDeliver to match if that posture is intentional." >&2
-                  exit 1
-                fi
-                # max_ack_pending is pure throughput, not a delivery guarantee —
-                # flag drift as a non-fatal note; never mutate a user-owned consumer.
-                CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
-                if [ "$CUR_MAXPENDING" != {{ .Values.nats.stream.consumer.maxAckPending | quote }} ]; then
-                  echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values {{ .Values.nats.stream.consumer.maxAckPending }} (throughput only; still usable, not changing a user-owned consumer)." >&2
-                fi
-                echo "pull consumer '$CONSUMER' already exists on '$STREAM' with desired filter [$FILTER], ack_policy=explicit, max_deliver=$CUR_MAXDELIVER; usable"
-              else
-                echo "creating pull consumer '$CONSUMER' (filter [$FILTER]) on external stream '$STREAM'"
-                nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
-                  --pull \
-                  --filter "$FILTER" \
-                  --ack explicit \
-                  --deliver all \
-                  --replay instant \
-                  --wait {{ .Values.nats.stream.consumer.ackWait }} \
-                  --max-pending {{ .Values.nats.stream.consumer.maxAckPending }} \
-                  --max-deliver={{ .Values.nats.stream.consumer.maxDeliver }} \
-                  --defaults
-              fi
-              nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
+                nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
+              done
           volumeMounts:
             - name: manage-creds
               mountPath: /etc/nats-creds/manage

@@ -5,7 +5,7 @@ top level. The per-leg pipeline ConfigMaps below hold ONLY input/pipeline/output
 (a valid streams stream config); the elector sidecar POSTs one to its local
 connect via the streams REST API while it holds the Lease.
 */}}
-{{- if or .Values.connect.source.enabled .Values.connect.sink.enabled }}
+{{- if or .Values.connect.source.enabled (eq (include "rrcs.connect.anySinkEnabled" .) "true") }}
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -28,15 +28,21 @@ data:
   pipeline.yaml: |-
 {{ tpl (.Files.Get (printf "files/connect/%s-forward.yaml" .Values.profile)) . | indent 4 }}
 {{- end }}
-{{- if .Values.connect.sink.enabled }}
+{{- /* One reverse pipeline ConfigMap per ENABLED sinkGroup (design D3). The sole
+     "default" group renders name connect-sink-pipeline with durable cdc_sink —
+     byte-identical to the pre-D3 single sink. .Group is passed into tpl so
+     cdc-reverse.yaml binds this group's per-group durable. */ -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}
+{{- if $g.enabled }}
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" "connect-sink-pipeline") }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" $g.pipelineBase) }}
   labels:
-    app: connect-sink
+    app: {{ $g.appLabel }}
 data:
   pipeline.yaml: |-
-{{ tpl (.Files.Get (printf "files/connect/%s-reverse.yaml" .Values.profile)) . | indent 4 }}
+{{ tpl ($.Files.Get (printf "files/connect/%s-reverse.yaml" $.Values.profile)) (merge (dict "Group" $g) $) | indent 4 }}
+{{- end }}
 {{- end }}

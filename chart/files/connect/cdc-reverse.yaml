@@ -30,7 +30,7 @@ input:
     auth:
       user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
-    durable: {{ .Values.nats.stream.consumer.durable | quote }}
+    durable: {{ .Group.durable | quote }}
     # bind:true => attach to the EXISTING pull consumer the nats-init Job (or
     # scripts/create-consumer.sh) created server-side. Without bind, this input
     # would instead create a durable PUSH consumer. In pull(bind) mode Redpanda

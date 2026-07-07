@@ -1,27 +1,37 @@
 {{/*
-RBAC for the elector sidecars. Each connect leg (source, sink) runs its own
-client-go leader election against a coordination.k8s.io Lease, so each leg gets
-its own ServiceAccount + Role + RoleBinding. The verbs below are exactly what
-client-go's LeaseLock needs: get/create the Lease, then watch/update/patch it to
-renew. Without this grant the elector cannot acquire leadership and every pod
-stays a fail-closed standby (no stream).
+RBAC for the elector sidecars. The source leg runs one client-go leader election
+against a coordination.k8s.io Lease; the sink leg runs ONE election PER sinkGroup
+(design D3), so each enabled group gets its own ServiceAccount + Role + RoleBinding
+(names connect-sink-<name>-elector; connect-sink-elector for the sole "default"
+group — byte-identical to the pre-D3 chart). The verbs are exactly what client-go's
+LeaseLock needs: get/create the Lease, then watch/update/patch it to renew.
 */}}
 {{- if .Values.rbac.enabled }}
-{{- range $leg := list "connect-source" "connect-sink" }}
-{{- $sa := printf "%s-elector" $leg }}
+{{- $sas := list (dict "app" "connect-source" "base" "connect-source-elector") -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) -}}
+{{- if $g.enabled -}}
+{{- $sas = append $sas (dict "app" $g.appLabel "base" $g.saBase) -}}
+{{- end -}}
+{{- end -}}
+{{- $first := true -}}
+{{- range $s := $sas }}
+{{- if not $first }}
+---
+{{- end }}
+{{- $first = false }}
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" $s.base) }}
   labels:
-    app: {{ $leg }}
+    app: {{ $s.app }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" $s.base) }}
   labels:
-    app: {{ $leg }}
+    app: {{ $s.app }}
 rules:
   - apiGroups:
       - coordination.k8s.io
@@ -38,18 +48,15 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" $s.base) }}
   labels:
-    app: {{ $leg }}
+    app: {{ $s.app }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
-  name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" $s.base) }}
 subjects:
   - kind: ServiceAccount
-    name: {{ include "rrcs.name" (dict "root" $ "base" $sa) }}
-{{- if ne $leg "connect-sink" }}
----
-{{- end }}
+    name: {{ include "rrcs.name" (dict "root" $ "base" $s.base) }}
 {{- end }}
 {{- end }}

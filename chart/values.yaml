@@ -174,6 +174,12 @@ connect:
     # Render the reverse (sink) leg: Deployment, headless Service, and its
     # pipeline ConfigMap. Disabling stops NATS→region-Redis applies; JetStream
     # retains messages (subject to stream limits) until a sink binds again.
+    #
+    # LEGACY SINGLE-SINK BLOCK. When connect.sinkGroups (below) is empty/unset the
+    # chart synthesises exactly ONE sink group named "default" from these keys plus
+    # nats.stream.consumer.* — so the default render is byte-for-byte identical to
+    # the pre-multi-subject chart. These keys are ALSO the inheritance source for
+    # any group that omits a field (group -> sinkDefaults -> here).
     enabled: true
     replicas: 3
     streamID: reverse_leg
@@ -182,6 +188,68 @@ connect:
       duration: 6s
       renewDeadline: 4s
       retryPeriod: 1s
+
+  # ── Multi-subject sink groups (design D3) ──────────────────────────────────
+  # Split the sink leg into N groups, each = (durable pull consumer × filter
+  # subject × sink Deployment × Lease/elector), so key-prefix-routed messages
+  # apply in parallel. EMPTY/UNSET => one implicit "default" group == the legacy
+  # connect.sink.* block above (byte-identical default render).
+  #
+  # Each group element:
+  #   name:      DNS-1123 + NATS-token safe (^[a-z0-9]([a-z0-9-]*[a-z0-9])?$).
+  #              Used in every derived name (connect-sink-<name>, cdc_sink_<name>,
+  #              connect-sink-<name>-elector). "default" is special: no suffix, so
+  #              it reproduces today's names verbatim. Reused names fail-loud.
+  #   enabled:   per-group toggle (INV-3). false => NONE of this group's objects
+  #              render (Deployment/Service/pipeline CM/Lease/SA/Role/RoleBinding)
+  #              and its durable is neither created nor pruned by nats-init.
+  #   Routing — set at most ONE of:
+  #     prefixes:      key-prefix tokens this group owns; the chart derives the
+  #                    consumer filter kv.cdc.<prefix>.> for each (union if many)
+  #                    and turns ON forward-leg prefix routing (publish subject
+  #                    becomes kv.cdc.<kv_prefix>.<op>). Requires the writer/keys
+  #                    to carry a prefix segment (design §3).
+  #     filterSubject: explicit NATS filter subject (escape hatch, non-prefix).
+  #     (neither) => the group filters the whole stream kv.cdc.> (the default).
+  #   mode:      "ha" (default) = Lease-elected single active puller per group
+  #              (INV-1 row 10 held per group). "shared" (concurrent pullers) is a
+  #              documented follow-up (§10.4) and currently fails-loud at render.
+  #   streamID:  streams-mode id the elector POSTs (per-group unique; default
+  #              "reverse_leg" for "default", else "reverse_leg_<name>").
+  #   replicas / consumer.{ackWait,maxAckPending,maxDeliver} / lease.{duration,
+  #   renewDeadline,retryPeriod} / resources: per-group overrides; unset keys
+  #   inherit connect.sinkDefaults then the legacy connect.sink.* / consumer.*.
+  #
+  # INV-1: consumer.maxDeliver MUST stay -1 and ackWait finite for EVERY group
+  # (per-group at-least-once). maxAckPending is a redelivery/memory bound, NOT a
+  # throughput knob (the pull input keeps ~1 fetch in flight regardless — §10.1).
+  #
+  # NATS auth: running >1 group needs the subscriber creds to cover per-group
+  # durable names. Re-run scripts/gen-nats-auth.sh --force (it now grants
+  # $JS.API.CONSUMER.*.KV_CDC.* wildcard) and commit chart/files/nats-auth/. The
+  # default single "default"/cdc_sink install works on the existing grant.
+  #
+  # Example (4 prefix groups, each its own active puller):
+  #   sinkGroups:
+  #     - { name: a, prefixes: [prefix-a] }
+  #     - { name: b, prefixes: [prefix-b] }
+  #     - { name: c, prefixes: [prefix-c] }
+  #     - { name: d, prefixes: [prefix-d], consumer: { maxAckPending: 8192 } }
+  sinkGroups: []
+
+  # Defaults every sinkGroup inherits when it omits a key (group -> sinkDefaults
+  # -> legacy connect.sink.* / nats.stream.consumer.*). Leave empty to inherit the
+  # legacy values verbatim (keeps the default render byte-identical).
+  sinkDefaults: {}
+    # replicas: 3
+    # consumer:
+    #   ackWait: "30s"
+    #   maxAckPending: 1024
+    #   maxDeliver: -1
+    # lease:
+    #   duration: 6s
+    #   renewDeadline: 4s
+    #   retryPeriod: 1s
 
 elector:
   pullPolicy: ""            # "" => inherit images.pullPolicy
