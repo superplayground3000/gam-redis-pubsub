@@ -7,8 +7,8 @@
 #   L4  failover chaos                             (~12 min; opt-in: RUN_FAILOVER=1)
 # CI runs this with SKIP_L2=1 SKIP_L3=1 (no docker-heavy tiers on PR).
 # RUN_PREFIX=1 additionally runs the multi-subject sink-group variants (design D3)
-#   in a SEPARATE namespace cdc-mg: verify-cdc-prefix.sh at L3 and (with
-#   RUN_FAILOVER=1) verify-failover-prefix.sh at L4. Needs the wildcard subscriber
+#   in a SEPARATE namespace cdc-mg: verify-cdc-prefix.sh + verify-cdc-twoseg.sh at
+#   L3 and (with RUN_FAILOVER=1) verify-failover-prefix.sh at L4. Needs the wildcard subscriber
 #   grant (committed) — see scripts/gen-nats-auth.sh / values connect.sinkGroups.
 # Env knobs: KIND_NAME (default cdc), RRCS_NS (default cdc-k8s), RRCS_RELEASE (default cdc).
 set -uo pipefail
@@ -161,6 +161,7 @@ else
   scripts/verify-cdc.sh || fail L3
   if [ "${RUN_PREFIX:-0}" = "1" ]; then
     RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-cdc-prefix.sh || fail L3
+    RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-cdc-twoseg.sh || fail L3
   fi
   pass L3
 fi
