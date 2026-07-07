@@ -105,12 +105,20 @@ done
 newA="$(holder "$LEASE_A")"
 log "group-a failed over: $victim -> $newA"
 
-# settle: region stops growing.
-log "waiting for region to settle (stop growing) ..."
-prev=-1; stable=0; deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
+# settle: a complete region (NA+NB) ends the wait immediately; otherwise only
+# conclude "stopped growing" after the count has been stable LONGER than the
+# ackWait redelivery horizon (30s). A message that was in-flight (delivered,
+# unacked) on the killed leader redelivers only after ackWait expires, so a
+# short stable window (the old 3x3s=9s) false-fails with a one-message
+# shortfall that lands seconds later (seen 2026-07-07: settle at 19999/20000,
+# all 20000 present moments after exit). 15x3s=45s > ackWait 30s.
+log "waiting for region to settle (complete, or stable past the ackWait horizon) ..."
+want_total=$(( NA + NB )); prev=-1; stable=0
+deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
 while (( $(date +%s) < deadline )); do
   cur="$(cnt "prefix-*")"
-  if (( cur == prev )); then stable=$(( stable+1 )); (( stable>=3 )) && break; else stable=0; fi
+  (( cur == want_total )) && break
+  if (( cur == prev )); then stable=$(( stable+1 )); (( stable>=15 )) && break; else stable=0; fi
   prev="$cur"; sleep 3
 done
 
