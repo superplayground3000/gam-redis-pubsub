@@ -14,6 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 IMG="${CONNECT_IMAGE:-hpdevelop/connect:4.92.0-claudefix}"
 WORK="$(mktemp -d)"; trap 'rm -rf "$WORK"' EXIT
+chmod 755 "$WORK"   # mktemp -d gives 0700; the connect container runs non-root and must read the mount
 log() { echo "[test-routing] $*"; }
 die() { echo "[test-routing] FAIL: $*" >&2; exit 1; }
 
