@@ -269,12 +269,15 @@ named "default" whose every field resolves to today's legacy single-sink values
 (connect.sink.* + nats.stream.consumer.*), so the default render is byte-for-byte
 identical to the pre-D3 chart (design §1). Field resolution precedence:
   group value  ->  connect.sinkDefaults  ->  legacy connect.sink.* / consumer.*
-Each element carries: name enabled isDefault prefixed durable filter streamID
-replicas ackWait maxAckPending maxDeliver leaseDuration renewDeadline retryPeriod
-deployBase pipelineBase saBase appLabel.
-Validation (fail-loud at render): DNS-1123 + NATS-token name/prefix (design §7),
-prefixes XOR filterSubject, mode ("ha" only in this pass), and the 57-char name
-budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
+Each element carries: name enabled isDefault prefixed prefixes catchAll durable
+filter streamID replicas ackWait maxAckPending maxDeliver leaseDuration
+renewDeadline retryPeriod deployBase pipelineBase saBase appLabel.
+Validation (fail-loud at render): DNS-1123 name; prefix grammar ^seg(:seg)?$
+with seg=[a-z0-9]([a-z0-9_-]*[a-z0-9])? (first-two-seg routing); reserved first
+segments "others"/"unknown"; duplicate-prefix and 1-seg/2-seg overlap checks
+across enabled groups; prefixes XOR filterSubject XOR catchAll; at most one
+enabled catchAll and only alongside >=1 enabled prefixed group; mode ("ha" only
+in this pass); the 57-char name budget.
 */}}
 {{- define "rrcs.connect.sinkGroups" -}}
 {{- $root := . -}}
@@ -288,11 +291,21 @@ budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
 {{- $legCons := $v.nats.stream.consumer -}}
 {{- $baseDurable := $legCons.durable -}}
 {{- $tokenRe := "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" -}}
+{{- /* Key-prefix grammar: ONE or TWO ':'-separated segments (first-two-seg
+     routing). Segment charset [a-z0-9_-], alnum first+last: '_' is legal in a
+     NATS subject token and needed for real prefixes like tg:caveat_context;
+     ':' is NOT legal in a subject token, so rrcs.connect.routeMap maps it to
+     '.' (tg:caveat -> subject kv.cdc.tg.caveat.<op>, filter kv.cdc.tg.caveat.>;
+     the stream binds kv.cdc.> so subject depth is free). */ -}}
+{{- $prefixRe := "^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(:[a-z0-9]([a-z0-9_-]*[a-z0-9])?)?$" -}}
 {{- $groups := $v.connect.sinkGroups -}}
 {{- if not $groups -}}
 {{-   $groups = list (dict "name" "default" "enabled" $legSink.enabled) -}}
 {{- end -}}
 {{- $out := list -}}
+{{- $seenPrefixes := dict -}}
+{{- $catchAllCount := 0 -}}
+{{- $anyPrefixedEnabled := false -}}
 {{- range $g := $groups -}}
 {{-   $name := $g.name | default "default" -}}
 {{-   if not (regexMatch $tokenRe $name) -}}
@@ -307,22 +320,43 @@ budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
 {{-   if eq (kindOf $enabled) "invalid" -}}{{- $enabled = true -}}{{- end -}}
 {{-   $prefixes := $g.prefixes | default list -}}
 {{-   $filterSubject := $g.filterSubject | default "" -}}
+{{-   $catchAll := $g.catchAll | default false -}}
+{{-   if and $catchAll $isDefault -}}
+{{-     fail "connect.sinkGroups: the \"default\" group cannot be catchAll (default = the legacy whole-stream sink; name the catch-all group e.g. \"others\")" -}}
+{{-   end -}}
+{{-   if and $catchAll (or (gt (len $prefixes) 0) (ne $filterSubject "")) -}}
+{{-     fail (printf "connect.sinkGroups[%s]: catchAll=true excludes prefixes and filterSubject (the catch-all filter is derived: %s.others.>)" $name $prefix) -}}
+{{-   end -}}
 {{-   if and (gt (len $prefixes) 0) (ne $filterSubject "") -}}
 {{-     fail (printf "connect.sinkGroups[%s]: set only ONE of prefixes or filterSubject, not both" $name) -}}
 {{-   end -}}
 {{-   $prefixed := gt (len $prefixes) 0 -}}
 {{-   $filter := printf "%s.>" $prefix -}}
 {{-   if $prefixed -}}
+{{-     if $enabled -}}{{- $anyPrefixedEnabled = true -}}{{- end -}}
 {{-     $subs := list -}}
 {{-     range $p := $prefixes -}}
-{{-       if not (regexMatch $tokenRe $p) -}}
-{{-         fail (printf "connect.sinkGroups[%s].prefixes: %q is not a valid NATS+DNS token (^[a-z0-9]([a-z0-9-]*[a-z0-9])?$)" $name $p) -}}
+{{-       if not (regexMatch $prefixRe $p) -}}
+{{-         fail (printf "connect.sinkGroups[%s].prefixes: %q must be one or two ':'-separated segments, each matching ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (e.g. \"tg:caveat\", \"tg:caveat_context\", \"prefix-a\")" $name $p) -}}
 {{-       end -}}
-{{-       $subs = append $subs (printf "%s.%s.>" $prefix $p) -}}
+{{-       $seg0 := index (splitList ":" $p) 0 -}}
+{{-       if or (eq $seg0 "others") (eq $seg0 "unknown") -}}
+{{-         fail (printf "connect.sinkGroups[%s].prefixes: %q — first segment %q is reserved (\"others\" is the catch-all subject token; \"unknown\" is the retired legacy parking token)" $name $p $seg0) -}}
+{{-       end -}}
+{{-       if $enabled -}}
+{{-         if hasKey $seenPrefixes $p -}}
+{{-           fail (printf "connect.sinkGroups[%s].prefixes: %q is already owned by enabled group %q — a prefix may belong to exactly one enabled group" $name $p (get $seenPrefixes $p)) -}}
+{{-         end -}}
+{{-         $_ := set $seenPrefixes $p $name -}}
+{{-       end -}}
+{{-       $subs = append $subs (printf "%s.%s.>" $prefix (replace ":" "." $p)) -}}
 {{-     end -}}
 {{-     $filter = join "," $subs -}}
 {{-   else if ne $filterSubject "" -}}
 {{-     $filter = $filterSubject -}}
+{{-   else if $catchAll -}}
+{{-     if $enabled -}}{{- $catchAllCount = add1 $catchAllCount -}}{{- end -}}
+{{-     $filter = printf "%s.others.>" $prefix -}}
 {{-   end -}}
 {{-   $durable := $baseDurable -}}
 {{-   $deployBase := "connect-sink" -}}
@@ -347,6 +381,8 @@ budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
              "enabled" $enabled
              "isDefault" $isDefault
              "prefixed" $prefixed
+             "prefixes" $prefixes
+             "catchAll" $catchAll
              "durable" $durable
              "filter" $filter
              "streamID" ($g.streamID | default $streamID)
@@ -362,6 +398,21 @@ budget. "shared" mode (concurrent pullers) is a documented follow-up (§10.4).
              "saBase" $saBase
              "appLabel" $deployBase -}}
 {{-   $out = append $out $elem -}}
+{{- end -}}
+{{- if gt $catchAllCount 1 -}}
+{{-   fail "connect.sinkGroups: at most ONE enabled catchAll group (two would double-deliver kv.cdc.others.>)" -}}
+{{- end -}}
+{{- if and (gt $catchAllCount 0) (not $anyPrefixedEnabled) -}}
+{{-   fail "connect.sinkGroups: a catchAll group requires at least one enabled group with prefixes — without prefix routing the forward leg publishes <subjectPrefix>.<op> and the catch-all filter <subjectPrefix>.others.> would never match" -}}
+{{- end -}}
+{{- range $p1x, $own1 := $seenPrefixes -}}
+{{-   if not (contains ":" $p1x) -}}
+{{-     range $p2x, $own2 := $seenPrefixes -}}
+{{-       if hasPrefix (printf "%s:" $p1x) $p2x -}}
+{{-         fail (printf "connect.sinkGroups: prefixes %q (group %q) and %q (group %q) overlap — consumer filter %s.%s.> would ALSO match every %s.%s.<op> subject (double delivery). Use explicit two-segment prefixes instead of the bare %q." $p1x $own1 $p2x $own2 $prefix $p1x $prefix (replace ":" "." $p2x) $p1x) -}}
+{{-       end -}}
+{{-     end -}}
+{{-   end -}}
 {{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
@@ -388,6 +439,43 @@ observability ConfigMap). Default single-group => equals connect.sink.enabled.
 {{- $any := false -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
 {{- if $g.enabled -}}{{- $any = true -}}{{- end -}}
+{{- end -}}
+{{- ternary "true" "false" $any -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.routeMap — JSON object {rawKeyPrefix: subjectToken} over every
+ENABLED prefixed sinkGroup, e.g. {"prefix-a":"prefix-a","tg:caveat":"tg.caveat"}.
+Rendered into the forward leg's routing mapping as a Bloblang object literal
+(JSON is valid Bloblang; toJson emits sorted keys => deterministic render, so
+the pipeline ConfigMap checksum is stable). Token = prefix with ':' -> '.'
+(':' is illegal in a NATS subject token): a two-segment prefix publishes to
+<subjectPrefix>.<seg0>.<seg1>.<op> and its group's consumer filters
+<subjectPrefix>.<seg0>.<seg1>.> — the stream binds <subjectPrefix>.> (any depth).
+*/}}
+{{- define "rrcs.connect.routeMap" -}}
+{{- $m := dict -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if and $g.enabled $g.prefixed -}}
+{{- range $p := $g.prefixes -}}
+{{- $_ := set $m $p (replace ":" "." $p) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}
+{{- $m | toJson -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.hasCatchAll — "true" iff an ENABLED catchAll sinkGroup exists.
+Gates the forward leg's no_match counter branch: with a catch-all deployed a
+set-miss is ROUTED traffic (cdc_forward_others); without one it PARKS on
+<subjectPrefix>.others.<op> (cdc_forward_unrouted{reason=no_match} => the
+existing CDCForwardUnrouted alert fires, unchanged).
+*/}}
+{{- define "rrcs.connect.hasCatchAll" -}}
+{{- $any := false -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if and $g.enabled $g.catchAll -}}{{- $any = true -}}{{- end -}}
 {{- end -}}
 {{- ternary "true" "false" $any -}}
 {{- end -}}
