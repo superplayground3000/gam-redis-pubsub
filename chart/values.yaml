@@ -394,6 +394,18 @@ resources:
     limits:
       cpu: 250m
       memory: 128Mi
+  # Shared block for the connect-leg startup-gate sidecars (wait-redis-*,
+  # wait-stream, wait-consumer). They run a cheap wait loop, then idle on
+  # `sleep infinity` so they stay execable as online debug shells (nats /
+  # redis-cli against the real creds + network). Minimum footprint — they do
+  # nothing until you exec in.
+  waitGate:
+    requests:
+      cpu: 10m
+      memory: 16Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
 
 # Observability artifacts for an EXISTING cluster monitoring stack. The chart ships
 # a Grafana dashboard, a PrometheusRule alert, and a ServiceMonitor — but NOT

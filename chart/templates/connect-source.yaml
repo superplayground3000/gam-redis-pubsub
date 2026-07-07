@@ -23,27 +23,51 @@ spec:
       serviceAccountName: {{ include "rrcs.name" (dict "root" $ "base" "connect-source-elector") }}
       {{- include "rrcs.imagePullSecrets" . | nindent 6 }}
       {{- include "rrcs.scheduling" . | nindent 6 }}
+      # Native sidecars (initContainer + restartPolicy: Always). Each runs the
+      # original wait loop, then touches a gate file and idles on `sleep
+      # infinity` so it stays alive as an online debug shell (exec in for
+      # redis-cli / nats against the real creds + network). Startup ordering is
+      # preserved by the startupProbe on the gate file: Kubernetes holds the
+      # main containers until each sidecar's startupProbe passes, exactly as the
+      # old init-then-exit gate did (the sink's bind:true input still must not
+      # start before its consumer exists).
       initContainers:
         - name: wait-redis-central
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.redis.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          restartPolicy: Always
           command:
             - /bin/sh
             - -c
           args:
-            - {{ include "rrcs.redis.central.waitCmd" . }}
+            - {{ include "rrcs.redis.central.waitCmd" . }} ; touch /tmp/gate-ready ; sleep infinity
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/gate-ready"]
+            periodSeconds: 5
+            failureThreshold: 720   # ~1h: approximate the old gate's wait-forever behaviour
+          resources:
+            {{- toYaml .Values.resources.waitGate | nindent 12 }}
         - name: wait-stream
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          restartPolicy: Always
           command:
             - /bin/sh
             - -c
           args:
-            - until nats --server {{ include "rrcs.nats.url" . | quote }} --creds /etc/nats-creds/publisher/user.creds stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done
+            - until nats --server {{ include "rrcs.nats.url" . | quote }} --creds /etc/nats-creds/publisher/user.creds stream info {{ .Values.nats.stream.name }} >/dev/null 2>&1; do echo waiting stream; sleep 1; done ; touch /tmp/gate-ready ; sleep infinity
+          startupProbe:
+            exec:
+              command: ["/bin/sh", "-c", "test -f /tmp/gate-ready"]
+            periodSeconds: 5
+            failureThreshold: 720   # ~1h: approximate the old gate's wait-forever behaviour
           volumeMounts:
             - name: nats-creds
               mountPath: /etc/nats-creds/publisher
               readOnly: true
+          resources:
+            {{- toYaml .Values.resources.waitGate | nindent 12 }}
       containers:
         - name: connect
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.connect.image) }}
