@@ -204,13 +204,26 @@ connect:
   #              render (Deployment/Service/pipeline CM/Lease/SA/Role/RoleBinding)
   #              and its durable is neither created nor pruned by nats-init.
   #   Routing — set at most ONE of:
-  #     prefixes:      key-prefix tokens this group owns; the chart derives the
-  #                    consumer filter kv.cdc.<prefix>.> for each (union if many)
-  #                    and turns ON forward-leg prefix routing (publish subject
-  #                    becomes kv.cdc.<kv_prefix>.<op>). Requires the writer/keys
-  #                    to carry a prefix segment (design §3).
+  #     prefixes:      key prefixes this group owns: ONE or TWO ':'-separated
+  #                    segments, each ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (e.g.
+  #                    "prefix-a", "tg:caveat", "tg:caveat_context"). ':' is not
+  #                    a legal NATS subject character, so the subject token is
+  #                    the prefix with ':' -> '.': filter kv.cdc.tg.caveat.>,
+  #                    publish kv.cdc.tg.caveat.<op> (union if many; turns ON
+  #                    forward-leg prefix routing). Matching is set-based and
+  #                    longest-first: a key matches its first-two-seg prefix,
+  #                    then its first-one-seg prefix, else routes to "others".
+  #                    First segments "others"/"unknown" are reserved; a one-seg
+  #                    prefix overlapping a two-seg one (tg + tg:caveat) and
+  #                    duplicate prefixes across enabled groups fail the render.
   #     filterSubject: explicit NATS filter subject (escape hatch, non-prefix).
-  #     (neither) => the group filters the whole stream kv.cdc.> (the default).
+  #     catchAll:      true => this group consumes kv.cdc.others.>: every event
+  #                    whose key matches NO configured prefix (counted by
+  #                    cdc_forward_others). At most one enabled catchAll group,
+  #                    only alongside >=1 enabled prefixes group. WITHOUT a
+  #                    catchAll group, unmatched events park on kv.cdc.others.<op>
+  #                    and fire CDCForwardUnrouted (reason=no_match).
+  #     (none)      => the group filters the whole stream kv.cdc.> (the default).
   #   mode:      "ha" (default) = Lease-elected single active puller per group
   #              (INV-1 row 10 held per group). "shared" (concurrent pullers) is a
   #              documented follow-up (§10.4) and currently fails-loud at render.
@@ -229,12 +242,19 @@ connect:
   # $JS.API.CONSUMER.*.KV_CDC.* wildcard) and commit chart/files/nats-auth/. The
   # default single "default"/cdc_sink install works on the existing grant.
   #
-  # Example (4 prefix groups, each its own active puller):
+  # Example — first-two-segment routing for the tg:* key families
+  # (docs/requests/first-two-seg-routing.md), plus the others catch-all:
   #   sinkGroups:
-  #     - { name: a, prefixes: [prefix-a] }
-  #     - { name: b, prefixes: [prefix-b] }
-  #     - { name: c, prefixes: [prefix-c] }
-  #     - { name: d, prefixes: [prefix-d], consumer: { maxAckPending: 8192 } }
+  #     - { name: caveat,         prefixes: ["tg:caveat"] }
+  #     - { name: caveat-context, prefixes: ["tg:caveat_context"] }
+  #     - { name: g2m,            prefixes: ["tg:g2m"] }
+  #     - { name: m2g,            prefixes: ["tg:m2g"] }
+  #     - { name: r2g,            prefixes: ["tg:r2g"] }
+  #     - { name: uint32id,       prefixes: ["tg:uint32id"] }
+  #     - { name: others,         catchAll: true }
+  # Durables become cdc_sink_caveat ... cdc_sink_others; a key like
+  # tg:caveat:123 publishes to kv.cdc.tg.caveat.<op>; any other key (e.g.
+  # tg:new_family:1) flows to kv.cdc.others.<op> via the others group.
   sinkGroups: []
 
   # Defaults every sinkGroup inherits when it omits a key (group -> sinkDefaults

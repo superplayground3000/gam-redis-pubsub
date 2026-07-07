@@ -39,11 +39,13 @@ groups:
             maxDeliver=-1 these redeliver until removed. Inspect the JetStream durable
             consumer and the poison message. The alert clears ~2m after the last
             redelivery once the poison is cleared.
-      # Forward-leg routing miss (multi-subject / design §3.1). Fires when the
-      # source cannot derive a key-prefix and publishes to kv.cdc.unknown.<op>,
-      # which NO sink group filters — the event parks in the stream unconsumed.
-      # Only ever nonzero when prefix routing is configured (the counter is emitted
-      # by a gated processor). METRIC NAME: cdc_forward_unrouted scrapes as
+      # Forward-leg routing miss (first-two-seg routing). Fires when an event
+      # ends up PARKED on kv.cdc.others.<op> with nothing consuming it:
+      # reason=empty_prefix (no derivable key segment — malformed event) or
+      # reason=no_match with NO catchAll group deployed. With a catchAll group
+      # the same miss is routed traffic and counts cdc_forward_others instead
+      # (dashboard panel 12; deliberately not alerted). Only ever nonzero when
+      # prefix routing is configured. METRIC NAME: cdc_forward_unrouted scrapes as
       # cdc_forward_unrouted or _total; the full-string __name__ regex matches both
       # and excludes the OpenMetrics _created series.
       - alert: CDCForwardUnrouted
@@ -58,8 +60,8 @@ groups:
           summary: "CDC forward leg produced unroutable events (reason={{ $labels.reason }})"
           description: >-
             The CDC forward leg in namespace {{ $labels.namespace }} (job {{ $labels.job }})
-            published events with no derivable key-prefix to kv.cdc.unknown.<op>, a
-            subject no sink group filters — they accumulate in the stream unconsumed.
-            Check the writer's key format / prefix derivation (design §3.1). Add a
-            sink group that filters the missing prefix, or fix the key so a prefix
-            can be derived.
+            published events to kv.cdc.others.<op> with nothing consuming them
+            (reason=empty_prefix: malformed key; reason=no_match: no catchAll
+            group deployed) — they accumulate in the stream unconsumed. Fix the
+            writer's key format, add a sink group whose prefixes cover the
+            missing key family, or deploy a catchAll: true group to drain them.
