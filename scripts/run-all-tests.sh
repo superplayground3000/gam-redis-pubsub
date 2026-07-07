@@ -6,6 +6,10 @@
 #   L3  kind e2e build-images + verify-cdc         (~5 min; skip: SKIP_L3=1)
 #   L4  failover chaos                             (~12 min; opt-in: RUN_FAILOVER=1)
 # CI runs this with SKIP_L2=1 SKIP_L3=1 (no docker-heavy tiers on PR).
+# RUN_PREFIX=1 additionally runs the multi-subject sink-group variants (design D3)
+#   in a SEPARATE namespace cdc-mg: verify-cdc-prefix.sh at L3 and (with
+#   RUN_FAILOVER=1) verify-failover-prefix.sh at L4. Needs the wildcard subscriber
+#   grant (committed) — see scripts/gen-nats-auth.sh / values connect.sinkGroups.
 # Env knobs: KIND_NAME (default cdc), RRCS_NS (default cdc-k8s), RRCS_RELEASE (default cdc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -112,12 +116,18 @@ if [ "${SKIP_L3:-0}" = "1" ]; then
 else
   scripts/build-images.sh --kind --kind-name="$KIND_NAME" || fail L3
   scripts/verify-cdc.sh || fail L3
+  if [ "${RUN_PREFIX:-0}" = "1" ]; then
+    RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-cdc-prefix.sh || fail L3
+  fi
   pass L3
 fi
 
 echo "[run-all-tests] == L4: failover chaos =="
 if [ "${RUN_FAILOVER:-0}" = "1" ]; then
   scripts/verify-failover.sh || fail L4
+  if [ "${RUN_PREFIX:-0}" = "1" ]; then
+    RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-failover-prefix.sh || fail L4
+  fi
   pass L4
 else
   skip L4 "opt-in via RUN_FAILOVER=1"

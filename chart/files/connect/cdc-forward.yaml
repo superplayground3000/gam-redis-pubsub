@@ -88,8 +88,8 @@ pipeline:
         # message parks in the stream instead of vanishing — surfaced by the
         # cdc_forward_unrouted counter added with the per-group dashboard work).
         let raw_key    = meta("kv_key").or(meta("new_key")).or("")
-        let seg        = raw_key.split(":").index(0)
-        meta kv_prefix = if seg == null || seg == "" { "unknown" } else { seg }
+        let seg        = $raw_key.split(":").index(0)
+        meta kv_prefix = if $seg == null || $seg == "" { "unknown" } else { $seg }
         {{- end }}
     {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
     # cdc_forward_unrouted (INV-2 / design §3.1): fires when no key-prefix could be
