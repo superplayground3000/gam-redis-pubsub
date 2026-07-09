@@ -1,0 +1,3 @@
+captured/*.txt
+captured/*.json
+!captured/.gitkeep
