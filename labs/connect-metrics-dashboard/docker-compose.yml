@@ -95,8 +95,11 @@ services:
     command: ["latency-calculator"]
     # REPORT_PATH defaults to /reports/latency-report.json; the k8s chart mounts an
     # emptyDir there (chart/templates/latency-calculator.yaml) — mirror it here so
-    # the report writer doesn't crash-loop on a missing directory.
-    volumes: [ "/reports" ]
+    # the report writer doesn't crash-loop on a missing directory. tmpfs (not an
+    # anonymous volume) because it defaults to mode 1777, writable by the
+    # non-root `app` (uid 10001) user the image runs as; a plain anonymous volume
+    # mounts root:root 0755 and the write fails with permission denied.
+    tmpfs: [ "/reports" ]
     environment:
       REGION_ADDR: "redis-region:6379"
       REGION_CLUSTER: "false"

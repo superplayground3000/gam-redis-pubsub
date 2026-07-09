@@ -1,16 +1,16 @@
 # TYPE cdc_latency_seconds gauge
 cdc_latency_seconds{op="overall",quantile="0.50"} 0.001
 cdc_latency_seconds{op="overall",quantile="0.95"} 0.002
-cdc_latency_seconds{op="overall",quantile="0.99"} 0.002
+cdc_latency_seconds{op="overall",quantile="0.99"} 0.271
 cdc_latency_seconds{op="create",quantile="0.50"} 0.001
 cdc_latency_seconds{op="create",quantile="0.95"} 0.002
-cdc_latency_seconds{op="create",quantile="0.99"} 0.002
+cdc_latency_seconds{op="create",quantile="0.99"} 0.47
 cdc_latency_seconds{op="update",quantile="0.50"} 0.001
 cdc_latency_seconds{op="update",quantile="0.95"} 0.002
-cdc_latency_seconds{op="update",quantile="0.99"} 0.002
+cdc_latency_seconds{op="update",quantile="0.99"} 0.071
 # TYPE cdc_latency_samples gauge
-cdc_latency_samples{op="overall"} 1382
-cdc_latency_samples{op="create"} 748
-cdc_latency_samples{op="update"} 634
+cdc_latency_samples{op="overall"} 810
+cdc_latency_samples{op="create"} 356
+cdc_latency_samples{op="update"} 454
 # TYPE cdc_latency_dropped_negative_total counter
 cdc_latency_dropped_negative_total 0
