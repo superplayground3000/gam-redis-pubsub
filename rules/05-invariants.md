@@ -57,6 +57,15 @@ Duplicates are allowed (absorbed by idempotency); loss is not.
 in this fence-free/no-LWW lab (`docs/nats-jetstream-and-redis-kv-message-flow.md`). Do not
 "fix" it as if it were a loss bug; it is not covered by INV-1.
 
+**Known accepted non-guarantee (same-key, sink failover):** same-key reordering across a
+sink leader failover — the old leader's delivered-but-unacked messages redeliver only
+after `ackWait`, behind newer messages — is *mitigated*, not eliminated: sink electors
+delay their pipeline POST by the group's effective `ackWait` (chart `postDelay`, elector
+`POST_DELAY`; spec `docs/superpowers/specs/2026-07-09-sink-post-delay-design.md`).
+Residual and accepted: an alive-but-partitioned old leader acking/applying late, and a
+new leader crashing mid-apply, can still reorder. The elector remains best-effort
+active-gating, not fencing — ordering must not *depend* on it.
+
 ---
 
 ## INV-2 — Problem-message metrics, seconds histograms, and Grafana visualization
