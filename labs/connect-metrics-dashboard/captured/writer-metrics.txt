@@ -1,0 +1,13 @@
+# TYPE cdc_writer_sent_total counter
+cdc_writer_sent_total 2185
+# TYPE cdc_writer_errors_total counter
+cdc_writer_errors_total 0
+# TYPE cdc_writer_ops_total counter
+cdc_writer_ops_total{op="create"} 925
+cdc_writer_ops_total{op="update"} 805
+cdc_writer_ops_total{op="delete"} 335
+cdc_writer_ops_total{op="rename"} 120
+# TYPE cdc_writer_rate_target gauge
+cdc_writer_rate_target 0
+# TYPE cdc_writer_inflight gauge
+cdc_writer_inflight 0

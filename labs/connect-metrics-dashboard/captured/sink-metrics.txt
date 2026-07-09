@@ -1,0 +1,346 @@
+# HELP cdc_apply Benthos Counter metric
+# TYPE cdc_apply counter
+cdc_apply{label="",op="create",path="root.pipeline.processors.1.switch.1.processors.3",type="hash"} 393
+cdc_apply{label="",op="create",path="root.pipeline.processors.1.switch.1.processors.3",type="string"} 1492
+cdc_apply{label="",op="update",path="root.pipeline.processors.1.switch.1.processors.3",type="hash"} 350
+cdc_apply{label="",op="update",path="root.pipeline.processors.1.switch.1.processors.3",type="string"} 1325
+# HELP input_connection_failed Benthos Counter metric
+# TYPE input_connection_failed counter
+input_connection_failed{label="connect_sink",path="root.input"} 0
+# HELP input_connection_lost Benthos Counter metric
+# TYPE input_connection_lost counter
+input_connection_lost{label="connect_sink",path="root.input"} 0
+# HELP input_connection_up Benthos Counter metric
+# TYPE input_connection_up counter
+input_connection_up{label="connect_sink",path="root.input"} 1
+# HELP input_latency_ns Benthos Timing metric
+# TYPE input_latency_ns histogram
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.005"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.01"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.025"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.05"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.1"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.25"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="0.5"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="1"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="2.5"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="5"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="10"} 4360
+input_latency_ns_bucket{label="connect_sink",path="root.input",le="+Inf"} 4360
+input_latency_ns_sum{label="connect_sink",path="root.input"} 0.8328741569999986
+input_latency_ns_count{label="connect_sink",path="root.input"} 4360
+# HELP input_received Benthos Counter metric
+# TYPE input_received counter
+input_received{label="connect_sink",path="root.input"} 4360
+# HELP output_batch_sent Benthos Counter metric
+# TYPE output_batch_sent counter
+output_batch_sent{label="",path="root.output.reject_errored"} 4360
+# HELP output_connection_failed Benthos Counter metric
+# TYPE output_connection_failed counter
+output_connection_failed{label="",path="root.output.reject_errored"} 0
+# HELP output_connection_lost Benthos Counter metric
+# TYPE output_connection_lost counter
+output_connection_lost{label="",path="root.output.reject_errored"} 0
+# HELP output_connection_up Benthos Counter metric
+# TYPE output_connection_up counter
+output_connection_up{label="",path="root.output.reject_errored"} 1
+# HELP output_error Benthos Counter metric
+# TYPE output_error counter
+output_error{label="",path="root.output.reject_errored"} 0
+# HELP output_latency_ns Benthos Timing metric
+# TYPE output_latency_ns histogram
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.005"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.01"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.025"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.05"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.1"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.25"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="0.5"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="1"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="2.5"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="5"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="10"} 4360
+output_latency_ns_bucket{label="",path="root.output.reject_errored",le="+Inf"} 4360
+output_latency_ns_sum{label="",path="root.output.reject_errored"} 0.0008379809999999991
+output_latency_ns_count{label="",path="root.output.reject_errored"} 4360
+# HELP output_sent Benthos Counter metric
+# TYPE output_sent counter
+output_sent{label="",path="root.output.reject_errored"} 4360
+# HELP processor_batch_received Benthos Counter metric
+# TYPE processor_batch_received counter
+processor_batch_received{label="",path="root.pipeline.processors.0"} 4360
+processor_batch_received{label="",path="root.pipeline.processors.1"} 4360
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 3560
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 3560
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 2817
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 3560
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 3560
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 743
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 2817
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 600
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 200
+processor_batch_received{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+# HELP processor_batch_sent Benthos Counter metric
+# TYPE processor_batch_sent counter
+processor_batch_sent{label="",path="root.pipeline.processors.0"} 4360
+processor_batch_sent{label="",path="root.pipeline.processors.1"} 4360
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 3560
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 3560
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 2817
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 3560
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 3560
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 743
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 2817
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 600
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 200
+processor_batch_sent{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+# HELP processor_error Benthos Counter metric
+# TYPE processor_error counter
+processor_error{label="",path="root.pipeline.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+# HELP processor_latency_ns Benthos Timing metric
+# TYPE processor_latency_ns histogram
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.005"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.01"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.025"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.05"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.25"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="2.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="10"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="+Inf"} 4360
+processor_latency_ns_sum{label="",path="root.pipeline.processors.0"} 0.10510450199999978
+processor_latency_ns_count{label="",path="root.pipeline.processors.0"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.005"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.01"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.025"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.05"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.25"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="2.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="10"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="+Inf"} 4360
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1"} 0.5697404189999982
+processor_latency_ns_count{label="",path="root.pipeline.processors.1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.005"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.01"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.025"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.05"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.25"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="0.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="2.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="10"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.0.processors.1",le="+Inf"} 0
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.005"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.01"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.025"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.05"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.25"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="0.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="2.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="10"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0",le="+Inf"} 3560
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 0.26007048499999924
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.005"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.01"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.025"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.05"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.25"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="0.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="2.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="10"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0",le="+Inf"} 3560
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 0.25370590000000004
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.005"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.01"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.025"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.05"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.1"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.25"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="0.5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="1"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="2.5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="10"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0",le="+Inf"} 2817
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 0.22214486999999938
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.005"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.01"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.025"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.05"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.25"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="0.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="2.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="10"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1",le="+Inf"} 3560
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 0.005942394
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.005"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.01"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.025"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.05"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.25"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="0.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="2.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="10"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0",le="+Inf"} 0
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.005"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.01"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.025"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.05"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.25"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="0.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="1"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="2.5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="5"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="10"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2",le="+Inf"} 3560
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 0.20021723999999994
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 3560
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.005"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.01"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.025"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.05"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.1"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.25"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="0.5"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="1"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="2.5"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="5"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="10"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0",le="+Inf"} 743
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 0.06256541300000003
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 743
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.005"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.01"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.025"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.05"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.1"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.25"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="0.5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="1"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="2.5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="5"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="10"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0",le="+Inf"} 2817
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 0.12148002999999992
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 2817
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.005"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.01"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.025"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.05"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.1"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.25"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="0.5"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="1"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="2.5"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="5"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="10"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.2.processors.0",le="+Inf"} 600
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 0.03672678999999998
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 600
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.005"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.01"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.025"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.05"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.1"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.25"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="0.5"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="1"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="2.5"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="5"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="10"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.3.processors.0",le="+Inf"} 200
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 0.018327960000000004
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 200
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.005"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.01"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.025"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.05"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.25"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="0.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="1"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="2.5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="5"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="10"} 0
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1.switch.4.processors.1",le="+Inf"} 0
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+processor_latency_ns_count{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+# HELP processor_received Benthos Counter metric
+# TYPE processor_received counter
+processor_received{label="",path="root.pipeline.processors.0"} 4360
+processor_received{label="",path="root.pipeline.processors.1"} 4360
+processor_received{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 3560
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 3560
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 2817
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 3560
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 3560
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 743
+processor_received{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 2817
+processor_received{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 600
+processor_received{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 200
+processor_received{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0
+# HELP processor_sent Benthos Counter metric
+# TYPE processor_sent counter
+processor_sent{label="",path="root.pipeline.processors.0"} 4360
+processor_sent{label="",path="root.pipeline.processors.1"} 4360
+processor_sent{label="",path="root.pipeline.processors.1.switch.0.processors.1"} 0
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0"} 3560
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0"} 3560
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.0.try.0.switch.0.processors.0"} 2817
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.1"} 3560
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.1.catch.0"} 0
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2"} 3560
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.0.processors.0"} 743
+processor_sent{label="",path="root.pipeline.processors.1.switch.1.processors.2.switch.1.processors.0"} 2817
+processor_sent{label="",path="root.pipeline.processors.1.switch.2.processors.0"} 600
+processor_sent{label="",path="root.pipeline.processors.1.switch.3.processors.0"} 200
+processor_sent{label="",path="root.pipeline.processors.1.switch.4.processors.1"} 0

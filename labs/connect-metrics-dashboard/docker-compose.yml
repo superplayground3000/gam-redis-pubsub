@@ -68,7 +68,10 @@ services:
     depends_on:
       redis-central: { condition: service_healthy }
       connect-source: { condition: service_healthy }
-    command: ["/usr/local/bin/app","writer"]
+    # Image ENTRYPOINT is `sleep infinity` (k8s-oriented: k8s `command:` overrides
+    # ENTRYPOINT, but compose `command:` only overrides CMD) — override entrypoint here.
+    entrypoint: ["/usr/local/bin/app"]
+    command: ["writer"]
     environment:
       REDIS_ADDR: "redis-central:6379"
       REDIS_CLUSTER: "false"
@@ -88,7 +91,12 @@ services:
     <<: *app
     depends_on:
       redis-region: { condition: service_healthy }
-    command: ["/usr/local/bin/app","latency-calculator"]
+    entrypoint: ["/usr/local/bin/app"]
+    command: ["latency-calculator"]
+    # REPORT_PATH defaults to /reports/latency-report.json; the k8s chart mounts an
+    # emptyDir there (chart/templates/latency-calculator.yaml) — mirror it here so
+    # the report writer doesn't crash-loop on a missing directory.
+    volumes: [ "/reports" ]
     environment:
       REGION_ADDR: "redis-region:6379"
       REGION_CLUSTER: "false"

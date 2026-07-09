@@ -1,0 +1,135 @@
+# HELP cdc_forward_others Benthos Counter metric
+# TYPE cdc_forward_others counter
+cdc_forward_others{label="",path="root.pipeline.processors.1.switch.1.processors.0",reason="no_match"} 4360
+# HELP input_connection_failed Benthos Counter metric
+# TYPE input_connection_failed counter
+input_connection_failed{label="redis_source",path="root.input"} 0
+# HELP input_connection_lost Benthos Counter metric
+# TYPE input_connection_lost counter
+input_connection_lost{label="redis_source",path="root.input"} 0
+# HELP input_connection_up Benthos Counter metric
+# TYPE input_connection_up counter
+input_connection_up{label="redis_source",path="root.input"} 1
+# HELP input_latency_ns Benthos Timing metric
+# TYPE input_latency_ns histogram
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.005"} 4355
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.01"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.025"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.05"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.1"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.25"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="0.5"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="1"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="2.5"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="5"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="10"} 4360
+input_latency_ns_bucket{label="redis_source",path="root.input",le="+Inf"} 4360
+input_latency_ns_sum{label="redis_source",path="root.input"} 1.7263970580000032
+input_latency_ns_count{label="redis_source",path="root.input"} 4360
+# HELP input_received Benthos Counter metric
+# TYPE input_received counter
+input_received{label="redis_source",path="root.input"} 4360
+# HELP output_batch_sent Benthos Counter metric
+# TYPE output_batch_sent counter
+output_batch_sent{label="",path="root.output.fallback.0"} 4360
+output_batch_sent{label="",path="root.output.fallback.1"} 0
+# HELP output_connection_failed Benthos Counter metric
+# TYPE output_connection_failed counter
+output_connection_failed{label="",path="root.output.fallback.0"} 0
+output_connection_failed{label="",path="root.output.fallback.1"} 0
+# HELP output_connection_lost Benthos Counter metric
+# TYPE output_connection_lost counter
+output_connection_lost{label="",path="root.output.fallback.0"} 0
+output_connection_lost{label="",path="root.output.fallback.1"} 0
+# HELP output_connection_up Benthos Counter metric
+# TYPE output_connection_up counter
+output_connection_up{label="",path="root.output.fallback.0"} 1
+output_connection_up{label="",path="root.output.fallback.1"} 1
+# HELP output_error Benthos Counter metric
+# TYPE output_error counter
+output_error{label="",path="root.output.fallback.0"} 0
+output_error{label="",path="root.output.fallback.1"} 0
+# HELP output_latency_ns Benthos Timing metric
+# TYPE output_latency_ns histogram
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.005"} 4355
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.01"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.025"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.05"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.1"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.25"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="0.5"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="1"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="2.5"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="5"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="10"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.0",le="+Inf"} 4360
+output_latency_ns_sum{label="",path="root.output.fallback.0"} 1.2280464650000027
+output_latency_ns_count{label="",path="root.output.fallback.0"} 4360
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.005"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.01"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.025"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.05"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.1"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.25"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="0.5"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="1"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="2.5"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="5"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="10"} 0
+output_latency_ns_bucket{label="",path="root.output.fallback.1",le="+Inf"} 0
+output_latency_ns_sum{label="",path="root.output.fallback.1"} 0
+output_latency_ns_count{label="",path="root.output.fallback.1"} 0
+# HELP output_sent Benthos Counter metric
+# TYPE output_sent counter
+output_sent{label="",path="root.output.fallback.0"} 4360
+output_sent{label="",path="root.output.fallback.1"} 0
+# HELP processor_batch_received Benthos Counter metric
+# TYPE processor_batch_received counter
+processor_batch_received{label="",path="root.pipeline.processors.0"} 4360
+processor_batch_received{label="",path="root.pipeline.processors.1"} 4360
+# HELP processor_batch_sent Benthos Counter metric
+# TYPE processor_batch_sent counter
+processor_batch_sent{label="",path="root.pipeline.processors.0"} 4360
+processor_batch_sent{label="",path="root.pipeline.processors.1"} 4360
+# HELP processor_error Benthos Counter metric
+# TYPE processor_error counter
+processor_error{label="",path="root.pipeline.processors.0"} 0
+processor_error{label="",path="root.pipeline.processors.1"} 0
+# HELP processor_latency_ns Benthos Timing metric
+# TYPE processor_latency_ns histogram
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.005"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.01"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.025"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.05"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.25"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="0.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="2.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="10"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.0",le="+Inf"} 4360
+processor_latency_ns_sum{label="",path="root.pipeline.processors.0"} 0.15041963799999986
+processor_latency_ns_count{label="",path="root.pipeline.processors.0"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.005"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.01"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.025"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.05"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.25"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="0.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="1"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="2.5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="5"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="10"} 4360
+processor_latency_ns_bucket{label="",path="root.pipeline.processors.1",le="+Inf"} 4360
+processor_latency_ns_sum{label="",path="root.pipeline.processors.1"} 0.03837609299999991
+processor_latency_ns_count{label="",path="root.pipeline.processors.1"} 4360
+# HELP processor_received Benthos Counter metric
+# TYPE processor_received counter
+processor_received{label="",path="root.pipeline.processors.0"} 4360
+processor_received{label="",path="root.pipeline.processors.1"} 4360
+# HELP processor_sent Benthos Counter metric
+# TYPE processor_sent counter
+processor_sent{label="",path="root.pipeline.processors.0"} 4360
+processor_sent{label="",path="root.pipeline.processors.1"} 4360
