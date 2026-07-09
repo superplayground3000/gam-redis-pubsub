@@ -124,6 +124,11 @@ spec:
               value: {{ $g.renewDeadline | quote }}
             - name: RETRY_PERIOD
               value: {{ $g.retryPeriod | quote }}
+            # Post-election settle wait: let the previous leader's un-acked
+            # deliveries pass their ackWait before this leg consumes, so they
+            # redeliver AHEAD of newer messages (same-key ordering mitigation).
+            - name: POST_DELAY
+              value: {{ $g.postDelay | quote }}
           ports:
             - containerPort: 8090
           readinessProbe:

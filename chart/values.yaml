@@ -87,6 +87,8 @@ nats:
                             # the CDCUnprocessableMessages alert window in
                             # files/prometheus/cdc-alerts.yaml must stay >= 2x this.
                             # If you raise ackWait, raise that window too.
+                            # Also the default for the sink electors' postDelay
+                            # (post-election settle wait, see connect.sinkGroups).
       maxAckPending: 1024    # max un-acked msgs in flight (sink throughput knob)
       maxDeliver: -1         # -1 = redeliver forever until acked
     maxAge: "1h"
@@ -232,6 +234,12 @@ connect:
   #              documented follow-up (§10.4) and currently fails-loud at render.
   #   streamID:  streams-mode id the elector POSTs (per-group unique; default
   #              "reverse_leg" for "default", else "reverse_leg_<name>").
+  #   postDelay: how long a group's elector waits after WINNING the Lease before
+  #              POSTing the pipeline, so the previous leader's delivered-but-
+  #              unacked messages pass their ackWait and redeliver ahead of newer
+  #              ones (same-key stale-overwrite mitigation on failover; best-effort,
+  #              not fencing). Inherits group -> sinkDefaults -> the group's
+  #              effective consumer.ackWait. "0s" disables (dev / A-B baselines).
   #   replicas / consumer.{ackWait,maxAckPending,maxDeliver} / lease.{duration,
   #   renewDeadline,retryPeriod} / resources: per-group overrides; unset keys
   #   inherit connect.sinkDefaults then the legacy connect.sink.* / consumer.*.
@@ -265,6 +273,7 @@ connect:
   # legacy values verbatim (keeps the default render byte-identical).
   sinkDefaults: {}
     # replicas: 3
+    # postDelay: "30s"
     # consumer:
     #   ackWait: "30s"
     #   maxAckPending: 1024

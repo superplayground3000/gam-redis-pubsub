@@ -269,8 +269,10 @@ named "default" whose every field resolves to today's legacy single-sink values
 (connect.sink.* + nats.stream.consumer.*), so the default render is byte-for-byte
 identical to the pre-D3 chart (design §1). Field resolution precedence:
   group value  ->  connect.sinkDefaults  ->  legacy connect.sink.* / consumer.*
+postDelay (elector post-election settle wait) resolves group.postDelay ->
+sinkDefaults.postDelay -> the group's EFFECTIVE consumer ackWait; "0s" disables.
 Each element carries: name enabled isDefault prefixed prefixes catchAll durable
-filter streamID replicas ackWait maxAckPending maxDeliver leaseDuration
+filter streamID replicas ackWait maxAckPending maxDeliver postDelay leaseDuration
 renewDeadline retryPeriod deployBase pipelineBase saBase appLabel.
 Validation (fail-loud at render): DNS-1123 name; prefix grammar ^seg(:seg)?$
 with seg=[a-z0-9]([a-z0-9_-]*[a-z0-9])? (first-two-seg routing); reserved first
@@ -380,6 +382,7 @@ in this pass); the 57-char name budget.
 {{-   end -}}
 {{-   $glease := $g.lease | default dict -}}
 {{-   $gcons := $g.consumer | default dict -}}
+{{-   $ackWait := $gcons.ackWait | default $defCons.ackWait | default $legCons.ackWait -}}
 {{-   $elem := dict
              "name" $name
              "enabled" $enabled
@@ -391,7 +394,8 @@ in this pass); the 57-char name budget.
              "filter" $filter
              "streamID" ($g.streamID | default $streamID)
              "replicas" ($g.replicas | default $defs.replicas | default $legSink.replicas)
-             "ackWait" ($gcons.ackWait | default $defCons.ackWait | default $legCons.ackWait)
+             "ackWait" $ackWait
+             "postDelay" ($g.postDelay | default $defs.postDelay | default $ackWait)
              "maxAckPending" ($gcons.maxAckPending | default $defCons.maxAckPending | default $legCons.maxAckPending)
              "maxDeliver" ($gcons.maxDeliver | default $defCons.maxDeliver | default $legCons.maxDeliver)
              "leaseDuration" ($glease.duration | default $defLease.duration | default $legLease.duration)
