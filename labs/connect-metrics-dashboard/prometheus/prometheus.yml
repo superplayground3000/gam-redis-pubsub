@@ -1,0 +1,12 @@
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+scrape_configs:
+  - job_name: connect-source
+    static_configs: [{ targets: ["connect-source:4195"], labels: { namespace: "lab", leg: "source" } }]
+  - job_name: connect-sink
+    static_configs: [{ targets: ["connect-sink:4195"], labels: { namespace: "lab", leg: "sink" } }]
+  - job_name: writer
+    static_configs: [{ targets: ["writer:8081"], labels: { namespace: "lab" } }]
+  - job_name: latency-calculator
+    static_configs: [{ targets: ["latency-calculator:8082"], labels: { namespace: "lab" } }]

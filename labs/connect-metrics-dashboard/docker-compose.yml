@@ -1,0 +1,122 @@
+name: lab-connect-metrics-dashboard
+
+x-app: &app
+  build: { context: ../.., dockerfile: Dockerfile }
+  image: cdc-app:lab
+
+services:
+  redis-central:
+    image: redis:7.4-alpine
+    command: ["redis-server","--save","","--appendonly","no","--protected-mode","no"]
+    healthcheck: { test: ["CMD","redis-cli","ping"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  redis-region:
+    image: redis:7.4-alpine
+    command: ["redis-server","--save","","--appendonly","no","--protected-mode","no"]
+    healthcheck: { test: ["CMD","redis-cli","ping"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats:
+    image: nats:2.10-alpine
+    command: ["-js","-m","8222"]
+    healthcheck: { test: ["CMD","wget","-qO-","http://localhost:8222/healthz"], interval: 2s, timeout: 2s, retries: 15 }
+    networks: [lab]
+
+  nats-init:
+    image: natsio/nats-box:0.14.5
+    depends_on: { nats: { condition: service_healthy } }
+    restart: "no"
+    entrypoint: ["/bin/sh","-c"]
+    command:
+      - |
+        set -e
+        nats --server nats://nats:4222 stream add LAB_CDC \
+          --subjects "kv.cdc.>" --storage file --retention limits \
+          --discard old --max-msgs=-1 --max-bytes=-1 --max-age=1h \
+          --dupe-window=5m --replicas=1 --max-msg-size=-1 --defaults
+        nats --server nats://nats:4222 consumer add LAB_CDC cdc_sink \
+          --pull --ack explicit --deliver all --replay instant \
+          --filter "kv.cdc.>" --max-deliver=-1 --wait=30s --max-pending=1024 \
+          --max-waiting=512 --no-headers-only --defaults
+    networks: [lab]
+
+  connect-source:
+    image: hpdevelop/connect:4.92.0-claudefix
+    depends_on:
+      redis-central: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    command: ["run","/etc/connect/source.yaml"]
+    volumes: [ "./connect/source.yaml:/etc/connect/source.yaml:ro" ]
+    ports: ["${SRC_PORT:-14195}:4195"]
+    healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:4195/ping || exit 1"], interval: 5s, timeout: 3s, retries: 15 }
+    networks: [lab]
+
+  connect-sink:
+    image: hpdevelop/connect:4.92.0-claudefix
+    depends_on:
+      redis-region: { condition: service_healthy }
+      nats-init: { condition: service_completed_successfully }
+    command: ["run","/etc/connect/sink.yaml"]
+    volumes: [ "./connect/sink.yaml:/etc/connect/sink.yaml:ro" ]
+    ports: ["${SINK_PORT:-14196}:4195"]
+    healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:4195/ping || exit 1"], interval: 5s, timeout: 3s, retries: 15 }
+    networks: [lab]
+
+  writer:
+    <<: *app
+    depends_on:
+      redis-central: { condition: service_healthy }
+      connect-source: { condition: service_healthy }
+    command: ["/usr/local/bin/app","writer"]
+    environment:
+      REDIS_ADDR: "redis-central:6379"
+      REDIS_CLUSTER: "false"
+      STREAM_KEY: "app.events"
+      HEALTH_ADDR: ":8081"
+      INITIAL_RATE: "0"
+      MAX_RATE: "500"
+      OP_CREATE: "40"
+      OP_UPDATE: "40"
+      OP_DELETE: "15"
+      OP_RENAME: "5"
+    ports: ["${WRITER_PORT:-18081}:8081"]
+    healthcheck: { test: ["CMD-SHELL","wget -qO- http://localhost:8081/healthz || exit 1"], interval: 5s, timeout: 3s, retries: 15 }
+    networks: [lab]
+
+  latency-calculator:
+    <<: *app
+    depends_on:
+      redis-region: { condition: service_healthy }
+    command: ["/usr/local/bin/app","latency-calculator"]
+    environment:
+      REGION_ADDR: "redis-region:6379"
+      REGION_CLUSTER: "false"
+      STREAM: "cdc:latency"
+      METRICS_ADDR: ":8082"
+    networks: [lab]
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    depends_on: [connect-source, connect-sink]
+    command: ["--config.file=/etc/prometheus/prometheus.yml","--storage.tsdb.retention.time=2h"]
+    ports: ["${PROM_PORT:-19090}:9090"]
+    volumes: [ "./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro" ]
+    networks: [lab]
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    depends_on: [prometheus]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      GF_USERS_DEFAULT_THEME: light
+    ports: ["${GRAFANA_PORT:-13000}:3000"]
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ../../chart/files/grafana:/var/lib/grafana/dashboards:rw
+    networks: [lab]
+
+networks:
+  lab: {}
