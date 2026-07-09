@@ -43,10 +43,11 @@
         { "expr": "sum(rate(cdc_writer_errors_total{namespace=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "errors" }
       ] },
     { "id": 9, "title": "Elector leadership & lease ops", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
-      "description": "elector_leading per pod (1 = holds the Lease; exactly one per leg) and stream POST/DELETE error rate. Scoped by namespace only.",
+      "description": "elector_leading per pod (1 = leading with pipeline POSTed; exactly one per leg — a Lease holder waiting out its postDelay settle window reports 0) and stream POST/DELETE error rate. Scoped by namespace only.",
       "targets": [
         { "expr": "elector_leading{namespace=~\"$namespace\"}", "legendFormat": "leading {{pod}}" },
-        { "expr": "sum(rate(elector_post_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval])) + sum(rate(elector_delete_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval]))", "legendFormat": "lease-op errors/s" }
+        { "expr": "sum(rate(elector_post_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval])) + sum(rate(elector_delete_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval]))", "legendFormat": "lease-op errors/s" },
+        { "expr": "sum(rate(elector_post_total{namespace=~\"$namespace\",result=\"aborted_before_post\"}[$__rate_interval]))", "legendFormat": "post aborted (settle-lost)/s" }
       ] },
     { "id": 10, "title": "Sink apply throughput by group (job) — ops/s", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "description": "Per-group apply rate. With multi-subject sink groups each group is a distinct Prometheus job (its Service name, e.g. lab-connect-sink / lab-connect-sink-a), so `by (job)` breaks throughput out per group; a single-group install shows one series.",

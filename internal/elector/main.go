@@ -70,6 +70,7 @@ func Run(args []string) {
 		leading       atomic.Int32
 		postOK, postE atomic.Int64
 		delOK, delE   atomic.Int64
+		postAbort     atomic.Int64
 	)
 
 	mux := http.NewServeMux()
@@ -79,6 +80,7 @@ func Run(args []string) {
 		writeMetric(w, "elector_leading", float64(leading.Load()))
 		writeMetric(w, "elector_post_total{result=\"ok\"}", float64(postOK.Load()))
 		writeMetric(w, "elector_post_total{result=\"err\"}", float64(postE.Load()))
+		writeMetric(w, "elector_post_total{result=\"aborted_before_post\"}", float64(postAbort.Load()))
 		writeMetric(w, "elector_delete_total{result=\"ok\"}", float64(delOK.Load()))
 		writeMetric(w, "elector_delete_total{result=\"err\"}", float64(delE.Load()))
 	})
@@ -133,6 +135,7 @@ func Run(args []string) {
 				if postDelay > 0 {
 					log.Printf("OnStartedLeading: won lease; delaying POST of %q by %s so the previous leader's un-acked deliveries pass their ackWait", streamID, postDelay)
 					if !waitPostDelay(c, postDelay) {
+						postAbort.Add(1)
 						log.Printf("leadership lost during POST delay -> staying fail-closed (no POST)")
 						return
 					}

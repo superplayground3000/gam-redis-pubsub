@@ -65,6 +65,10 @@ from "0" before reading new entries.
 - No new metric. The extra leaderless window is already visible on the existing
   `elector_leading` dashboard panel; the elector log line carries the reason. No pipeline
   failure branch is added, so INV-2 requires no dashboard change.
+  Amended after final cross-model review (2026-07-09): the abort-without-POST path
+  (leadership lost mid-wait) additionally counts `elector_post_total{result="aborted_before_post"}`,
+  charted on the dashboard's elector panel, and the `elector_leading` panel wording now notes
+  that a Lease holder in its settle wait reports 0.
 - `rules/05-invariants.md` gains a note next to the existing "known accepted non-guarantee"
   (cross-key reordering): same-key reordering across sink failover is *mitigated* (not
   eliminated) by the post-election delay. Edit follows `rules/40-maintenance-protocol.md`
