@@ -25,11 +25,15 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
   `postDelay` for a fresh election. A same-run retry that "passes" without a new leader
   election proves nothing about the race — never accept a retry as evidence unless it also
   exercised a fresh election.
-- Applied: recorded only — `verify-cdc.sh` and `quiescence.go` not modified in this task (out
-  of scope: verification-only). Left as a known gap for whoever next touches
-  `scripts/verify-cdc.sh` or the sink elector's delay window; L4 `verify-failover.sh` and
-  `verify-failover-prefix.sh` were unaffected (source-leg chaos never re-elects the sink
-  leader mid-run; prefix chaos's own settle loop already outlasts `ackWait`, see the
+- Applied: fixed same day (coordinator-authorized follow-up) — verifier Job's hardcoded
+  `--quiesce-timeout` raised 15s→90s in `chart/templates/verifier-job.yaml` with a comment
+  documenting the postDelay coupling; `WaitQuiescent` returns early once drained, so the larger
+  timeout costs nothing on passing runs. Proven by a fresh-namespace L3 (namespace deleted
+  first to force a genuine new sink election): elector won the lease 07:51:35, POSTed
+  `reverse_leg` at 07:52:05 (30s delay), verifier started 07:51:46 — 19s BEFORE the POST, the
+  exact window that failed at 15s — and passed FIRST attempt (`verdict.pass=true`, exit 0,
+  no quiesce warnings). L4 scripts were never affected (source-leg chaos never re-elects the
+  sink leader mid-run; prefix chaos's settle loop already outlasts `ackWait`, see the
   2026-07-07 lesson below, so it also outlasts `postDelay`, which derives from the same value).
 
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer

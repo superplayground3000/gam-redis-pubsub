@@ -36,7 +36,12 @@ spec:
             - --nats-stream={{ .Values.nats.stream.name }}
             - --nats-consumer={{ .Values.nats.stream.consumer.durable }}
             - --source-group=cdc_propagator
-            - --quiesce-timeout=15s
+            # Must outlast the sink electors' post-election settle delay
+            # (postDelay = ackWait, 30s default) plus drain: on a fresh election
+            # the sink POSTs its pipeline only after postDelay, so quiescence
+            # legitimately takes >30s. WaitQuiescent returns early once drained —
+            # a large timeout costs nothing on passing runs.
+            - --quiesce-timeout=90s
           resources:
             {{- toYaml .Values.resources.verifier | nindent 12 }}
 {{- end }}
