@@ -52,6 +52,7 @@ func Run(args []string) {
 		leaseDur    = envDur("LEASE_DURATION", 6*time.Second)
 		renewDl     = envDur("RENEW_DEADLINE", 4*time.Second)
 		retryPd     = envDur("RETRY_PERIOD", 1*time.Second)
+		postDelay   = envDur("POST_DELAY", 0)
 	)
 	if podName == "" {
 		log.Fatal("POD_NAME is required (downward API)")
@@ -129,6 +130,13 @@ func Run(args []string) {
 		RetryPeriod:     retryPd,
 		Callbacks: leaderelection.LeaderCallbacks{
 			OnStartedLeading: func(c context.Context) {
+				if postDelay > 0 {
+					log.Printf("OnStartedLeading: won lease; delaying POST of %q by %s so the previous leader's un-acked deliveries pass their ackWait", streamID, postDelay)
+					if !waitPostDelay(c, postDelay) {
+						log.Printf("leadership lost during POST delay -> staying fail-closed (no POST)")
+						return
+					}
+				}
 				log.Printf("OnStartedLeading: POST stream %q", streamID)
 				if err := retry(c, 10, retryPd, func() error { return sc.post(c, streamID, pipelineYAML) }); err != nil {
 					postE.Add(1)
@@ -163,4 +171,21 @@ func Run(args []string) {
 
 func writeMetric(w http.ResponseWriter, name string, v float64) {
 	_, _ = w.Write([]byte(name + " " + strconv.FormatFloat(v, 'f', -1, 64) + "\n"))
+}
+
+// waitPostDelay blocks for d (the post-election settle delay) unless the
+// leadership context is cancelled first. false = lost leadership mid-wait:
+// the caller must return without POSTing (fail-closed).
+func waitPostDelay(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return true
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
 }
