@@ -107,18 +107,18 @@ log "group-a failed over: $victim -> $newA"
 
 # settle: a complete region (NA+NB) ends the wait immediately; otherwise only
 # conclude "stopped growing" after the count has been stable LONGER than the
-# ackWait redelivery horizon (30s). A message that was in-flight (delivered,
-# unacked) on the killed leader redelivers only after ackWait expires, so a
-# short stable window (the old 3x3s=9s) false-fails with a one-message
-# shortfall that lands seconds later (seen 2026-07-07: settle at 19999/20000,
-# all 20000 present moments after exit). 15x3s=45s > ackWait 30s.
+# slowest recovery mechanism (rules/50-lessons.md 2026-07-07). Since the sink
+# electors' post-election settle delay (postDelay = ackWait, 30s default), the
+# killed group's count legitimately freezes for leader election (<=~10s) +
+# postDelay (30s) before the first redelivered apply — ackWait itself expires
+# DURING that wait. 25x3s=75s outlasts that ~40s horizon with margin.
 log "waiting for region to settle (complete, or stable past the ackWait horizon) ..."
 want_total=$(( NA + NB )); prev=-1; stable=0
 deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
 while (( $(date +%s) < deadline )); do
   cur="$(cnt "prefix-*")"
   (( cur == want_total )) && break
-  if (( cur == prev )); then stable=$(( stable+1 )); (( stable>=15 )) && break; else stable=0; fi
+  if (( cur == prev )); then stable=$(( stable+1 )); (( stable>=25 )) && break; else stable=0; fi
   prev="$cur"; sleep 3
 done
 
