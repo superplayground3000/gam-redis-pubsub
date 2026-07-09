@@ -148,8 +148,17 @@ run_one() {
 
   # 7) settle. For fixed, wait until the (reused, stable) consumer's PEL drains to 0 — the new
   #    leader re-read it from "0", re-published and acked. Then, for BOTH modes, wait for the
-  #    sink to catch up by polling region membership until it STOPS GROWING (adaptive: robust to
-  #    variable sink lag and to any N; a fixed sleep would falsely inflate loss on the fixed run).
+  #    sink to catch up: a complete region (cur == N) ends the wait immediately; otherwise only
+  #    conclude "stopped growing" after the count has been stable LONGER than the slowest
+  #    recovery mechanism (rules/50-lessons.md 2026-07-07 — this script's loop bit on
+  #    2026-07-09 exactly as that lesson predicted). Since the sink electors' post-election
+  #    settle delay (postDelay = ackWait, 30s default), each mode's helm consumerClientId flip
+  #    re-rolls the SINK too (checksum/connect-config spans all connect ConfigMaps), so the
+  #    sink leader is re-elected mid-script and the region count legitimately freezes for
+  #    leader election (<=~10s) + postDelay (30s) before applies resume. The old 3x3s=9s
+  #    stability concluded inside that window and false-reported loss_keys=N with all keys
+  #    actually present (seen 2026-07-09, twice, deterministically). 25x3s=75s outlasts the
+  #    ~40s horizon with margin; the complete-count break keeps fixed-mode runs fast.
   if [[ "$mode" == fixed ]]; then
     deadline=$(( $(date +%s) + DRAIN_TIMEOUT_S ))
     while (( $(date +%s) < deadline )); do
@@ -162,7 +171,8 @@ run_one() {
   deadline=$(( $(date +%s) + SINK_TIMEOUT_S ))
   while (( $(date +%s) < deadline )); do
     cur="$(rr --scan --pattern "lb:failover:active:{run:${runid}:k*}" 2>/dev/null | grep -c . || true)"
-    if (( cur == prev )); then stable=$(( stable + 1 )); (( stable >= 3 )) && break; else stable=0; fi
+    (( cur == N )) && break
+    if (( cur == prev )); then stable=$(( stable + 1 )); (( stable >= 25 )) && break; else stable=0; fi
     prev="$cur"; sleep 3
   done
   log "sink settled: region has $cur / $N keys for this run"

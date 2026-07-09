@@ -32,9 +32,20 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
   first to force a genuine new sink election): elector won the lease 07:51:35, POSTed
   `reverse_leg` at 07:52:05 (30s delay), verifier started 07:51:46 — 19s BEFORE the POST, the
   exact window that failed at 15s — and passed FIRST attempt (`verdict.pass=true`, exit 0,
-  no quiesce warnings). L4 scripts were never affected (source-leg chaos never re-elects the
-  sink leader mid-run; prefix chaos's settle loop already outlasts `ackWait`, see the
-  2026-07-07 lesson below, so it also outlasts `postDelay`, which derives from the same value).
+  no quiesce warnings).
+  CORRECTION + second fix (same day): this entry originally claimed "L4 scripts were never
+  affected (source-leg chaos never re-elects the sink leader mid-run)" — WRONG. The
+  `checksum/connect-config` annotation on connect-sink spans the whole `connect-configmaps.yaml`
+  render, so `verify-failover.sh`'s per-mode `--set consumerClientId` helm flips re-roll the
+  SINK too, re-electing its leader mid-script; with `postDelay` the region count freezes for
+  election (≤~10s) + 30s before applies resume. The script's old 3×3s=9s settle stability
+  concluded inside that window and false-reported `loss_keys=5000` (fixed mode,
+  `region_present=0`) twice, deterministically — post-hoc scans showed all 5000 keys present
+  and the sink POSTing 1-3s AFTER the script gave up. Exactly the failure the 2026-07-07
+  settle-horizon lesson (below) predicted for this script. Hardened in the same commit as this
+  lesson edit, mirroring 49ba20d: complete-count (`cur == N`) fast-path + `stable >= 25`
+  (75s > ~40s horizon). The prefix script needed no change (already hardened by 49ba20d, and
+  its post-fix run passed first attempt on the same image).
 
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
 - What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
