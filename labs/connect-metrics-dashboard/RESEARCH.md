@@ -18,10 +18,13 @@ Traffic is driven by the `app writer` (`scripts/drive.sh`). Both legs' raw `/met
 captured by `scripts/scrape-metrics.sh` into `captured/`.
 
 ## Coverage & known gaps
-- Custom counters (`cdc_apply`, `cdc_unprocessable`) fire under normal traffic and
-  establish the exporter's suffix convention, which applies identically to the
-  forward-leg counters (`cdc_forward_unrouted/others/publish_failed`) — same exporter,
-  same rule — so those names are confirmed structurally even when a branch doesn't fire.
+- `cdc_apply` fires under normal traffic and establishes the exporter's suffix
+  convention. `cdc_unprocessable` did **not** fire in this capture (0 occurrences,
+  see Findings) — its name/labels are confirmed structurally from
+  `connect/sink.yaml:109-113,198-202`, not observed live. The same suffix
+  convention applies identically to the forward-leg counters
+  (`cdc_forward_unrouted/others/publish_failed`) — same exporter, same rule — so
+  those names are also confirmed structurally even where a branch doesn't fire.
 - `elector_*` metrics need the K8s Lease API and can't run in compose. They are
   hand-written text in `internal/elector/main.go`
   (`elector_leading`, `elector_post_total{result=...}`, `elector_delete_total{result=...}`)
@@ -66,3 +69,18 @@ Full per-panel table, evidence lines, and the delete/rename limitation writeup l
 
 ## How to run
 See "Run" section below.
+
+## Run
+```bash
+cd labs/connect-metrics-dashboard
+./scripts/render-configs.sh              # regenerate Connect configs from the chart
+docker compose up -d --build             # bring up the full CDC path
+./scripts/drive.sh 45                     # generate traffic
+./scripts/scrape-metrics.sh              # capture raw :4195 + app /metrics into captured/
+# edit dashboards live at http://localhost:13000 (anonymous admin), then:
+./scripts/export-dashboard.sh            # write edits back to chart/files/grafana/cdc-dashboard.json
+docker compose down -v
+```
+
+## Status
+Dashboard aligned to live metric names on 2026-07-09. See METRIC-AUDIT.md for the mapping.

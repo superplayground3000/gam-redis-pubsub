@@ -1,7 +1,7 @@
 # Metric-name audit — cdc-dashboard.json vs live :4195
 
 Captured: `labs/connect-metrics-dashboard/captured/*.txt` (see git for the run).
-Dashboard: `chart/files/grafana/cdc-dashboard.json` (12 panels / 13 targets).
+Dashboard: `chart/files/grafana/cdc-dashboard.json` (12 panels / 16 targets).
 Pipeline source (structural cross-check for metrics that didn't fire in this
 capture): `labs/connect-metrics-dashboard/connect/source.yaml` (forward leg),
 `labs/connect-metrics-dashboard/connect/sink.yaml` (reverse leg),
