@@ -1,0 +1,43 @@
+# Overrides so `helm template` renders the pipeline against compose service names.
+# Only connection/addressing values are set here — nothing touches metric blocks.
+redis:
+  central:
+    external: { enabled: true, url: "redis://redis-central:6379", cluster: false }
+  region:
+    external: { enabled: true, url: "redis://redis-region:6379", cluster: false }
+nats:
+  external:
+    enabled: true
+    url: "nats://nats:4222"
+    # Dummy secret names — required by the chart's external-mode guards
+    # (rrcs.nats.credsSecret.publisher/subscriber) so `helm template` renders
+    # cleanly. The lab's NATS is auth-less; render-configs.sh strips the
+    # resulting user_credentials_file line from the rendered pipeline.
+    auth:
+      publisherSecret: "lab-nats-publisher-creds"
+      subscriberSecret: "lab-nats-subscriber-creds"
+  stream:
+    name: "LAB_CDC"
+    subjectPrefix: "kv.cdc"
+latencyCalculator:
+  stream: "cdc:latency"
+
+# Deviation from the brief's verbatim Step 1 snippet, added deliberately:
+# without an enabled prefixed group + a catchAll group, the forward leg's
+# routing-miss switch block (rrcs.connect.prefixRouting == "false") does not
+# render at all, so cdc_forward_unrouted/cdc_forward_others never appear in
+# source.yaml — Step 4's fidelity check would report them MISSING even though
+# the chart defines them (chart/files/connect/cdc-forward.yaml). This is the
+# documented values.yaml example (see chart/values.yaml connect.sinkGroups
+# comment) trimmed to the minimum that turns both branches on. The "default"
+# name keeps every derived resource/ConfigMap name identical to the legacy
+# single-sink render (connect-sink-pipeline), so render-configs.sh still
+# extracts the same ConfigMap for sink.yaml; the extra "others" catch-all
+# group's pipeline ConfigMap is rendered by the chart but intentionally not
+# captured here (the lab wires exactly one source + one sink container).
+connect:
+  sinkGroups:
+    - name: default
+      prefixes: ["lab"]
+    - name: others
+      catchAll: true
