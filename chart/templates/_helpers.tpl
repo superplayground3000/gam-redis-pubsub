@@ -272,7 +272,7 @@ identical to the pre-D3 chart (design §1). Field resolution precedence:
 postDelay (elector post-election settle wait) resolves group.postDelay ->
 sinkDefaults.postDelay -> the group's EFFECTIVE consumer ackWait; "0s" disables.
 Each element carries: name enabled isDefault prefixed prefixes catchAll durable
-filter streamID replicas ackWait maxAckPending maxDeliver postDelay leaseDuration
+filter streamID replicas ackWait postDelay maxAckPending maxDeliver leaseDuration
 renewDeadline retryPeriod deployBase pipelineBase saBase appLabel.
 Validation (fail-loud at render): DNS-1123 name; prefix grammar ^seg(:seg)?$
 with seg=[a-z0-9]([a-z0-9_-]*[a-z0-9])? (first-two-seg routing); reserved first
