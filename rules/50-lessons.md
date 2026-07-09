@@ -2,6 +2,36 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-09 — `verify-cdc.sh` races the new sink `postDelay` on a fresh leader election
+- What happened: full-ladder verification of the post-election settle delay (commits
+  ceda768..903facd) ran L3 first. On the first run (fresh helm upgrade that rolled new
+  connect-sink pods), `verify-cdc.sh` FAILed: `dedup failed: stream grew by 0 (want 1)`, plus
+  a `create` per-op quiesce timeout. `verify-cdc.sh` only waits for `kubectl rollout status`
+  (pod Ready), then launches the verifier Job immediately; it does not wait for the sink
+  elector's new 30 s `POST_DELAY` after winning the Lease. Elector log proved it exactly:
+  lease won at `07:37:59`, `OnStartedLeading: won lease; delaying POST ... by 30s` logged, POST
+  of `reverse_leg` completed at `07:38:29`. The verifier's own quiescence check has only a 15 s
+  timeout (`internal/verifier/quiescence.go`, `WaitQuiescent`, requires stream `MaxPending==0`
+  i.e. the sink consumer draining) and it ran from `07:37:56`, timing out at `07:38:11` —
+  18 s before the sink pipeline was even POSTed. A same-namespace retry with no new rollout
+  (no election, pipeline already active) passed instantly (17 s), which would silently mask
+  the race if retried without reading the first failure's logs.
+- Rule that would have prevented it: any wait loop gating a verifier run on "rollout status /
+  pod Ready" is insufficient once pipeline activation itself is asynchronous and delayed
+  (elector `postDelay`, or any future post-election delay) — pod Ready ≠ pipeline POSTed.
+  Either `verify-cdc.sh` must wait for elector POST completion (e.g. poll the elector's
+  `:8090` health/metrics endpoint or a POSTed-state signal) before launching the verifier Job,
+  or the verifier's own `WaitQuiescent` deadline must exceed the maximum configured
+  `postDelay` for a fresh election. A same-run retry that "passes" without a new leader
+  election proves nothing about the race — never accept a retry as evidence unless it also
+  exercised a fresh election.
+- Applied: recorded only — `verify-cdc.sh` and `quiescence.go` not modified in this task (out
+  of scope: verification-only). Left as a known gap for whoever next touches
+  `scripts/verify-cdc.sh` or the sink elector's delay window; L4 `verify-failover.sh` and
+  `verify-failover-prefix.sh` were unaffected (source-leg chaos never re-elects the sink
+  leader mid-run; prefix chaos's own settle loop already outlasts `ackWait`, see the
+  2026-07-07 lesson below, so it also outlasts `postDelay`, which derives from the same value).
+
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
 - What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
   lab-connect-sink-a" / "two-seg render missing name: cdc_forward_others" — but chart-identical
