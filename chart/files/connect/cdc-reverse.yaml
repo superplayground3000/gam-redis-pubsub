@@ -96,6 +96,17 @@ pipeline:
         } else { null }
         meta body = $decoded
         meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
+    {{- if .Values.connect.deadLetter.enabled }}
+        # DLQ guard: hash bodies must be a valid JSON OBJECT for the HSET args_mapping
+        # below. Validate up front so a malformed body is COUNTED
+        # (cdc_unprocessable{reason=hash_decode_error}) and dead-lettered, instead of
+        # throwing UN-COUNTED inside the HSET args_mapping (silent poison loop). Only
+        # checked for create/update hash bodies that decoded OK.
+        let hash_body_ok = if (this.op == "create" || this.op == "update") && this.type.or("string") == "hash" && meta("decode_failed") == "no" {
+          $decoded.parse_json().catch(null) != null
+        } else { true }
+        meta hash_decode_failed = if $hash_body_ok { "no" } else { "yes" }
+    {{- end }}
     {{- if .Values.connect.contentLog.enabled }}
     # Dump exactly what is about to be applied to region Redis (the op switch below
     # turns these into SET / DEL / rename-EVAL). body holds the full value payload.
@@ -126,7 +137,27 @@ pipeline:
                 name: cdc_unprocessable
                 labels:
                   reason: decode_error
+            {{- if .Values.connect.deadLetter.enabled }}
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "decode_error"
+                meta dlq_error  = "undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?"))
+            {{- else }}
             - mapping: 'root = throw("decode_error: undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?")))'
+            {{- end }}
+    {{- if .Values.connect.deadLetter.enabled }}
+        - check: meta("hash_decode_failed") == "yes"
+          processors:
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  reason: hash_decode_error
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "hash_decode_error"
+                meta dlq_error  = "hash body is not valid JSON for kv_key %s".format(meta("kv_key").or("?"))
+    {{- end }}
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
             # Best-effort latency telemetry, emitted BEFORE the SET. ts-bearing
@@ -215,8 +246,49 @@ pipeline:
                 name: cdc_unprocessable
                 labels:
                   reason: unknown_op
+            {{- if .Values.connect.deadLetter.enabled }}
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "unknown_op"
+                meta dlq_error  = "unknown op: %s".format(meta("op").or("missing"))
+            {{- else }}
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
+            {{- end }}
 
 output:
+{{- if .Values.connect.deadLetter.enabled }}
+  # DLQ enabled: applied messages -> drop (ack). Permanent poison (dlq==yes) ->
+  # publish to <deadLetter.subject>.<reason> on the same stream, THEN ack (the
+  # nats_jetstream send is the write; a send failure surfaces as an output error so
+  # reject_errored nacks -> retry = write-then-ack, INV-1 preserved). Transient apply
+  # failures still error -> reject_errored -> nack -> redelivery.
+  reject_errored:
+    switch:
+      cases:
+        - check: meta("dlq") == "yes"
+          output:
+            label: dlq_out
+            nats_jetstream:
+              urls:
+                - "{{ include "rrcs.nats.url" . }}"
+              auth:
+                user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
+              subject: '{{ .Values.connect.deadLetter.subject }}.${! meta("dlq_reason") }'
+              headers:
+                Nats-Msg-Id: ${! meta("event_id") }
+                dlq_reason: ${! meta("dlq_reason") }
+                dlq_error: ${! meta("dlq_error") }
+                dlq_orig_subject: ${! meta("nats_subject") }
+          processors:
+            # per-delivery count of messages routed to the DLQ (INV-2 visibility).
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: '${! meta("dlq_reason") }'
+        - output:
+            drop: {}
+{{- else }}
   reject_errored:
     drop: {}
+{{- end }}
