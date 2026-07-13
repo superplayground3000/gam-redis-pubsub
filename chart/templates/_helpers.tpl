@@ -239,7 +239,16 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 */}}
 {{- define "rrcs.nats.stream.subjects" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
-{{- printf "%s.>" $p -}}
+{{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- if $dl.enabled -}}
+{{-   $sub := required "connect.deadLetter.subject is required when deadLetter.enabled" $dl.subject -}}
+{{-   if or (eq $sub $p) (hasPrefix (printf "%s." $p) $sub) -}}
+{{-     fail (printf "connect.deadLetter.subject %q must be OUTSIDE nats.stream.subjectPrefix %q — a subject under %s.> would be re-consumed by a whole-stream sink. Use e.g. dlq.cdc." $sub $p $p) -}}
+{{-   end -}}
+{{-   printf "%s.>,%s.>" $p $sub -}}
+{{- else -}}
+{{-   printf "%s.>" $p -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

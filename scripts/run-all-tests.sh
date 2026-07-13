@@ -40,6 +40,15 @@ echo "[run-all-tests] == L1: helm lint + template + toggle renders =="
 # silently masks a real failure (bit CI on 2026-07-07, rules/50-lessons.md).
 helm lint chart/ || fail L1
 DEFAULT_OUT=$(helm template chart/) || fail L1
+# --- deadLetter (DLQ) render checks ---
+DLQ_OUT=$(helm template chart/ --set connect.deadLetter.enabled=true) || fail L1
+grep -q 'kv.cdc.>,dlq.cdc.>' <<<"$DLQ_OUT" \
+  || { echo "L1: DLQ enabled must extend stream subjects to kv.cdc.>,dlq.cdc.>"; fail L1; }
+if grep -q 'dlq.cdc' <<<"$DEFAULT_OUT"; then echo "L1: default render must not mention dlq"; fail L1; fi
+# fail-loud: subject under kv.cdc must be rejected
+if helm template chart/ --set connect.deadLetter.enabled=true --set connect.deadLetter.subject=kv.cdc.dlq >/dev/null 2>&1; then
+  echo "L1: deadLetter.subject under subjectPrefix must fail-loud"; fail L1
+fi
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
