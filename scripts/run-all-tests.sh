@@ -52,14 +52,16 @@ fi
 grep -q 'reason: hash_decode_error' <<<"$DLQ_OUT" || { echo "L1: missing hash_decode_error counter"; fail L1; }
 grep -q 'cdc_dlq_forwarded'        <<<"$DLQ_OUT" || { echo "L1: missing cdc_dlq_forwarded counter"; fail L1; }
 grep -q 'hash_decode_failed'       <<<"$DLQ_OUT" || { echo "L1: missing hash guard"; fail L1; }
-# enabled output must route via nats_jetstream to the dlq subject
+# enabled output must route via nats_jetstream to the per-reason dlq subject.
 # (cdc-reverse.yaml is rendered embedded/indented inside a ConfigMap block, so
 # "output:" is not column-0 here -- match with leading whitespace.) Captured to
 # a variable before grep -q, same reason as the header comment above: a live
 # `awk | grep -q` pipe under pipefail lets grep -q exit at the first match and
 # SIGPIPE the upstream awk, flaking a good render to FAIL.
 DLQ_OUT_TAIL=$(awk '/^[[:space:]]*output:[[:space:]]*$/{o=1} o' <<<"$DLQ_OUT")
-grep -q 'dlq.cdc' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output subject missing"; fail L1; }
+grep -q 'nats_jetstream:' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must route via nats_jetstream"; fail L1; }
+# literal per-reason subject template: '<subject>.${! meta("dlq_reason") }' (default subject dlq.cdc)
+grep -qF 'dlq.cdc.${! meta("dlq_reason") }' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must use per-reason subject template"; fail L1; }
 # default output must stay reject_errored: drop (byte-identical guard covers full render)
 grep -q 'reason: hash_decode_error' <<<"$DEFAULT_OUT" && { echo "L1: hash guard leaked into default"; fail L1; } || true
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1

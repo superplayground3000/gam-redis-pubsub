@@ -103,7 +103,13 @@ pipeline:
         # throwing UN-COUNTED inside the HSET args_mapping (silent poison loop). Only
         # checked for create/update hash bodies that decoded OK.
         let hash_body_ok = if (this.op == "create" || this.op == "update") && this.type.or("string") == "hash" && meta("decode_failed") == "no" {
-          $decoded.parse_json().catch(null) != null
+          # Must be a JSON OBJECT: the HSET args_mapping below does
+          # .parse_json().key_values(), which throws on arrays/scalars/strings. A
+          # parseable-but-non-object body (e.g. `["a","b"]` or `"5566"`) would slip
+          # past a bare != null check and throw UN-COUNTED inside args_mapping. On
+          # parse failure .catch(null) yields null whose .type() is "null" -> also
+          # (correctly) classified failed.
+          $decoded.parse_json().catch(null).type() == "object"
         } else { true }
         meta hash_decode_failed = if $hash_body_ok { "no" } else { "yes" }
     {{- end }}
@@ -131,7 +137,12 @@ pipeline:
         - check: meta("decode_failed") == "yes"
           processors:
             # Permanent poison: the gzip:base64 body could not be decoded. Count it,
+            {{- if .Values.connect.deadLetter.enabled }}
+            # then set dlq meta -> the output publishes to <subject>.decode_error and
+            # acks only after PubAck (captured, not retried forever).
+            {{- else }}
             # then throw to nack (redelivered under maxDeliver=-1 until removed).
+            {{- end }}
             - metric:
                 type: counter
                 name: cdc_unprocessable
