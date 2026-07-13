@@ -61,7 +61,13 @@ never nack a message):
 let ts_ms  = this.ts.number().catch(0)
 let sync_delta_ns = if $ts_ms > 0 { timestamp_unix_nano() - ($ts_ms * 1000000).round() } else { 0 }
 meta sync_has_ts     = if $ts_ms > 0 { "yes" } else { "no" }
-meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().string()   # clamp; metric processor rejects negatives
+# .int64() BEFORE .string(): Bloblang float arithmetic stringifies large values in
+# scientific notation, which the timing metric's strconv.ParseInt hard-rejects —
+# and that error would fire AFTER the apply, nacking an already-applied message
+# (same trap as the writer_ts fix at the latency-XADD args_mapping). .int64()
+# forces integer formatting. Clamp keeps the value non-negative (processor
+# rejects negatives).
+meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().int64().string()
 meta sync_skew_neg   = if $sync_delta_ns < 0 { "yes" } else { "no" }
 ```
 
@@ -108,7 +114,11 @@ still seconds, better tail resolution, slight cardinality increase.
 
 - New timeseries panel **"Sync latency p50/p95/p99 (s)"** (unit: seconds; style of the
   existing "Connect processing latency" panel):
-  `histogram_quantile(0.50|0.95|0.99, sum by (le) (rate(cdc_sync_latency_seconds_bucket{namespace=~"$namespace",job=~"$job"}[$__rate_interval])))`
+  `histogram_quantile(0.50|0.95|0.99, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~"$namespace",job=~"$job"}[$__rate_interval])))`
+  — `sum by (le, job)`, not `sum by (le)`: with multiple sink groups selected, omitting
+  `job` would merge the groups' distributions into one bogus quantile instead of the
+  per-group breakdown this spec claims (Codex review finding, 2026-07-13). Legend:
+  `{{job}} p50` etc.
 - New timeseries panel **"Sync clock-skew negatives"**:
   `sum(increase({__name__=~"cdc_sync_skew_negative(_total)?",namespace=~"$namespace",job=~"$job"}[$__rate_interval]))`
   (INV-2: every added metric gets a panel).
@@ -134,7 +144,10 @@ still seconds, better tail resolution, slight cardinality increase.
 4. **L3** (~5 min): `scripts/build-images.sh --kind --kind-name=cdc` +
    `RRCS_NS=cdc-k8s RRCS_RELEASE=cdc scripts/verify-cdc.sh`; then curl `:4195/metrics` on the
    sink pod and confirm: `cdc_sync_latency_seconds_bucket` present with seconds-scale values
-   across ops; `cdc_sync_skew_negative` absent or 0; error-path messages did not record.
+   across ops; `cdc_sync_skew_negative` absent or 0; error-path messages did not record;
+   `processor_error` did not increase for the sink pipeline (a timing-value parse failure —
+   the Codex-flagged scientific-notation trap — would show up there and nack applied
+   messages).
 5. **L4 not required**: no consumer-id/group, lease, elector, ack/commit, or nats-init change.
 
 ## Invariant impact
