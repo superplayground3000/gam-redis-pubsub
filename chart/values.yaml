@@ -147,6 +147,13 @@ connect:
   # forever as before. Subject MUST be outside nats.stream.subjectPrefix so no
   # sink consumer re-consumes it (fail-loud otherwise).
   deadLetter:
+    # Activating the DLQ requires the subscriber creds to grant pub on <subject>.> .
+    # scripts/gen-nats-auth.sh already emits that grant, but the committed
+    # chart/files/nats-auth/ creds are NOT regenerated here (a --force regen rotates
+    # the operator+account identities and would orphan an existing KV_CDC stream).
+    # To enable end-to-end: run scripts/gen-nats-auth.sh --force, commit
+    # chart/files/nats-auth/, and redeploy. Until then a DLQ publish is
+    # permission-denied — which fails SAFE (nack/retry, no loss).
     enabled: false
     subject: "dlq.cdc"      # published per-reason as <subject>.<reason>; stream binds <subject>.>
   source:

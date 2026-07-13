@@ -6,6 +6,7 @@
 # Env overrides (defaults match chart/values.yaml):
 #   STREAM_NAME=APP_EVENTS        DURABLE_NAME=region-writer
 #   SUBJECT_PREFIX=app.events     (publisher --allow-pub is "<prefix>.>")
+#   DLQ_SUBJECT=dlq.cdc           (subscriber --allow-pub is "<DLQ_SUBJECT>.>")
 #   OPERATOR_NAME=RRCS-OP         ACCOUNT_NAME=APP
 set -euo pipefail
 
@@ -96,6 +97,10 @@ parse_values() {
 STREAM_NAME="${STREAM_NAME:-$(parse_values nats.stream.name APP_EVENTS)}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-$(parse_values nats.stream.subjectPrefix app.events)}"
 DURABLE_NAME="${DURABLE_NAME:-$(parse_values nats.stream.consumer.durable region-writer)}"
+# DLQ base subject (chart's connect.deadLetter.subject default); the sink
+# publishes permanently-unprocessable messages to "<DLQ_SUBJECT>.<reason>"
+# using the subscriber creds, so the subscriber user needs pub on the subtree.
+DLQ_SUBJECT="${DLQ_SUBJECT:-dlq.cdc}"
 OPERATOR_NAME="${OPERATOR_NAME:-RRCS-OP}"
 ACCOUNT_NAME="${ACCOUNT_NAME:-APP}"
 
@@ -159,11 +164,17 @@ echo "[gen] user subscriber"
 # CONSUMER.*CREATE.* are dropped: in pull/bind mode the sink never CREATES a
 # consumer — the nats-init Job (admin creds) provisions them. bind:true only
 # attaches. (Re-add them here if you ever run a non-bind/push sink.)
+#
+# DLQ (design §4.4): the sink also publishes permanently-unprocessable
+# messages to "${DLQ_SUBJECT}.<reason>" using these SAME subscriber creds
+# (there is no separate DLQ-publisher identity), so grant pub on the DLQ
+# subtree here too.
 nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
   --allow-pub '$JS.ACK.'"${STREAM_NAME}"'.>' \
   --allow-pub '$JS.API.STREAM.INFO.'"${STREAM_NAME}" \
   --allow-pub '$JS.API.CONSUMER.INFO.'"${STREAM_NAME}"'.*' \
   --allow-pub '$JS.API.CONSUMER.MSG.NEXT.'"${STREAM_NAME}"'.*' \
+  --allow-pub "${DLQ_SUBJECT}.>" \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user admin"
