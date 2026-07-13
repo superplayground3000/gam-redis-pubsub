@@ -74,10 +74,11 @@ dashboard in the same change.
 | `chart/files/connect/cdc-reverse.yaml` | `cdc_unprocessable{reason=...}` counter fires on every permanent-failure branch (today: `decode_error`, `unknown_op`). **Any new failure branch added to a pipeline must add a `reason` label value.** |
 | `chart/files/connect/cdc-forward.yaml` | `cdc_forward_publish_failed{reason}` increments in the output `fallback` failure child (fires per failed JetStream publish; the message is then nacked — INV-1 row 11) |
 | `chart/files/connect/cdc-reverse.yaml` | `cdc_apply{op,type}` increments only after a successful apply |
+| `chart/files/connect/cdc-reverse.yaml` | `cdc_sync_latency_seconds{op}` timing records only after a successful apply (`!errored()` + `sync_has_ts` guard); its value stays clamped ≥ 0 and `.int64().string()`-formatted — a negative or float value makes the metric processor error AFTER the apply and nack an already-applied message. Negative deltas increment `cdc_sync_skew_negative` instead |
 | `chart/files/connect/observability.yaml` | `use_histogram_timing: true`. Quirk of the pinned build: the timing metrics keep `_ns` names (`processor_latency_ns` etc.) but the histogram **buckets record seconds** — dashboards must treat values as seconds |
 | `internal/latency/metrics.go` + `chart/templates/latency-calculator.yaml` | latency-calculator serves `cdc_latency_seconds{op,quantile}` gauges (+ samples, dropped-negative) on `:8082`, and its Service exposes port `http` for the ServiceMonitor |
 | `chart/templates/observability/servicemonitor.yaml` | Selects connect legs + writer + latency-calculator (`http` endpoint) and the elector sidecars (`elector` endpoint, port 8090 on the connect Services) |
-| `chart/files/grafana/cdc-dashboard.json` | Panels exist for: apply throughput, unprocessable activity, unprocessable-by-reason, processor errors, forward-leg publish failures, Connect latency p50/p95/p99, end-to-end latency percentiles, writer throughput/errors, elector leadership. **If you add a metric, add/extend a panel in the same change.** |
+| `chart/files/grafana/cdc-dashboard.json` | Panels exist for: apply throughput, unprocessable activity, unprocessable-by-reason, processor errors, forward-leg publish failures, Connect latency p50/p95/p99, end-to-end latency percentiles, sync latency p50/p95/p99 by group, sync clock-skew negatives, writer throughput/errors, elector leadership. **If you add a metric, add/extend a panel in the same change.** |
 | `chart/files/prometheus/cdc-alerts.yaml` | `CDCUnprocessableMessages` alert; its `increase[...]` window must stay ≥ 2× `nats.stream.consumer.ackWait` (redelivery cadence coupling — documented in the rule file header) |
 | `chart/templates/observability/*` | ServiceMonitor/PrometheusRule/dashboard ConfigMap render when `observability.enabled=true` |
 | `internal/writer/http.go`, `internal/elector/main.go` | Writer counters (`cdc_writer_errors_total` etc., exposed in `http.go`) and elector counters (`elector_leading`, `elector_post_total`, `elector_delete_total`) keep existing names — dashboards/reports reference them by name |
@@ -89,7 +90,7 @@ dashboard in the same change.
   latency-calculator Service appear; `helm template chart/` (default) — confirm the
   observability objects do not.
 - Metric name check after editing a pipeline: grep the dashboard + alert files for every metric
-  name you touched: `grep -n "cdc_unprocessable\|cdc_apply\|cdc_forward_publish_failed\|cdc_latency_seconds\|cdc_writer\|elector_" chart/files/grafana/cdc-dashboard.json chart/files/prometheus/cdc-alerts.yaml`
+  name you touched: `grep -n "cdc_unprocessable\|cdc_apply\|cdc_forward_publish_failed\|cdc_latency_seconds\|cdc_sync_latency_seconds\|cdc_sync_skew_negative\|cdc_writer\|elector_" chart/files/grafana/cdc-dashboard.json chart/files/prometheus/cdc-alerts.yaml`
 - Behavior check (L2, ~7 min): `labs/redis-cdc-error-alerting/scripts/verify-alert.sh` proves
   the alert + dashboard against a real Connect sink (single-source bind mounts).
 - Behavior check (L3): run `verify-cdc.sh`, then curl `:4195/metrics` on the sink pod and
