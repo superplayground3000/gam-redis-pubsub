@@ -1,0 +1,230 @@
+# Hash-decode guard + Dead-Letter Queue — Design
+
+- **Date:** 2026-07-13
+- **Branch:** `investigate-sink-ack` (worktree `connect-sink-ack`, from `master`)
+- **Status:** Approved for planning
+- **Invariants touched:** INV-1 (ack semantics, rows 7–8), INV-2 (new failure branch + panels), INV-3 (toggle); plus NATS auth grant and stream subjects.
+
+## Problem
+
+The reverse (sink) pipeline's authoritative apply switch is deliberately un-wrapped
+(`chart/files/connect/cdc-reverse.yaml`, "NOT wrapped — a failure must nack/redeliver").
+For `type=hash` create/update, the HSET `args_mapping` calls `meta("body").parse_json()`.
+A malformed hash body (verified example: a trailing comma
+`{"employee::144000":"5566","employee::155666":"55123",}`) makes `parse_json()` throw:
+
+```
+failed to parse value as JSON: invalid character '}' looking for beginning of object key string
+```
+
+Consequences today:
+
+1. The throw errors the message → `reject_errored` nacks → with `maxDeliver: -1` it
+   **redelivers forever** (poison loop).
+2. **No `cdc_unprocessable{reason=...}` counter fires** for this branch (unlike
+   `decode_error` and `unknown_op`), so it is an INV-2 gap — a permanent-failure branch
+   with no metric.
+3. Because JetStream's `ack_floor` is the *contiguous* ack sequence, the stuck message
+   **pins the ack floor and head-of-line-blocks** the consumer — the whole group looks
+   like "not acking, no errors."
+
+### Provenance (established during investigation)
+
+The malformed body originates from the **upstream stream producer**, not the pipeline and
+not the lab writer:
+
+- Source/forward leg reads `body` as raw content (`body_key: body`) and encodes it as
+  `content().compress("gzip").encode("base64")` — opaque byte passthrough, no JSON parse
+  or re-serialize (`cdc-forward.yaml:75`). It cannot introduce or remove a comma.
+- Sink/reverse leg decodes back the identical bytes, then `parse_json()` is the first thing
+  that inspects the JSON.
+- The lab writer builds hash bodies with `json.Marshal(map[string]string{...})`
+  (`internal/writer/payload.go:74`, fields `name`/`tier`/`rev`) — strictly valid JSON,
+  never a trailing comma.
+
+So the data fix is upstream. This change makes the poison **visible and non-blocking** on
+the sink side (INV-2), and adds an operator-configurable DLQ so poison is parked instead of
+looping.
+
+## Goals / Non-goals
+
+**Goals**
+- Close the INV-2 gap: `cdc_unprocessable{reason=hash_decode_error}` fires on malformed hash bodies.
+- Add an opt-in Dead-Letter Queue: permanently-unprocessable messages are published to a
+  configurable subject on the same JetStream stream, then acked (loop stops, ack floor unblocks).
+- Preserve at-least-once: nothing is dropped; a message is acked only after its DLQ PubAck
+  succeeds (write-then-ack). Transient failures still nack/retry.
+- Keep the default install render byte-identical (toggle default off).
+
+**Non-goals**
+- Fixing the upstream producer (separate owner).
+- A DLQ *consumer*/replayer. The DLQ is a durable parking lot for manual inspection/replay;
+  automated redrive is a future follow-up.
+- Changing behavior for transient (retryable) apply failures.
+
+## Decisions (locked)
+
+1. **Delivery semantics:** DLQ-publish-then-ack (write-then-ack). Publish to the DLQ subject;
+   ack the original only after the DLQ PubAck. If the DLQ publish fails → nack (retry). This
+   is the explicit INV-1 sign-off and is why L4 is required.
+2. **DLQ subject placement:** a **sibling subject outside `kv.cdc.>`** (default `dlq.cdc`,
+   published per-reason as `dlq.cdc.<reason>`), bound as a *second* subject on the same
+   `KV_CDC` stream. No sink consumer filters `dlq.*`, so it is never re-consumed in any
+   install shape (default, prefix-routed, catchAll).
+3. **Scope:** all three permanent-failure reasons route to the DLQ when enabled —
+   `decode_error`, `unknown_op`, and the new `hash_decode_error`.
+4. **Toggle default:** `connect.deadLetter.enabled: false`. All changes are gated behind it;
+   default render stays byte-identical. Enabling activates the guard + counter + DLQ routing
+   together.
+5. **Per-reason subject tokens** under one configurable base subject; DLQ payload = the
+   original NATS envelope; dedup via `Nats-Msg-Id: event_id`.
+
+## Behavior
+
+With `connect.deadLetter.enabled=true`:
+
+| Path | Today | New |
+|---|---|---|
+| Applied to region Redis (happy) | ack | unchanged — ack |
+| Transient apply failure (region Redis down, etc.) | nack → retry | unchanged — nack → retry |
+| Permanent poison (`decode_error`, `unknown_op`, `hash_decode_error`) | throw → nack → loop forever | count `cdc_unprocessable{reason}` → publish to `dlq.cdc.<reason>` → ack after PubAck; nack only if DLQ publish fails |
+
+With `connect.deadLetter.enabled=false` (default): the pipeline renders **byte-identical to
+today**. The entire feature — hash guard, `hash_decode_error` counter, and DLQ output — is
+gated behind the toggle. So when disabled there is no new failure branch: a malformed hash
+body behaves exactly as today (throws in the HSET `args_mapping` → nack → loop, uncounted).
+The pre-existing INV-2 gap is therefore closed **by enabling the feature**, not in the
+disabled path. This is consistent with INV-2: the only *newly added* failure branch
+(present only when enabled) ships with its `reason` counter in the same change.
+
+> Byte-identical default is the L1 gate. Because everything is inside
+> `{{- if .Values.connect.deadLetter.enabled }}`, the pure-default render (deadLetter off)
+> is unchanged; the existing L1 byte-identical render check must still pass untouched.
+
+## Component changes
+
+### 4.1 `chart/values.yaml` — new config under `connect:`
+
+```yaml
+connect:
+  deadLetter:
+    enabled: false          # opt-in; default keeps render byte-identical
+    subject: "dlq.cdc"      # base subject; published per-reason as <subject>.<reason>
+                            # MUST be outside nats.stream.subjectPrefix (kv.cdc) so no
+                            # sink consumer re-consumes it. Bound as a 2nd stream subject.
+```
+
+### 4.2 `chart/templates/_helpers.tpl`
+
+- `rrcs.nats.stream.subjects`: when `connect.deadLetter.enabled`, return
+  `"<subjectPrefix>.>,<deadLetter.subject>.>"` (e.g. `kv.cdc.>,dlq.cdc.>`); else unchanged
+  (`kv.cdc.>`).
+- New helper `rrcs.connect.deadLetter.enabled` (bool passthrough) for template gating, plus
+  a fail-loud validation that `deadLetter.subject` does **not** start with
+  `nats.stream.subjectPrefix` (prevents re-consumption).
+
+### 4.3 `chart/files/connect/cdc-reverse.yaml` — pipeline (INV-1/INV-2 load-bearing)
+
+- **Guard (mapping stage):** for `create/update` + `type=hash`, pre-validate
+  `$decoded.parse_json().catch(null)`; set `meta hash_decode_failed = "yes"|"no"`.
+  Mirrors the existing `decode_failed` pattern; skip when `decode_failed=="yes"`.
+- **Switch:** add branch `check: meta("hash_decode_failed") == "yes"` →
+  `metric cdc_unprocessable{reason: hash_decode_error}` → (enabled: set DLQ meta; disabled:
+  throw). The existing HSET `args_mapping` can then trust valid JSON.
+- **Poison branches** (`decode_error`, `unknown_op`, `hash_decode_error`): when enabled, set
+  `meta dlq="yes"`, `meta dlq_reason=<reason>`, and `meta dlq_error` instead of `throw`;
+  when disabled, `throw` as today. `dlq_error` is a reason-appropriate string: for
+  `unknown_op` include the offending op; for `decode_error`/`hash_decode_error` a static
+  description (the guards use `.catch(null)`, so no live parser error string is captured) —
+  e.g. `"hash body is not valid JSON"`.
+- **Output restructure (gated):**
+  - Enabled:
+    ```yaml
+    output:
+      reject_errored:
+        switch:
+          cases:
+            - check: meta("dlq") == "yes"
+              output:
+                nats_jetstream:
+                  urls: [ <nats url> ]
+                  auth: { user_credentials_file: <subscriber creds> }
+                  subject: '{{ deadLetter.subject }}.${! meta("dlq_reason") }'
+                  headers:
+                    Nats-Msg-Id: ${! meta("event_id") }     # dedup DLQ republishes
+                    dlq_reason:  ${! meta("dlq_reason") }
+                    dlq_error:   ${! meta("dlq_error") }
+                    dlq_orig_subject: ${! meta("nats_subject") }   # set by the nats_jetstream input
+            - output:
+                drop: {}
+      # cdc_dlq_forwarded{reason} counter increments on the DLQ case's successful send.
+    ```
+    A DLQ publish failure surfaces as a write error → `reject_errored` nacks → retry
+    (write-then-ack). Unprocessable messages are caught by earlier switch branches and never
+    reach the redis apply, so `content()` at DLQ time is still the original envelope.
+  - Disabled: `reject_errored: { drop: {} }` — byte-identical to today.
+
+### 4.4 `scripts/gen-nats-auth.sh` + `chart/files/nats-auth/`
+
+- Add `--allow-pub '<deadLetter.subject>.>'` (default `dlq.cdc.>`) to the **subscriber**
+  user (the sink publishes the DLQ with its subscriber creds).
+- Regenerate committed creds (`subscriber.creds`, JWTs). ⚠️ Requires `nsc`; if unavailable in
+  the implementation env, this becomes a documented operator step (same footgun class as the
+  per-group durable creds at `values.yaml:243`).
+
+### 4.5 `chart/templates/nats-init-job.yaml`
+
+- No logic change: the existing subject-reconcile (`nats stream edit --subjects "$DESIRED_SUBJECTS"`)
+  picks up the extended `rrcs.nats.stream.subjects`. Confirm the reconcile path handles the
+  two-subject value (comma-joined) correctly.
+
+### 4.6 Observability (INV-2)
+
+- `cdc_unprocessable{reason=hash_decode_error}` — new reason value; existing
+  "unprocessable-by-reason" panel + `CDCUnprocessableMessages` alert cover it by label.
+- New counter `cdc_dlq_forwarded{reason}` (increments on successful DLQ publish) + a new
+  Grafana panel in `chart/files/grafana/cdc-dashboard.json` (INV-2: new metric ⇒ new panel).
+- `chart/files/prometheus/cdc-alerts.yaml`: document in the rule header that with DLQ enabled,
+  poison increments `cdc_unprocessable` once (then parked) rather than every `ackWait`; the
+  alert still fires on new poison. The `increase[...] ≥ 2× ackWait` coupling is unchanged.
+
+## Data flow (enabled)
+
+```
+NATS deliver ─▶ decode(base64/gzip) ─▶ hash JSON validate ─▶ op switch
+                     │ fail                    │ fail              │ apply ok ─▶ drop ─▶ ACK
+                     ▼                          ▼                  │ transient fail ─▶ (error) ─▶ reject_errored ─▶ NACK
+              reason=decode_error        reason=hash_decode_error  │
+                     └──────────────┬───────────┘                  └─ unknown op ─▶ reason=unknown_op
+                                    ▼
+                     set dlq meta (no throw)
+                                    ▼
+                 output switch: nats_jetstream ─▶ dlq.cdc.<reason>
+                                    │ PubAck ok ─▶ ACK original + cdc_dlq_forwarded{reason}++
+                                    │ PubAck fail ─▶ reject_errored ─▶ NACK (retry)
+```
+
+## Testing (per `rules/05-invariants.md`)
+
+- **L1** — `helm lint` + renders:
+  - default (`deadLetter` off) byte-identical to master (the existing L1 byte-identical check).
+  - `--set connect.deadLetter.enabled=true`: reverse pipeline shows the DLQ output switch;
+    `rrcs.nats.stream.subjects` = `kv.cdc.>,dlq.cdc.>`; subscriber grant includes `dlq.cdc.>`;
+    fail-loud fires when `deadLetter.subject` starts with `kv.cdc`.
+- **INV-2 grep** — `cdc_unprocessable`, `cdc_dlq_forwarded` present in dashboard + alerts.
+- **L3** — `verify-cdc.sh` (pipeline behavior unaffected on happy path).
+- **L4** — `verify-failover.sh` (**required**: ack/commit semantics change). Plus a new lab
+  assertion: inject a malformed hash body, confirm it lands in `dlq.cdc.hash_decode_error`
+  (durable, PubAck'd) and the consumer ack floor advances past it (no loop, no head-of-line
+  block).
+
+## Rollout / safety notes
+
+- Reader-first, like `bodyEncoding`: the DLQ output and the subscriber pub grant must be in
+  place before any producer of poison — but since the DLQ is sink-internal (the sink both
+  detects and publishes), enabling is a single sink-side change + stream subject + creds.
+- `nsc`-regenerated creds must be committed and pods must remount them before enabling
+  (otherwise the DLQ publish is permission-denied — which would nack/retry, i.e. fail safe,
+  not lose data).
+- INV-1 load-bearing lines edited (rows 7–8 area, output topology): L3 + L4 run and output
+  pasted before completion, per the hard safety rules.
