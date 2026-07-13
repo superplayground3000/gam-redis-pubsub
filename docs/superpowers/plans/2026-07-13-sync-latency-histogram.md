@@ -397,7 +397,8 @@ APPLY=$(grep -o 'cdc_apply[^ ]* [0-9.e+]*$' "$M" | awk '{s+=$2} END {print s}')
 SYNC=$(grep -o 'cdc_sync_latency_seconds_count[^ ]* [0-9.e+]*$' "$M" | awk '{s+=$2} END {print s}')
 echo "apply=$APPLY sync=$SYNC"
 ```
-Expected: `sync > 0` and `sync <= apply` (every sample corresponds to exactly one successful apply; every writer/verifier event carries ts, so the two should be approximately equal). `sync > apply` means error-path messages recorded — FAILURE.
+Expected: `sync > 0`, and PER-OP equality for create and update: the `cdc_sync_latency_seconds_count{op="create"}` sum equals the `cdc_apply{op="create"}` sum, likewise for update. A create/update sync count EXCEEDING its apply count means error-path messages recorded — FAILURE.
+NOTE (found during execution 2026-07-13): do NOT compare whole-metric totals. `cdc_apply` has NO delete/rename series — pre-existing label-set inconsistency (`cdc_apply{op,type}` in the create/update branch vs `cdc_apply{op}` in delete/rename branches; the registry silently rejects the second shape), recorded in the 2026-07-07 SDD ledger. The sync histogram DOES cover delete/rename, so `sync total > apply total` is expected and correct.
 
 - [ ] **Step 4: Report**
 
