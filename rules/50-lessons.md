@@ -2,6 +2,24 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-14 — L1 renders the chart but never LINTS the enabled pipeline on the real Connect binary
+- What happened: The DLQ feature's reverse output put a per-case `processors:` block under the
+  `switch` output (to count `cdc_dlq_forwarded`). `helm lint` + `helm template` accept it (valid
+  YAML/Helm), and Task 2's L3 ran with `deadLetter.enabled=false`, so the enabled output block
+  never rendered. `redpanda-connect lint` on the RENDERED enabled pipeline
+  (`hpdevelop/connect:4.92.0-claudefix`) rejected it — `field processors not recognised` — meaning
+  the sink would fail to load whenever the feature is turned on. Caught only when the L2 lab (which
+  uses the enabled shape) was built.
+- Rule that would have prevented it: a Connect pipeline-YAML change is NOT verified by
+  `helm template` alone — render the pipeline in its ENABLED/feature-on configuration and run
+  `redpanda-connect lint` against the pinned image. `switch`-output cases take only
+  `check`/`continue`/`output`; per-message counting for a routed branch belongs in the pipeline,
+  not the output case. Expected standalone-lint noise: the `__POD__` label placeholder (the elector
+  substitutes it before POSTing) is not a real error.
+- Applied: `chart/files/connect/cdc-reverse.yaml` emits `cdc_dlq_forwarded{reason}` from the three
+  pipeline DLQ branches (commit 999b32f); enabled pipeline now lints clean. Added a best-effort
+  enabled-pipeline lint to the test suite (Task 6 of the DLQ plan).
+
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
 - What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
   lab-connect-sink-a" / "two-seg render missing name: cdc_forward_others" — but chart-identical
