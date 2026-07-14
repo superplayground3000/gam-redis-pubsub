@@ -98,6 +98,7 @@ services:
       MODE: ${GEN_MODE:-mixed}
       RATE: ${GEN_RATE:-20}
       DURATION: ${GEN_DURATION:-0}
+      COUNT: ${GEN_COUNT:-0}
     profiles: ["gen"]     # not started by default `up`; run on demand via the test script
     networks: [lab]
 

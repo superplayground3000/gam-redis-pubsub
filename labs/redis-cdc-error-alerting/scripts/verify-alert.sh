@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Automated proof: healthy → no alert; poison → alert fires (both reasons) & webhook
-# received; hash poison → dead-letters to dlq.cdc.hash_decode_error and the sink
-# consumer's ack floor advances (no loop); recovery (purge) → alert clears. Resolves
-# metric names from /metrics first (no _total assumption). Exits 0 on PASS, 1 on FAIL.
+# received; hash poison → EXACTLY N messages dead-letter to dlq.cdc.hash_decode_error
+# and the sink acks EXACTLY N with ZERO redeliveries (INV-1 no-loss: nothing lost,
+# nothing looping); recovery (purge) → alert clears. Resolves metric names from
+# /metrics first (no _total assumption). Exits 0 on PASS, 1 on FAIL.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 PROM="http://localhost:${PROM_PORT:-19090}"
@@ -79,48 +80,53 @@ sink_ok=$(curl -s "$SINK/alerts" | jq -r --arg a "$ALERT" '[.[]|select(.labels.a
 [ "${sink_ok:-0}" -ge 1 ] || fail "alert-sink did not receive the firing alert"
 echo "  OK: alert firing (both reasons) + webhook received ($sink_ok)"
 
-echo "== PHASE 3: hash poison -> DLQ, ack floor advances, no loop =="
-# This phase must prove THIS hashpoison batch (not stale/concurrent state) was
-# dead-lettered and acked. So: (1) settle the stream, (2) BASELINE the specific
-# dlq.cdc.hash_decode_error subject + the consumer's ack_floor and num_redelivered
-# BEFORE injecting, (3) inject a known small batch in the FOREGROUND, (4) assert the
-# DELTAS. Phase 2's poison lands on dlq.cdc.{unknown_op,decode_error} — DIFFERENT
-# subjects — so baselining the hash subject isolates this batch from that traffic.
-sleep 5   # let the sink drain any in-flight Phase-2 poison before we baseline
+echo "== PHASE 3: hash poison -> DLQ, EXACT no-loss (INV-1) proof =="
+# Prove THIS batch of exactly N hash-poison messages was FULLY dead-lettered and
+# acked — none lost, none looping. Phase 2 poison lands on
+# dlq.cdc.{unknown_op,decode_error} (DIFFERENT subjects), and Phase 2 ran in the
+# FOREGROUND, so the stream is settled and baselining the hash subject isolates
+# this batch. Bind every outcome to N (exact ==, not > BASE): the no-loss guarantee.
+N=10
+# drain(): block until the sink has consumed AND acked everything in the stream
+# (num_pending==0 AND num_ack_pending==0), bounded ~60s. Used BOTH before the
+# baseline (so Phase-2 leftovers can't inflate the ack_floor delta) and after the
+# injection (so the AFTER snapshot is final) — this is what makes the == N deltas
+# exact rather than approximate.
+drain() {
+  for _ in $(seq 1 30); do
+    ci=$(natsbox consumer info LAB_CDC cdc_sink --json)
+    np=$(echo "$ci" | jq -r '.num_pending'); nap=$(echo "$ci" | jq -r '.num_ack_pending')
+    { [ "$np" = "0" ] && [ "$nap" = "0" ]; } && return 0
+    sleep 2
+  done
+  return 1
+}
+drain || fail "stream not settled before Phase-3 baseline (num_pending=$np num_ack_pending=$nap)"
 BASE_DLQ=$(subj_count 'dlq.cdc.hash_decode_error'); BASE_DLQ="${BASE_DLQ:-0}"
-ci=$(natsbox consumer info LAB_CDC cdc_sink --json)
 BASE_FLOOR=$(echo "$ci" | jq -r '.ack_floor.consumer_seq')
 BASE_REDEL=$(echo "$ci" | jq -r '.num_redelivered')
-echo "  baseline: dlq.cdc.hash_decode_error=$BASE_DLQ ack_floor=$BASE_FLOOR num_redelivered=$BASE_REDEL"
+echo "  baseline (settled): dlq.cdc.hash_decode_error=$BASE_DLQ ack_floor=$BASE_FLOOR num_redelivered=$BASE_REDEL (N=$N)"
 
-# Inject a KNOWN small batch (~10 msgs at 5/s for 2s), FOREGROUND (waits for exit).
-GEN_MODE=hashpoison GEN_RATE=5 GEN_DURATION=2 docker compose run --rm generator >/dev/null
+# Inject EXACTLY N (GEN_COUNT, not rate*duration). The generator log.Fatal's if it
+# can't publish all N, so a non-zero exit here already means the batch was short.
+GEN_MODE=hashpoison GEN_COUNT="$N" GEN_RATE=10 docker compose run --rm generator >/dev/null \
+  || fail "generator did not publish exactly N=$N hash-poison messages"
 
-# (a) the hash-DLQ subject must GROW by this batch (new hash poison dead-lettered,
-# not merely "some message already there"). `stream subjects` filtered to the exact
-# subject is the count. (The brief's `stream view --count` is unusable on this nats
-# CLI — `--count` is not a flag and `stream view` needs an interactive TTY.)
-AFTER_DLQ="$BASE_DLQ"
-for i in $(seq 1 20); do   # up to ~40s for consume+DLQ-publish
-  AFTER_DLQ=$(subj_count 'dlq.cdc.hash_decode_error'); AFTER_DLQ="${AFTER_DLQ:-0}"
-  [ "$AFTER_DLQ" -gt "$BASE_DLQ" ] && break
-  sleep 2
-done
-[ "$AFTER_DLQ" -gt "$BASE_DLQ" ] || fail "dlq.cdc.hash_decode_error did not grow ($BASE_DLQ -> $AFTER_DLQ): this hash-poison batch was NOT dead-lettered"
+# Settle again so the AFTER snapshot is final (all N consumed + acked), not mid-flight.
+drain || fail "sink did not drain after injection (num_pending=$np num_ack_pending=$nap): batch stuck in flight"
 
-# (b) ack_floor must ADVANCE (the batch was acked after DLQ publish) and (c)
-# num_redelivered must NOT climb materially (acked once, not nack-looping).
-AFTER_FLOOR="$BASE_FLOOR"; AFTER_REDEL="$BASE_REDEL"
-for i in $(seq 1 20); do   # up to ~40s for the ack floor to catch up
-  ci=$(natsbox consumer info LAB_CDC cdc_sink --json)
-  AFTER_FLOOR=$(echo "$ci" | jq -r '.ack_floor.consumer_seq')
-  AFTER_REDEL=$(echo "$ci" | jq -r '.num_redelivered')
-  awk "BEGIN{exit !($AFTER_FLOOR > $BASE_FLOOR)}" && break
-  sleep 2
-done
-awk "BEGIN{exit !($AFTER_FLOOR > $BASE_FLOOR)}" || fail "ack_floor did not advance ($BASE_FLOOR -> $AFTER_FLOOR): hash poison stuck"
-awk "BEGIN{exit !(($AFTER_REDEL - $BASE_REDEL) <= 1)}" || fail "num_redelivered climbed ($BASE_REDEL -> $AFTER_REDEL): hash poison is looping, not acked-after-DLQ"
-echo "  dlq.cdc.hash_decode_error $BASE_DLQ -> $AFTER_DLQ; ack_floor $BASE_FLOOR -> $AFTER_FLOOR; num_redelivered $BASE_REDEL -> $AFTER_REDEL"
+AFTER_DLQ=$(subj_count 'dlq.cdc.hash_decode_error'); AFTER_DLQ="${AFTER_DLQ:-0}"
+AFTER_FLOOR=$(echo "$ci" | jq -r '.ack_floor.consumer_seq')
+AFTER_REDEL=$(echo "$ci" | jq -r '.num_redelivered')
+D_DLQ=$((AFTER_DLQ - BASE_DLQ)); D_FLOOR=$((AFTER_FLOOR - BASE_FLOOR)); D_REDEL=$((AFTER_REDEL - BASE_REDEL))
+
+# (a) EXACTLY N dead-lettered — every injected poison captured, none silently lost.
+[ "$D_DLQ" -eq "$N" ] || fail "dlq.cdc.hash_decode_error delta=$D_DLQ, expected exactly $N ($BASE_DLQ -> $AFTER_DLQ): hash poison LOST or duplicated"
+# (b) EXACTLY N acked — ack_floor advanced by the whole batch (stream was quiesced).
+[ "$D_FLOOR" -eq "$N" ] || fail "ack_floor delta=$D_FLOOR, expected exactly $N ($BASE_FLOOR -> $AFTER_FLOOR): not all of the batch was acked"
+# (c) ZERO redeliveries — DLQ-then-ack means the poison never nack-loops. Strict.
+[ "$D_REDEL" -eq 0 ] || fail "num_redelivered delta=$D_REDEL, expected exactly 0 ($BASE_REDEL -> $AFTER_REDEL): hash poison is looping, not acked-after-DLQ"
+echo "  EXACT: N=$N; dlq.cdc.hash_decode_error +$D_DLQ ($BASE_DLQ->$AFTER_DLQ); ack_floor +$D_FLOOR ($BASE_FLOOR->$AFTER_FLOOR); num_redelivered +$D_REDEL"
 
 echo "== PHASE 4: recovery → purge poison, alert must clear (~2m window) =="
 docker run --rm --network "container:$(docker compose ps -q nats)" natsio/nats-box:0.14.5 \
