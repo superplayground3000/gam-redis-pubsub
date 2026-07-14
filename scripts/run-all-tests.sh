@@ -67,6 +67,26 @@ grep -q 'reason: hash_decode_error' <<<"$DEFAULT_OUT" && { echo "L1: hash guard 
 # INV-2: cdc_dlq_forwarded is a new counter (Task 2) — it must ship with its own
 # dashboard panel in the same change (rules/05-invariants.md INV-2 load-bearing table).
 grep -q 'cdc_dlq_forwarded' chart/files/grafana/cdc-dashboard.json || { echo "L1: dashboard missing cdc_dlq_forwarded panel"; fail L1; }
+# Lint the ENABLED reverse pipeline against the real Connect binary. `helm template`
+# accepts config that `redpanda-connect lint` rejects (e.g. `processors` under a switch-
+# output case — the DLQ feature shipped that bug once, invisible because L3 runs with the
+# feature OFF; see rules/50-lessons.md 2026-07-14). Best-effort: skips when the pinned
+# image is not available locally (CI/dev with the image built still runs it). The `__POD__`
+# label is the elector's runtime placeholder, not a real lint error — filter it out.
+CONNECT_IMG="${CONNECT_IMG:-hpdevelop/connect:4.92.0-claudefix}"
+if command -v docker >/dev/null 2>&1 && docker image inspect "$CONNECT_IMG" >/dev/null 2>&1; then
+  REV_PIPE=$(python3 -c 'import sys,yaml
+for d in yaml.safe_load_all(sys.stdin):
+  if d and d.get("kind")=="ConfigMap":
+    for k,v in (d.get("data") or {}).items():
+      if v and "reject_errored" in v and "nats_jetstream" in v and "dlq" in v:
+        print(v); sys.exit(0)' <<<"$DLQ_OUT")
+  LINT_OUT=$(printf '%s' "$REV_PIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label '__POD__'" || true)
+  if [ -n "$LINT_OUT" ]; then echo "L1: enabled DLQ reverse pipeline fails redpanda-connect lint:"; echo "$LINT_OUT"; fail L1; fi
+  echo "[run-all-tests] L1: enabled DLQ pipeline lints clean on $CONNECT_IMG"
+else
+  echo "[run-all-tests] L1: skipping enabled-pipeline connect-lint ($CONNECT_IMG not available locally)"
+fi
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
