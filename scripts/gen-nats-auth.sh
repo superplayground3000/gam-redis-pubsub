@@ -6,7 +6,8 @@
 # Env overrides (defaults match chart/values.yaml):
 #   STREAM_NAME=APP_EVENTS        DURABLE_NAME=region-writer
 #   SUBJECT_PREFIX=app.events     (publisher --allow-pub is "<prefix>.>")
-#   DLQ_SUBJECT=dlq.cdc           (subscriber --allow-pub is "<DLQ_SUBJECT>.>")
+#   DLQ_SUBJECT (default: connect.deadLetter.subject in values.yaml, else
+#                dlq.cdc)         (subscriber --allow-pub is "<DLQ_SUBJECT>.>")
 #   OPERATOR_NAME=RRCS-OP         ACCOUNT_NAME=APP
 set -euo pipefail
 
@@ -32,9 +33,9 @@ NSC_STORE_DIR="${OUT}/.nsc-store"
 parse_values() {
   local key="$1" default="$2"
   if [[ -f chart/values.yaml ]]; then
-    # awk walks the YAML hierarchy under `nats:` to find the requested key.
-    # `key` is one of: nats.stream.name, nats.stream.subjectPrefix,
-    # nats.stream.consumer.durable
+    # awk walks the YAML hierarchy under `nats:` (or `connect:`) to find the
+    # requested key. `key` is one of: nats.stream.name, nats.stream.subjectPrefix,
+    # nats.stream.consumer.durable, connect.deadLetter.subject
     local val
     case "$key" in
       nats.stream.name)
@@ -88,6 +89,24 @@ parse_values() {
           }
         ' chart/values.yaml)"
         ;;
+      connect.deadLetter.subject)
+        # shellcheck disable=SC2016
+        # SC2016: awk program is single-quoted intentionally — $0/etc are awk
+        # field refs, not shell variables.
+        val="$(awk '
+          /^connect:/{in_connect=1; next}
+          /^[a-zA-Z]/{in_connect=0}
+          in_connect && /^  deadLetter:/{in_dlq=1; next}
+          in_connect && /^  [a-zA-Z]/{in_dlq=0}
+          in_dlq && /^    subject:/{
+            gsub(/^    subject:[[:space:]]*/,"")
+            gsub(/[[:space:]]*#.*$/,"")
+            gsub(/^"|"$/,"")
+            print
+            exit
+          }
+        ' chart/values.yaml)"
+        ;;
     esac
     [[ -n "$val" ]] && { echo "$val"; return; }
   fi
@@ -97,10 +116,13 @@ parse_values() {
 STREAM_NAME="${STREAM_NAME:-$(parse_values nats.stream.name APP_EVENTS)}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-$(parse_values nats.stream.subjectPrefix app.events)}"
 DURABLE_NAME="${DURABLE_NAME:-$(parse_values nats.stream.consumer.durable region-writer)}"
-# DLQ base subject (chart's connect.deadLetter.subject default); the sink
-# publishes permanently-unprocessable messages to "<DLQ_SUBJECT>.<reason>"
-# using the subscriber creds, so the subscriber user needs pub on the subtree.
-DLQ_SUBJECT="${DLQ_SUBJECT:-dlq.cdc}"
+# DLQ base subject, resolved from chart's connect.deadLetter.subject (same
+# precedence as the other values: env override > values.yaml > built-in
+# default) so that a customized subject in values.yaml stays in sync with the
+# creds this script mints. The sink publishes permanently-unprocessable
+# messages to "<DLQ_SUBJECT>.<reason>" using the subscriber creds, so the
+# subscriber user needs pub on the subtree.
+DLQ_SUBJECT="${DLQ_SUBJECT:-$(parse_values connect.deadLetter.subject dlq.cdc)}"
 OPERATOR_NAME="${OPERATOR_NAME:-RRCS-OP}"
 ACCOUNT_NAME="${ACCOUNT_NAME:-APP}"
 

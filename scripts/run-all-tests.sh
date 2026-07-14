@@ -45,6 +45,27 @@ DLQ_OUT=$(helm template chart/ --set connect.deadLetter.enabled=true) || fail L1
 grep -q 'kv.cdc.>,dlq.cdc.>' <<<"$DLQ_OUT" \
   || { echo "L1: DLQ enabled must extend stream subjects to kv.cdc.>,dlq.cdc.>"; fail L1; }
 if grep -q 'dlq.cdc' <<<"$DEFAULT_OUT"; then echo "L1: default render must not mention dlq"; fail L1; fi
+# Best-effort EXACT guard: the substring checks above only prove dlq/hash-guard
+# strings are absent, not that the default render is otherwise untouched. Diff
+# the current default render against the render at the branch's merge-base
+# with master — deadLetter must be fully gated, so with the toggle off the two
+# renders must be byte-identical. Best-effort: skipped (not failed) when no
+# merge-base is resolvable, e.g. a shallow clone.
+MB=$(git merge-base master HEAD 2>/dev/null || true)
+if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; then
+  MBDIR=$(mktemp -d)
+  if git worktree add -q "$MBDIR" "$MB" 2>/dev/null; then
+    if ! diff <(helm template "$MBDIR/chart") <(printf '%s\n' "$DEFAULT_OUT") >/dev/null; then
+      echo "[run-all-tests] L1: default render is NOT byte-identical to merge-base $MB (deadLetter must be fully gated)"
+      git worktree remove -f "$MBDIR"
+      fail L1
+    fi
+    git worktree remove -f "$MBDIR"
+    echo "[run-all-tests] L1: default render byte-identical to merge-base ✓"
+  fi
+else
+  echo "[run-all-tests] L1: skipping merge-base byte-identical check (no merge-base available)"
+fi
 # fail-loud: subject under kv.cdc must be rejected
 if helm template chart/ --set connect.deadLetter.enabled=true --set connect.deadLetter.subject=kv.cdc.dlq >/dev/null 2>&1; then
   echo "L1: deadLetter.subject under subjectPrefix must fail-loud"; fail L1
