@@ -27,7 +27,7 @@ services:
       - |
         set -e
         nats --server nats://nats:4222 stream add LAB_CDC \
-          --subjects "kv.cdc.>" --storage file --retention limits \
+          --subjects "kv.cdc.>,dlq.cdc.>" --storage file --retention limits \
           --discard old --max-msgs=-1 --max-bytes=-1 --max-age=1h \
           --dupe-window=5m --replicas=1 --max-msg-size=-1 --defaults
         nats --server nats://nats:4222 consumer add LAB_CDC cdc_sink \
