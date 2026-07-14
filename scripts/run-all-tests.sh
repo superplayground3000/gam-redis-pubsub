@@ -64,6 +64,9 @@ grep -q 'nats_jetstream:' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must rout
 grep -qF 'dlq.cdc.${! meta("dlq_reason") }' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must use per-reason subject template"; fail L1; }
 # default output must stay reject_errored: drop (byte-identical guard covers full render)
 grep -q 'reason: hash_decode_error' <<<"$DEFAULT_OUT" && { echo "L1: hash guard leaked into default"; fail L1; } || true
+# INV-2: cdc_dlq_forwarded is a new counter (Task 2) — it must ship with its own
+# dashboard panel in the same change (rules/05-invariants.md INV-2 load-bearing table).
+grep -q 'cdc_dlq_forwarded' chart/files/grafana/cdc-dashboard.json || { echo "L1: dashboard missing cdc_dlq_forwarded panel"; fail L1; }
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \

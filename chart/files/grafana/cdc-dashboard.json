@@ -62,6 +62,11 @@
       "description": "cdc_forward_others: events whose key matched no configured prefix, published to kv.cdc.others.<op> and consumed by the catchAll sink group (reason=no_match). Emitted ONLY when a catchAll group is deployed — without one the same miss increments cdc_forward_unrouted (panel 11) and alerts. A sustained rate here means a key family is flowing through the catch-all: consider giving it its own sinkGroup.",
       "targets": [
         { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_others(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "others {{reason}}" }
+      ] },
+    { "id": 13, "title": "DLQ forwarded (by reason)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 6, "x": 18, "y": 48 },
+      "description": "cdc_dlq_forwarded by reason: messages routed to the dead-letter queue (dlq.cdc.<reason>) when connect.deadLetter.enabled — decode_error / unknown_op / hash_decode_error. Nonzero means permanently-unprocessable messages are being parked (and acked) instead of looping. Pairs with the unprocessable-by-reason panel.",
+      "targets": [
+        { "expr": "sum by (reason) (increase({__name__=~\"cdc_dlq_forwarded(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" }
       ] }
   ]
 }
