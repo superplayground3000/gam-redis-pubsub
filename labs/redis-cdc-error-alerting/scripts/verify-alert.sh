@@ -17,6 +17,12 @@ alert_state() { curl -s "$PROM/api/v1/alerts" | jq -r --arg a "$ALERT" '[.data.a
 # not found"). Run the CLI from a nats-box container joined to the nats
 # container's network namespace instead (same trick Phase 4's purge already uses).
 natsbox() { docker run --rm --network "container:$(docker compose ps -q nats)" natsio/nats-box:0.14.5 nats --server nats://localhost:4222 "$@"; }
+# Message count on ONE stream subject (empty -> nothing printed -> caller defaults 0).
+subj_count() { natsbox stream subjects LAB_CDC "$1" 2>/dev/null | grep -oE "$(printf '%s' "$1" | sed 's/\./\\./g')[^0-9]+[0-9]+" | grep -oE '[0-9]+$' | head -1; }
+# Always tear the lab down on exit (success OR failure) so a rerun starts clean —
+# leftover containers + a file-backed stream are exactly the stale state that makes
+# Phase 3 assertions pass on the wrong data. Preserve the real exit code.
+trap 'ec=$?; docker compose down -v >/dev/null 2>&1 || true; exit $ec' EXIT
 
 echo "== bring up =="
 scripts/run-lab.sh >/dev/null
@@ -54,7 +60,12 @@ firing=$(alert_state | jq -r '[.[]|select(.state=="firing")]|length')
 echo "  OK: cdc_apply climbing, alert inactive"
 
 echo "== PHASE 2: poison → alert must fire (both reasons) and webhook must receive it =="
-GEN_MODE=poison GEN_RATE=20 GEN_DURATION=20 docker compose run -d --rm generator >/dev/null
+# FOREGROUND (not `-d`): the generator publishes its full poison batch and EXITS
+# before we poll, so the stream is settled by the time Phase 3 baselines it. With
+# the DLQ enabled each poison increments cdc_unprocessable once (then is DLQ'd +
+# acked), which is enough to arm the increase[2m] alert — no need for a detached
+# generator to keep re-injecting.
+GEN_MODE=poison GEN_RATE=20 GEN_DURATION=20 docker compose run --rm generator >/dev/null
 ok=0
 for i in $(seq 1 40); do    # up to ~2min
   st=$(alert_state)
@@ -69,32 +80,47 @@ sink_ok=$(curl -s "$SINK/alerts" | jq -r --arg a "$ALERT" '[.[]|select(.labels.a
 echo "  OK: alert firing (both reasons) + webhook received ($sink_ok)"
 
 echo "== PHASE 3: hash poison -> DLQ, ack floor advances, no loop =="
-before=$(natsbox consumer info LAB_CDC cdc_sink --json | jq -r '.ack_floor.consumer_seq')
-GEN_MODE=hashpoison GEN_RATE=5 GEN_DURATION=5 docker compose run --rm generator >/dev/null
-# DLQ subject must receive the malformed hash body. Assert via `stream get
-# --last-for <subject>`: it exits 0 iff at least one message exists on that exact
-# subject, 1 otherwise — an unambiguous presence check needing no output parsing.
-# (The brief's `stream view --count` does NOT work on this nats CLI: `--count`
-# isn't a flag and `stream view` also demands an interactive TTY, so it always
-# errored and the grep spuriously "passed" or failed on the error text.) Only the
-# hash_decode_failed pipeline branch ever publishes here, so a hit is proof the
-# malformed hash body was dead-lettered. Poll: the sink needs a moment to
-# consume+publish after the generator exits.
-dlq_ok=0
-for i in $(seq 1 20); do   # up to ~40s
-  if natsbox stream get LAB_CDC --last-for 'dlq.cdc.hash_decode_error' -j >/dev/null 2>&1; then dlq_ok=1; break; fi
+# This phase must prove THIS hashpoison batch (not stale/concurrent state) was
+# dead-lettered and acked. So: (1) settle the stream, (2) BASELINE the specific
+# dlq.cdc.hash_decode_error subject + the consumer's ack_floor and num_redelivered
+# BEFORE injecting, (3) inject a known small batch in the FOREGROUND, (4) assert the
+# DELTAS. Phase 2's poison lands on dlq.cdc.{unknown_op,decode_error} — DIFFERENT
+# subjects — so baselining the hash subject isolates this batch from that traffic.
+sleep 5   # let the sink drain any in-flight Phase-2 poison before we baseline
+BASE_DLQ=$(subj_count 'dlq.cdc.hash_decode_error'); BASE_DLQ="${BASE_DLQ:-0}"
+ci=$(natsbox consumer info LAB_CDC cdc_sink --json)
+BASE_FLOOR=$(echo "$ci" | jq -r '.ack_floor.consumer_seq')
+BASE_REDEL=$(echo "$ci" | jq -r '.num_redelivered')
+echo "  baseline: dlq.cdc.hash_decode_error=$BASE_DLQ ack_floor=$BASE_FLOOR num_redelivered=$BASE_REDEL"
+
+# Inject a KNOWN small batch (~10 msgs at 5/s for 2s), FOREGROUND (waits for exit).
+GEN_MODE=hashpoison GEN_RATE=5 GEN_DURATION=2 docker compose run --rm generator >/dev/null
+
+# (a) the hash-DLQ subject must GROW by this batch (new hash poison dead-lettered,
+# not merely "some message already there"). `stream subjects` filtered to the exact
+# subject is the count. (The brief's `stream view --count` is unusable on this nats
+# CLI — `--count` is not a flag and `stream view` needs an interactive TTY.)
+AFTER_DLQ="$BASE_DLQ"
+for i in $(seq 1 20); do   # up to ~40s for consume+DLQ-publish
+  AFTER_DLQ=$(subj_count 'dlq.cdc.hash_decode_error'); AFTER_DLQ="${AFTER_DLQ:-0}"
+  [ "$AFTER_DLQ" -gt "$BASE_DLQ" ] && break
   sleep 2
 done
-[ "$dlq_ok" = "1" ] || fail "no message parked on dlq.cdc.hash_decode_error"
-# ack floor must ADVANCE (poison acked after DLQ publish, not stuck redelivering)
-after=0
-for i in $(seq 1 15); do   # up to ~30s for the ack floor to catch up
-  after=$(natsbox consumer info LAB_CDC cdc_sink --json | jq -r '.ack_floor.consumer_seq')
-  awk "BEGIN{exit !($after > $before)}" && break
+[ "$AFTER_DLQ" -gt "$BASE_DLQ" ] || fail "dlq.cdc.hash_decode_error did not grow ($BASE_DLQ -> $AFTER_DLQ): this hash-poison batch was NOT dead-lettered"
+
+# (b) ack_floor must ADVANCE (the batch was acked after DLQ publish) and (c)
+# num_redelivered must NOT climb materially (acked once, not nack-looping).
+AFTER_FLOOR="$BASE_FLOOR"; AFTER_REDEL="$BASE_REDEL"
+for i in $(seq 1 20); do   # up to ~40s for the ack floor to catch up
+  ci=$(natsbox consumer info LAB_CDC cdc_sink --json)
+  AFTER_FLOOR=$(echo "$ci" | jq -r '.ack_floor.consumer_seq')
+  AFTER_REDEL=$(echo "$ci" | jq -r '.num_redelivered')
+  awk "BEGIN{exit !($AFTER_FLOOR > $BASE_FLOOR)}" && break
   sleep 2
 done
-awk "BEGIN{exit !($after > $before)}" || fail "ack floor did not advance ($before -> $after): poison is looping"
-echo "  ack floor advanced $before -> $after; DLQ received hash poison on dlq.cdc.hash_decode_error"
+awk "BEGIN{exit !($AFTER_FLOOR > $BASE_FLOOR)}" || fail "ack_floor did not advance ($BASE_FLOOR -> $AFTER_FLOOR): hash poison stuck"
+awk "BEGIN{exit !(($AFTER_REDEL - $BASE_REDEL) <= 1)}" || fail "num_redelivered climbed ($BASE_REDEL -> $AFTER_REDEL): hash poison is looping, not acked-after-DLQ"
+echo "  dlq.cdc.hash_decode_error $BASE_DLQ -> $AFTER_DLQ; ack_floor $BASE_FLOOR -> $AFTER_FLOOR; num_redelivered $BASE_REDEL -> $AFTER_REDEL"
 
 echo "== PHASE 4: recovery → purge poison, alert must clear (~2m window) =="
 docker run --rm --network "container:$(docker compose ps -q nats)" natsio/nats-box:0.14.5 \
