@@ -149,6 +149,14 @@ pipeline:
                 labels:
                   reason: decode_error
             {{- if .Values.connect.deadLetter.enabled }}
+            # per-delivery count of messages routed to the DLQ (INV-2). Emitted in
+            # the pipeline (not the switch-output case, where `processors` is not a
+            # valid field on this Connect build) alongside the dlq meta.
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: decode_error
             - mapping: |
                 meta dlq        = "yes"
                 meta dlq_reason = "decode_error"
@@ -162,6 +170,11 @@ pipeline:
             - metric:
                 type: counter
                 name: cdc_unprocessable
+                labels:
+                  reason: hash_decode_error
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
                 labels:
                   reason: hash_decode_error
             - mapping: |
@@ -258,6 +271,11 @@ pipeline:
                 labels:
                   reason: unknown_op
             {{- if .Values.connect.deadLetter.enabled }}
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: unknown_op
             - mapping: |
                 meta dlq        = "yes"
                 meta dlq_reason = "unknown_op"
@@ -290,13 +308,6 @@ output:
                 dlq_reason: ${! meta("dlq_reason") }
                 dlq_error: ${! meta("dlq_error") }
                 dlq_orig_subject: ${! meta("nats_subject") }
-          processors:
-            # per-delivery count of messages routed to the DLQ (INV-2 visibility).
-            - metric:
-                type: counter
-                name: cdc_dlq_forwarded
-                labels:
-                  reason: '${! meta("dlq_reason") }'
         - output:
             drop: {}
 {{- else }}
