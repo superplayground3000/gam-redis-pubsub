@@ -279,41 +279,69 @@ connect:
   sinkGroups: []
 
   # ── Per-key sharding (subject-sharding v2: strict per-key ordering) ──────────
-  # Declares key FAMILIES whose subjects are split into per-shard subjects:
-  # a key like lp:m2g:active:{employee:123} publishes to
-  # kv.cdc.lp.m2g.s<123 mod N>.<op>; sinkGroups claim shards via shardsOf/shards
-  # (see above). EMPTY/UNSET => everything below is inert and the render is
-  # byte-identical to the non-sharded chart (INV-S1).
+  # Use this only when one Redis key family is too busy for one sink, but each
+  # individual entity still needs strict ordering. Sharding changes the NATS
+  # subject from one family-wide lane to many shard lanes. For example, with
+  # family "lp:m2g" and shards: 32, this key:
+  #   lp:m2g:active:{employee:123}
+  # is published to:
+  #   kv.cdc.lp.m2g.s27.<op>   # 123 mod 32 = 27
+  # The sinkGroups below must then claim those shard subjects with shardsOf/shards.
   #
-  # Enabling sharding SERIALIZES the forward leg (pipeline threads: 1,
-  # max_in_flight: 1, no reject fallback — ordering links O-3/O-4): correctness
-  # without an LWW fence is carried entirely by the ordering chain, and the
-  # forward throughput ceiling becomes ~1/RTT(central Connect ↔ NATS) for ALL
-  # families combined (design v2 §14 — the known price of the no-fence design).
-  # Requires connect.source.maxInFlight to be UNSET (fail-loud otherwise).
+  # Empty families means sharding is OFF. In that mode keyPattern and
+  # pruneOrphans are ignored and the chart behaves like the normal prefix-based
+  # routing chart.
+  #
+  # Important trade-off: enabling sharding makes the forward leg publish one
+  # message at a time (threads: 1, max_in_flight: 1). This protects ordering
+  # without a last-write-wins fence, but it also means total forward throughput is
+  # limited by the round trip from Connect to NATS. Remove any
+  # connect.source.maxInFlight override before enabling sharding; the chart fails
+  # rendering if both are set.
   sharding:
-    # RE2 pattern extracting the numeric shard key from a kv key. MUST contain
-    # the named capture (?P<id>...). Deliberately matches only the {entity:id}
-    # hash-tag segment so every variant of the same entity (active/standby/…)
-    # lands on the same shard — the correctness premise for per-key ordering.
-    # Keys of a sharded family that DON'T match route to the isolation shard sx
-    # and count cdc_forward_unrouted{reason="unparseable_shard"}.
+    # Regular expression used to find the numeric id that decides the shard.
+    # It must contain a named capture group called "id": (?P<id>...). Only that
+    # captured number is used for shard math.
+    #
+    # The default pattern reads ids from Redis Cluster hash tags like
+    # "{employee:123}". Keeping the id inside a stable hash-tag lets related keys
+    # for the same entity, such as active/standby variants, land on the same
+    # shard and preserve per-entity ordering.
+    #
+    # If a key belongs to a sharded family but does not match this pattern, the
+    # forward leg sends it to the isolation shard "sx" and increments
+    # cdc_forward_unrouted{reason="unparseable_shard"}. Include shard "x" in one
+    # sinkGroup so those messages are not lost.
     keyPattern: '\{employee:(?P<id>[0-9]+)\}'
-    # families:
-    #   "lp:m2g":
-    #     shards: 32        # N; virtual-shard over-provision — pick ONCE, large
-    #                       # (design D-10). Changing N later requires the
-    #                       # pause-drain procedure in
-    #                       # docs/design/subject-sharding/cutover.md.
+    # Families that should be sharded. The map key is the Redis key family prefix
+    # to shard. It uses the same one- or two-segment format as sinkGroup prefixes,
+    # for example "lp" or "lp:m2g". Do not also list the same family in a
+    # sinkGroup.prefixes entry; one family can have only one owner.
+    #
+    # shards is the number of normal numeric shards: s0 through s(N-1). Choose it
+    # once and choose enough headroom for future scale. Changing this number later
+    # moves keys to different subjects and requires the pause/drain/cutover steps
+    # in docs/design/subject-sharding/cutover.md.
+    #
+    # Every enabled sharded family must be fully covered by sinkGroups:
+    #   - all numeric shards 0..N-1 must be claimed exactly once
+    #   - the isolation shard "x" must be claimed exactly once
+    # Example:
+    #   families:
+    #     "lp:m2g":
+    #       shards: 32
     families: {}
-    # nats-init orphan pruning while sharding is configured. false (default) =>
-    # the init Job only REPORTS durables that fell out of the desired set and
-    # never deletes them — cutover step 4 (delete the old superset-filter
-    # durable) must be a deliberate manual act AFTER the drain criterion holds
-    # (num_pending==0 && num_ack_pending==0), because deleting it early while
-    # both old and new consumers exist creates the dual-consumption window that
-    # is a CORRECTNESS error without a fence (design v2 §10). Set true only for
-    # the upgrade that performs cutover step 4, then revert.
+    # Controls whether nats-init deletes old JetStream consumers that are no
+    # longer described by the current sinkGroups while sharding is enabled.
+    #
+    # Keep this false for normal installs and during most cutover steps. With
+    # false, nats-init only prints the orphan consumers it finds; it does not
+    # delete them. This prevents accidentally deleting an old consumer before it
+    # is fully drained.
+    #
+    # Set true only for the deliberate cleanup upgrade after you have confirmed
+    # each old consumer is drained (num_pending==0 and num_ack_pending==0). After
+    # that cleanup upgrade, set it back to false.
     pruneOrphans: false
 
   # Defaults every sinkGroup inherits when it omits a key (group -> sinkDefaults
