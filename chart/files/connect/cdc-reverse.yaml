@@ -98,22 +98,17 @@ pipeline:
         meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
         # ── Sync-latency stash (spec 2026-07-13-sync-latency-histogram) ──
         # Envelope ts = writer mint time (epoch ms, stamped for EVERY op).
-        # Delta is computed HERE (decode time), just before the apply — it
-        # under-counts by one local Redis call (sub-ms), noise at the seconds
-        # scale this metric watches. .catch(0) => a missing/garbled ts can
-        # never throw and nack; it just skips the sample (sync_has_ts=no).
+        # Only the writer timestamp is stashed here (the redis processors below
+        # REPLACE content, so it must live in metadata); the delta itself is
+        # computed in the recording block AFTER the apply switch, so the sample
+        # includes the sink-side Redis apply (peer-review fix 2026-07-15).
+        # .catch(0) => a missing/garbled ts can never throw and nack; it just
+        # skips the sample (sync_has_ts=no).
         let ts_ms = this.ts.number().catch(0)
-        let sync_delta_ns = if $ts_ms > 0 { timestamp_unix_nano() - ($ts_ms * 1000000).round() } else { 0 }
         meta sync_has_ts = if $ts_ms > 0 { "yes" } else { "no" }
-        # Clamp to >=0 (the timing metric processor hard-errors on negatives —
-        # an NTP step must not error-flag messages into the nack path), and
-        # .int64() BEFORE .string(): float arithmetic stringifies large values
-        # in scientific notation, which the metric processor's strconv.ParseInt
-        # rejects — and that error would fire AFTER the apply, nacking an
-        # already-applied message (same trap as writer_ts below). Negative
-        # deltas are counted separately via sync_skew_neg.
-        meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().int64().string()
-        meta sync_skew_neg = if $sync_delta_ns < 0 { "yes" } else { "no" }
+        # Int string, not float: metadata round-trips as strings and float
+        # stringification of epoch-ms can emit scientific notation.
+        meta sync_ts_ms = $ts_ms.round().int64().string()
     {{- if .Values.connect.contentLog.enabled }}
     # Dump exactly what is about to be applied to region Redis (the op switch below
     # turns these into SET / DEL / rename-EVAL). body holds the full value payload.
@@ -247,6 +242,24 @@ pipeline:
     - switch:
         - check: '!errored() && meta("sync_has_ts") == "yes"'
           processors:
+            # Delta computed HERE — after the apply switch — so the histogram
+            # measures writer mint → sink successful apply INCLUSIVE of the
+            # region-Redis write (peer-review fix 2026-07-15). Meta-only
+            # mapping: never assigns root — content here is the raw Redis
+            # reply (e.g. `OK`), not JSON; touching root would error AFTER the
+            # apply and nack an already-applied message. .catch(0) keeps it
+            # throw-proof for the same reason.
+            # Clamp to >=0 (the timing metric processor hard-errors on
+            # negatives — an NTP step must not error-flag messages into the
+            # nack path), and .int64() BEFORE .string(): float arithmetic
+            # stringifies large values in scientific notation, which the
+            # metric processor's strconv.ParseInt rejects. Negative deltas
+            # are counted separately via sync_skew_neg.
+            - mapping: |
+                let ts_ms = meta("sync_ts_ms").number().catch(0)
+                let sync_delta_ns = if $ts_ms > 0 { timestamp_unix_nano() - ($ts_ms * 1000000).round() } else { 0 }
+                meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().int64().string()
+                meta sync_skew_neg = if $sync_delta_ns < 0 { "yes" } else { "no" }
             - metric:
                 type: timing
                 name: cdc_sync_latency_seconds

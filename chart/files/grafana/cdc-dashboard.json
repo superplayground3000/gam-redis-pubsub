@@ -8,7 +8,7 @@
     "list": [
       { "name": "datasource", "type": "datasource", "query": "prometheus", "current": {}, "hide": 0 },
       { "name": "namespace", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(cdc_apply, namespace)", "refresh": 2, "includeAll": true, "multi": true },
-      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(cdc_apply{namespace=~\"$namespace\"}, job)", "refresh": 2, "includeAll": true, "multi": true }
+      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values({__name__=~\"cdc_apply(_total)?|cdc_sync_latency_seconds_count\",namespace=~\"$namespace\"}, job)", "refresh": 2, "includeAll": true, "multi": true }
     ]
   },
   "panels": [
@@ -112,7 +112,7 @@
       "x": 0,
       "y": 48
      },
-     "description": "cdc_sync_skew_negative: messages whose writer ts was AHEAD of the sink clock (delta < 0). The latency sample is clamped to 0 (the metric processor rejects negatives), and counted here instead. Non-zero ⇒ writer/sink NTP drift or a corrupt ts field — investigate.",
+     "description": "cdc_sync_skew_negative: messages whose writer ts was AHEAD of the sink clock (delta < 0). The latency sample is clamped to 0 (the metric processor rejects negatives), and counted here instead. Non-zero ⇒ writer clock ahead of sink (NTP drift) — investigate. Corrupt or missing ts never reaches this counter: it is caught by the ts parse guard (sync_has_ts=no) and skipped entirely.",
      "fieldConfig": {
       "defaults": {
        "unit": "short"
