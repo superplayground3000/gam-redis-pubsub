@@ -25,8 +25,13 @@ RESOURCE_PREFIX="$(helm get values "${RELEASE}" -n "${NS}" -o json | jq -r '.res
 # The connect legs roll whenever a pipeline ConfigMap changes (checksum/connect-config
 # annotation), and helm --wait can return before the new ReplicaSet is observed.
 # Wait for both rollouts so the verifier doesn't race the leader election.
-for d in connect-source connect-sink; do
-  kubectl -n "${NS}" rollout status "deploy/${RESOURCE_PREFIX}${d}" --timeout=180s
+# Sink deployments are discovered by name: multi-group / sharded installs
+# (connect.sinkGroups via RRCS_SET) render connect-sink-<group> instead of the
+# single connect-sink, and every one of them must be rolled out.
+SINK_DEPLOYS="$(kubectl -n "${NS}" get deploy -o name | grep -E "/${RESOURCE_PREFIX}connect-sink" | sed 's|^deployment.apps/||')"
+[ -n "$SINK_DEPLOYS" ] || { echo "[verify] no connect-sink deployments found in ${NS}" >&2; exit 1; }
+for d in "${RESOURCE_PREFIX}connect-source" $SINK_DEPLOYS; do
+  kubectl -n "${NS}" rollout status "deploy/${d}" --timeout=180s
 done
 
 JOB="verifier-${EPOCH}"

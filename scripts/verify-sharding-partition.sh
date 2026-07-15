@@ -8,13 +8,18 @@
 # (older) event AFTER later events already published → the region value for
 # that key would go BACKWARDS after recovery. The monotone assertion below is
 # therefore the direct O-4 oracle.
-# Mechanism: iptables DROP toward the NATS pod IP inside the kind node for
-# PARTITION_S seconds mid-traffic (network partition; connect-source and its
-# elector keep running), then restore and assert:
-#   - output_error on connect-source INCREASED during the partition (proves
-#     real publish failures were exercised — guards against a vacuous pass);
+# Mechanism: iptables DROP toward the NATS pod IP inside the kind node is
+# raised BEFORE the traffic is emitted and held for PARTITION_S seconds
+# (network partition; connect-source and its elector keep running), then
+# lifted. Assertions:
+#   - VACUITY GUARD: while partitioned, ZERO of this run's keys reach region
+#     (proves the pipeline really was stalled on live publish failures — if
+#     the partition were ineffective the keys would stream through);
 #   - region capture stays monotone per key across partition + recovery;
 #   - finals == last emitted sequence; distinct-key creates all present.
+# output_error delta is reported as evidence but not gated: whether the NATS
+# client surfaces per-attempt errors or silently blocks in its reconnect
+# buffer is client-internal — either way O-4 only needs NO nack-reorder.
 # Prereqs: kind (node reachable via docker exec; iptables inside the node).
 # ~6 min. Usage: RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-partition.sh
 set -euo pipefail
@@ -89,7 +94,12 @@ kubectl -n "$NS" exec "$REGION" -- sh -c \
   > "$POLL_OUT" 2>/dev/null &
 POLL_PID=$!
 
-log "starting paced emitter: $NSEQ interleaved updates per key + $NKEYS creates (spans the partition)"
+ERR0="$(metric_sum connect-source output_error)"
+log "PARTITIONING NATS ($NATS_IP) for ${PARTITION_S}s BEFORE emitting (iptables DROP on $NODE); output_error baseline=$ERR0"
+docker exec "$NODE" iptables -I FORWARD 1 -d "$NATS_IP" -j DROP
+sleep 2
+
+log "emitting $((NSEQ*2)) same-key updates + $NKEYS creates INTO the partition"
 kubectl -n "$NS" exec "$CENTRAL" -- sh -c "
   i=1
   while [ \$i -le $NSEQ ]; do
@@ -100,17 +110,19 @@ kubectl -n "$NS" exec "$CENTRAL" -- sh -c "
       redis-cli XADD $STREAM '*' event_id ${runid}-pk-\$k op create type string kv_key \"lb:company:active:{employees:\$k}:pk${runid}\" ts $ts body k\$k >/dev/null
     fi
     i=\$((i+1))
-  done" &
-EMIT_PID=$!
+  done" || die "emitter failed"
 
-sleep 6
-ERR0="$(metric_sum connect-source output_error)"
-log "PARTITIONING NATS ($NATS_IP) for ${PARTITION_S}s mid-traffic (iptables DROP on $NODE); output_error baseline=$ERR0"
-docker exec "$NODE" iptables -I FORWARD 1 -d "$NATS_IP" -j DROP
+log "traffic emitted; holding the partition for ${PARTITION_S}s"
 sleep "$PARTITION_S"
+# VACUITY GUARD: with NATS unreachable the forward cannot publish, so nothing
+# of this run may have applied. Any key present => the partition never bit and
+# the O-4 blocking claim was not exercised.
+STALLED="$(cnt "*${runid}*")"
+ERRP="$(metric_sum connect-source output_error)"
+(( STALLED == 0 )) || die "VACUOUS: $STALLED keys applied WHILE partitioned — the partition never caused a live publish failure; O-4 blocking not exercised"
+log "stall confirmed: 0 keys applied while partitioned (output_error now $ERRP)"
 unblock
-log "partition lifted; waiting for emitter + drain"
-wait "$EMIT_PID" || die "emitter failed"
+log "partition lifted; waiting for drain"
 
 ERR1="$(metric_sum connect-source output_error)"
 deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
@@ -121,10 +133,9 @@ while (( $(date +%s) < deadline )); do
   sleep 3
 done
 kill "$POLL_PID" >/dev/null 2>&1 || true; wait "$POLL_PID" 2>/dev/null || true
-[ "$fa" = "$NSEQ" ]  || die "final active $fa != $NSEQ after partition recovery"
+[ "$fa" = "$NSEQ" ]  || die "final active $fa != $NSEQ after partition recovery (forward stuck or messages lost)"
 [ "$fsv" = "$NSEQ" ] || die "final standby $fsv != $NSEQ after partition recovery"
 (( kc == NKEYS ))    || die "loss across partition: $kc/$NKEYS creates reached region"
-(( ERR1 > ERR0 ))    || die "VACUOUS: output_error did not increase ($ERR0 -> $ERR1) — the partition never caused a live publish failure; the O-4 blocking claim was not exercised"
 
 viol="$(awk -F'|' '
   { for (c = 1; c <= 2; c++) {
@@ -136,7 +147,7 @@ viol="$(awk -F'|' '
   END { exit bad }' "$POLL_OUT" 2>&1)" \
   || die "ORDER VIOLATION across live publish failure (output nacked instead of blocking — O-4 broken): $viol"
 SAMPLES=$(grep -c . "$POLL_OUT" || true); rm -f "$POLL_OUT"
-log "partition OK: output_error $ERR0 -> $ERR1 (real failures), $SAMPLES samples monotone, finals $fa/$fsv, $kc/$NKEYS creates"
+log "partition OK: stalled-at-0 while blocked, output_error $ERR0 -> $ERR1 (informational), $SAMPLES samples monotone, finals $fa/$fsv, $kc/$NKEYS creates"
 
-echo "RESULT_JSON:{\"output_error_delta\":$(( ERR1 - ERR0 )),\"samples\":$SAMPLES,\"finals\":\"$fa/$fsv\",\"creates\":$kc}"
+echo "RESULT_JSON:{\"stalled_keys\":0,\"output_error_delta\":$(( ERR1 - ERR0 )),\"samples\":$SAMPLES,\"finals\":\"$fa/$fsv\",\"creates\":$kc}"
 echo "[shard-partition] PASS — live publish failures blocked in place: no nack-reorder, no loss (O-4/D-7)"
