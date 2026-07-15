@@ -125,22 +125,35 @@ pipeline:
           } else { "" }
         let sh_tok    = if $fam_n == null { "" }
           else if $sh_id == "" { "sx" }
-          else { "s" + ($sh_id.number().int64() % $fam_n.int64()).string() }
+          # An id >= 2^63 overflows the .int64() cast ("float value too large to
+          # be cast as a signed integer"); .catch("sx") routes it to the
+          # isolation shard exactly like a missing id, instead of erroring the
+          # mapping. A mapping error would leave kv_prefix unset -> the bare
+          # sharded output publishes to kv.cdc.<fam>.null.<op>, the stream
+          # (kv.cdc.>) accepts it, PubAck triggers XACK, and NO consumer filter
+          # matches -> silent per-message loss with zero metrics.
+          else { ("s" + ($sh_id.number().int64() % $fam_n.int64()).string()).catch("sx") }
         # Cross-shard rename assertion (INV-S7): ANY disagreement among the
         # rename's parsed ids — old vs new, or (when the producer set kv_key,
         # which this repo's writer never does) the routing key vs new — means
         # the same-entity-same-shard premise broke. Quarantine to sx instead of
         # letting one rename's ordering split across two consumers. Note ids
-        # go through .number() (float64): above 2^53 precision loss shifts
-        # PLACEMENT only — it stays deterministic per id string, so
-        # same-entity-same-shard and this consistency check are unaffected.
+        # go through .number() (float64): between 2^53 and 2^63 precision loss
+        # shifts PLACEMENT only — it stays deterministic per id string, so
+        # same-entity-same-shard and this consistency check are unaffected. At
+        # or above 2^63 the .int64() cast ERRORS (float too large to cast); the
+        # id arithmetic below is .catch(false)-wrapped so an overflowing rename
+        # falls through to the sh_id/sh_tok path (sx + "unparseable"), NOT to
+        # cross_shard_rename — an overflow is an unplaceable id, not an INV-S7
+        # violation, so it must not perturb that must-stay-0 counter. Letting it
+        # error instead would leave kv_prefix unset -> silent loss (see sh_tok).
         let old_id = meta("old_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
         let new_id = meta("new_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
         let x_shard = $fam_n != null && meta("op").or("") == "rename" &&
                       (($old_id != "" && $new_id != "" &&
                         ($old_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())) ||
                        ($sh_id != "" && $new_id != "" &&
-                        ($sh_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())))
+                        ($sh_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64()))).catch(false)
         meta kv_prefix = if $fam_n == null { $base_prefix }
           else if $x_shard { $base_prefix + ".sx" }
           else { $base_prefix + "." + $sh_tok }
@@ -149,7 +162,7 @@ pipeline:
         # processors, which would make the counter switch below unreliable.
         meta kv_shard_reason = if $fam_n == null { "none" }
           else if $x_shard { "cross_shard_rename" }
-          else if $sh_id == "" { "unparseable" }
+          else if $sh_tok == "sx" { "unparseable" }
           else { "sharded" }
         {{- else }}
         meta kv_prefix        = $hit.or("others")

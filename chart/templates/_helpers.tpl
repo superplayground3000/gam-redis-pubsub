@@ -338,6 +338,7 @@ in this pass); the 57-char name budget.
 {{- end -}}
 {{- $out := list -}}
 {{- $seenPrefixes := dict -}}
+{{- $seenNames := dict -}}
 {{- /* Families join the prefix-conflict domain: a family may not double as a
      group prefix (double delivery: the group filter <p>.<fam>.> is a superset
      of every <p>.<fam>.s<K>.> shard filter), and the 1-seg/2-seg overlap sweep
@@ -354,6 +355,22 @@ in this pass); the 57-char name budget.
 {{-   if not (regexMatch $tokenRe $name) -}}
 {{-     fail (printf "connect.sinkGroups: group name %q is not a valid NATS+DNS token (^[a-z0-9]([a-z0-9-]*[a-z0-9])?$: lowercase alnum + dash, no leading/trailing dash)" $name) -}}
 {{-   end -}}
+{{- /* Name uniqueness across ALL groups AS WRITTEN — checked here, before the
+     enabled flag is read, so it fires even when a duplicate is disabled. This is
+     DELIBERATELY stricter than the enabled-gated duplicate-prefix sweep below
+     (seenPrefixes only registers enabled groups): a duplicate NAME has no inert
+     interpretation — two groups with one name derive one Deployment (K8s name
+     collision, one silently wins) and one durable in the nats-init SINK_GROUPS
+     record carrying two conflicting FilterSubjects; drift-reconcile flips that
+     filter and one group's traffic is published but never consumed (silent
+     delivery loss). A disabled duplicate is a config smell that becomes exactly
+     that bug the moment it is enabled, so it is rejected up front. Groups that
+     omit name resolve to "default", so two un-named (or two literal "default")
+     groups collide here too. */ -}}
+{{-   if hasKey $seenNames $name -}}
+{{-     fail (printf "connect.sinkGroups: group name %q is used by more than one group — names must be UNIQUE across all groups as written (checked regardless of enabled: a disabled duplicate is a config smell that becomes a correctness bug the moment it is enabled). Two groups sharing a name derive the SAME sink Deployment (Kubernetes name collision — one silently wins) and the SAME durable %q in the nats-init SINK_GROUPS record, which then carries two conflicting FilterSubjects; drift-reconcile flips the durable's filter so one group's traffic is published to JetStream but never consumed — silent delivery loss. Give each group a distinct name." $name (printf "%s_%s" $baseDurable $name)) -}}
+{{-   end -}}
+{{-   $_ := set $seenNames $name $name -}}
 {{-   $isDefault := eq $name "default" -}}
 {{-   $mode := $g.mode | default "ha" -}}
 {{-   if not (has $mode (list "ha")) -}}
