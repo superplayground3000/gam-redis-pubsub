@@ -269,6 +269,7 @@ if [ "${RUN_FAILOVER:-0}" = "1" ]; then
   if [ "${RUN_SHARDING:-0}" = "1" ]; then
     RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-failover.sh || fail L4
     RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-replay.sh || fail L4
+    RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-partition.sh || fail L4
   fi
   pass L4
 else

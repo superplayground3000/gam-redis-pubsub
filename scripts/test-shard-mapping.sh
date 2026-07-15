@@ -64,6 +64,8 @@ cat > "$WORK/cases.json" <<'EOF'
   "note":"id 8 mod 4 = s0"},
  {"kv_key":"lb:company:standby:{employees:0007}", "want":"lb.company.s3", "want_shard":"sharded",
   "note":"leading zeros parse numerically: 7 mod 4 = s3"},
+ {"kv_key":"lb:company:active:{employees:9007199254740992}", "want":"lb.company.s0", "want_shard":"sharded",
+  "note":"2^53 (float64 exact-representation boundary): mod stays deterministic; beyond 2^53 precision loss degrades balance only, never same-key consistency"},
  {"kv_key":"lb:company:active:no-tag-here",    "want":"lb.company.sx", "want_shard":"unparseable",
   "note":"family key without {employees:N} -> isolation shard"},
  {"op":"rename",

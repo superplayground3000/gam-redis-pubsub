@@ -443,7 +443,7 @@ in this pass); the 57-char name budget.
 {{-       end -}}
 {{-       if $enabled -}}
 {{-         if hasKey $seenPrefixes $p -}}
-{{-           fail (printf "connect.sinkGroups[%s].prefixes: %q is already owned by enabled group %q — a prefix may belong to exactly one enabled group" $name $p (get $seenPrefixes $p)) -}}
+{{-           fail (printf "connect.sinkGroups[%s].prefixes: %q is already owned by %q — a prefix may belong to exactly one enabled owner (a sinkGroup's prefixes or a connect.sharding family)" $name $p (get $seenPrefixes $p)) -}}
 {{-         end -}}
 {{-         $_ := set $seenPrefixes $p $name -}}
 {{-       end -}}
