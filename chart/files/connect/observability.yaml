@@ -12,3 +12,8 @@ logger:
 metrics:
   prometheus:
     use_histogram_timing: true
+    # Buckets are SECONDS (exporter divides timing ns by 1e9). 30/60/120 keep
+    # outage/PEL-replay tails out of +Inf (DefBuckets top out at 10s). GLOBAL:
+    # the built-in timing metrics (processor_latency_ns etc.) get the same
+    # seconds buckets — owner-approved 2026-07-13.
+    histogram_buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120]

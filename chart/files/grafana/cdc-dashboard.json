@@ -8,7 +8,7 @@
     "list": [
       { "name": "datasource", "type": "datasource", "query": "prometheus", "current": {}, "hide": 0 },
       { "name": "namespace", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(cdc_apply, namespace)", "refresh": 2, "includeAll": true, "multi": true },
-      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(cdc_apply{namespace=~\"$namespace\"}, job)", "refresh": 2, "includeAll": true, "multi": true }
+      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values({__name__=~\"cdc_apply(_total)?|cdc_sync_latency_seconds_count\",namespace=~\"$namespace\"}, job)", "refresh": 2, "includeAll": true, "multi": true }
     ]
   },
   "panels": [
@@ -62,6 +62,68 @@
       "description": "cdc_forward_others: events whose key matched no configured prefix, published to kv.cdc.others.<op> and consumed by the catchAll sink group (reason=no_match). Emitted ONLY when a catchAll group is deployed — without one the same miss increments cdc_forward_unrouted (panel 11) and alerts. A sustained rate here means a key family is flowing through the catch-all: consider giving it its own sinkGroup.",
       "targets": [
         { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_others(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "others {{reason}}" }
-      ] }
+      ] },
+    {
+     "id": 13,
+     "title": "Sync latency p50/p95/p99 (s) by group",
+     "type": "timeseries",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "gridPos": {
+      "h": 8,
+      "w": 12,
+      "x": 12,
+      "y": 40
+     },
+     "description": "cdc_sync_latency_seconds: writer mint (envelope ts) → sink successful apply, ALL ops — includes forward leg, JetStream, and redelivery/replay time. Timing is fed in ns; the exporter divides by 1e9, so values are SECONDS. sum by (le, job): each sink group keeps its own distribution — merging jobs would produce a bogus blended quantile.",
+     "fieldConfig": {
+      "defaults": {
+       "unit": "s"
+      }
+     },
+     "targets": [
+      {
+       "expr": "histogram_quantile(0.50, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{job}} p50"
+      },
+      {
+       "expr": "histogram_quantile(0.95, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{job}} p95"
+      },
+      {
+       "expr": "histogram_quantile(0.99, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{job}} p99"
+      }
+     ]
+    },
+    {
+     "id": 14,
+     "title": "Sync clock-skew negatives",
+     "type": "timeseries",
+     "datasource": {
+      "type": "prometheus",
+      "uid": "${datasource}"
+     },
+     "gridPos": {
+      "h": 8,
+      "w": 12,
+      "x": 0,
+      "y": 48
+     },
+     "description": "cdc_sync_skew_negative: messages whose writer ts was AHEAD of the sink clock (delta < 0). The latency sample is clamped to 0 (the metric processor rejects negatives), and counted here instead. Non-zero ⇒ writer clock ahead of sink (NTP drift) — investigate. Corrupt or missing ts never reaches this counter: it is caught by the ts parse guard (sync_has_ts=no) and skipped entirely.",
+     "fieldConfig": {
+      "defaults": {
+       "unit": "short"
+      }
+     },
+     "targets": [
+      {
+       "expr": "sum(increase({__name__=~\"cdc_sync_skew_negative(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))",
+       "legendFormat": "negative deltas (clamped to 0)"
+      }
+     ]
+    }
   ]
 }

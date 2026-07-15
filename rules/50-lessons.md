@@ -190,3 +190,8 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
   final review is what caught it; keep it.
 - Applied: `_helpers.tpl` whole-stream guard (commit 344ef76); reinforces
   `~/.claude/rules/subagent-provider-routing.md` (final review → Codex).
+
+## 2026-07-13 — Verify a metric's actual series shape before asserting against it
+- What happened: the sync-latency plan asserted `sync_count <= cdc_apply_count` at L3; it false-failed because `cdc_apply` has NO delete/rename series (pre-existing `{op,type}` vs `{op}` label-set inconsistency silently rejects the second shape — same quirk the 2026-07-07 run logged as a minor). The new histogram counted ops that cdc_apply cannot.
+- Rule that would have prevented it: new — before writing an assertion that compares two metrics, curl/dump the live series of BOTH and compare per-label-set, not whole-metric totals; treat a ledger "minor, pre-existing" note as an input to later plans.
+- Applied: plan step fixed to per-op create/update equality (commit b875315); recorded only, no rule file change.
