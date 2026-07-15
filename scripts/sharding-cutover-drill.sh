@@ -88,6 +88,15 @@ runid="$(date +%s%3N)"; ts="$runid"
 EMP=5; KO="lb:company:active:{employees:${EMP}}:cut${runid}"
 seq_emitted=0
 
+# region-side poller: captures the same-key lane's intermediate states across
+# the WHOLE drill (pre-pause, pause, flip, resume) so the no-reorder claim is
+# asserted on observed sequence monotonicity, not just the final value.
+POLL_OUT="$(mktemp)"
+kubectl -n "$NS" exec "$REGION" -- sh -c \
+  "i=0; while [ \$i -lt 200000 ]; do redis-cli GET '$KO'; i=\$((i+1)); done" \
+  > "$POLL_OUT" 2>/dev/null &
+POLL_PID=$!
+
 emit_batch() { # $1=tag $2=count $3=seq-updates-count
   local tag="$1" n="$2" nups="$3" i cmds; cmds="$(mktemp)"
   for (( i=1; i<=n; i++ )); do
@@ -155,7 +164,16 @@ deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
 while (( $(date +%s) < deadline )); do
   fo="$(rr GET "$KO" | tr -d '\r')"; [ "$fo" = "$seq_emitted" ] && break; sleep 3
 done
+kill "$POLL_PID" >/dev/null 2>&1 || true; wait "$POLL_PID" 2>/dev/null || true
 [ "$fo" = "$seq_emitted" ] || die "same-key lane final $fo != $seq_emitted (reorder or loss across cutover)"
+viol="$(awk '
+  { if ($0 == "") next
+    if ($0 + 0 < last) { print last " -> " $0; bad = 1 }
+    last = $0 + 0 }
+  END { exit bad }' "$POLL_OUT" 2>&1)" \
+  || die "ORDER VIOLATION across cutover (value went backwards): $viol"
+DRILL_SAMPLES=$(grep -c . "$POLL_OUT" || true); rm -f "$POLL_OUT"
+log "same-key lane monotone across the whole drill ($DRILL_SAMPLES samples)"
 sx_probe="$(kubectl -n "$NS" get pods -l app=connect-sink-shard-b -o jsonpath='{.items[*].metadata.name}')"
 sxa=0
 for pod in $sx_probe; do

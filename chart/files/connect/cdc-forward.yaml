@@ -126,14 +126,21 @@ pipeline:
         let sh_tok    = if $fam_n == null { "" }
           else if $sh_id == "" { "sx" }
           else { "s" + ($sh_id.number().int64() % $fam_n.int64()).string() }
-        # Cross-shard rename assertion (INV-S7): old/new resolving to different
-        # shards means the same-entity-same-shard premise broke — quarantine to
-        # sx instead of splitting one rename across two consumers.
+        # Cross-shard rename assertion (INV-S7): ANY disagreement among the
+        # rename's parsed ids — old vs new, or (when the producer set kv_key,
+        # which this repo's writer never does) the routing key vs new — means
+        # the same-entity-same-shard premise broke. Quarantine to sx instead of
+        # letting one rename's ordering split across two consumers. Note ids
+        # go through .number() (float64): above 2^53 precision loss shifts
+        # PLACEMENT only — it stays deterministic per id string, so
+        # same-entity-same-shard and this consistency check are unaffected.
         let old_id = meta("old_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
         let new_id = meta("new_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
         let x_shard = $fam_n != null && meta("op").or("") == "rename" &&
-                      $old_id != "" && $new_id != "" &&
-                      ($old_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())
+                      (($old_id != "" && $new_id != "" &&
+                        ($old_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())) ||
+                       ($sh_id != "" && $new_id != "" &&
+                        ($sh_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())))
         meta kv_prefix = if $fam_n == null { $base_prefix }
           else if $x_shard { $base_prefix + ".sx" }
           else { $base_prefix + "." + $sh_tok }
