@@ -1,0 +1,81 @@
+# Example values for connect.sharding.* with sharded and non-sharded sinkGroups
+# running side by side.
+#
+# Scenario:
+#   - Keys for the high-volume lp:m2g family look like
+#     lp:m2g:active:{employee:123}. The employee id decides the shard, so every
+#     key variant for employee 123 is delivered to the same shard and applied in
+#     order.
+#   - Keys for lower-volume families, such as lp:g2m and lp:r2g, do not need
+#     per-key sharding. They continue to use normal prefix-routed sinkGroups.
+#   - A catch-all group receives keys that do not match any configured sharded
+#     family or non-sharded prefix.
+#
+# Install example:
+#   helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
+#     -f chart/examples/values-sharding.yaml
+
+connect:
+  # Required for sharding: leave maxInFlight unset. Sharding renders the forward
+  # output with max_in_flight: 1 to keep publish order strict.
+  source:
+    maxInFlight:
+
+  sharding:
+    # Extract the numeric id from the hash-tag part of the key. For
+    # lp:m2g:active:{employee:123}, the captured id is 123.
+    keyPattern: '\{employee:(?P<id>[0-9]+)\}'
+
+    # Shard only the high-volume lp:m2g family. With shards: 8, normal shard
+    # subjects are kv.cdc.lp.m2g.s0.> through kv.cdc.lp.m2g.s7.>.
+    #
+    # Do not also configure "lp:m2g" under any sinkGroup.prefixes entry. A family
+    # can be owned either by sharding or by prefix routing, never both.
+    families:
+      "lp:m2g":
+        shards: 8
+
+    # Safety default. nats-init reports obsolete consumers but does not delete
+    # them. Change to true only during the explicit post-drain cleanup upgrade,
+    # then change it back to false.
+    pruneOrphans: false
+
+  # Sharded and non-sharded sinkGroups can co-exist:
+  #   - shardsOf/shards groups consume per-shard subjects for sharded families.
+  #   - prefixes groups consume regular prefix-routed subjects for families that
+  #     do not need sharding.
+  #   - catchAll consumes the remaining kv.cdc.others.> traffic.
+  #
+  # Because at least one prefix/sharded group is enabled, do not add a group with
+  # no routing key. A whole-stream group would receive the same messages again.
+  sinkGroups:
+    # Sharded groups for lp:m2g. The union must cover every numeric shard exactly
+    # once and also cover isolation shard "x" exactly once.
+    - name: m2g-a
+      shardsOf: "lp:m2g"
+      shards: [0, 1, 2, 3]
+
+    - name: m2g-b
+      shardsOf: "lp:m2g"
+      shards: [4, 5, 6, 7]
+
+    # The isolation shard receives lp:m2g keys that do not match keyPattern, plus
+    # cross-shard rename events. Monitor it; it should normally stay empty or
+    # near zero.
+    - name: m2g-isolation
+      shardsOf: "lp:m2g"
+      shards: ["x"]
+
+    # Non-sharded groups can stay on normal prefix routing. These families still
+    # publish to subjects like kv.cdc.lp.g2m.<op> and kv.cdc.lp.r2g.<op>.
+    - name: g2m
+      prefixes: ["lp:g2m"]
+
+    - name: r2g
+      prefixes: ["lp:r2g"]
+
+    # Optional catch-all for all keys outside lp:m2g, lp:g2m, and lp:r2g. Without
+    # this group, unmatched messages park on kv.cdc.others.<op> and trigger the
+    # unrouted alert instead of being applied.
+    - name: others
+      catchAll: true
