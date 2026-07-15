@@ -208,6 +208,14 @@ pipeline:
                 name: cdc_apply
                 labels:
                   op: delete
+                  # Keep the label SET identical across all cdc_apply branches
+                  # (create/update/delete/rename). delete envelopes carry no type,
+                  # so meta("type") is the "string" default from the stash mapping.
+                  # A differing label set makes the Prometheus exporter log
+                  # "Metrics label mismatch N versus M ... skipping metric" and drop
+                  # whichever set registers second — historically hid delete/rename
+                  # applies entirely (INV-2: cdc_apply increments after apply).
+                  type: '${! meta("type") }'
         - check: meta("op") == "rename"
           processors:
             - redis:
@@ -222,6 +230,9 @@ pipeline:
                 name: cdc_apply
                 labels:
                   op: rename
+                  # Same label-set-consistency requirement as the delete branch:
+                  # rename envelopes carry no type, so meta("type") is "string".
+                  type: '${! meta("type") }'
         - processors:
             - metric:
                 type: counter
