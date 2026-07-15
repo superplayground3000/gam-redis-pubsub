@@ -53,8 +53,15 @@ spec:
           # consumer (not just the stream) so the input doesn't crashloop on
           # "consumer does not exist for bind mode" before the nats-init Job
           # creates it. consumer info also implies the stream exists.
+          {{- /* Sharded groups gate on EVERY shard durable: the broker input
+               needs all its bind children to attach (one missing durable would
+               crashloop the whole group's pipeline). */}}
           args:
+            {{- if $g.sharded }}
+            - for d in{{ range $c := $g.consumers }} {{ $c.durable }}{{ end }}; do until nats --server {{ include "rrcs.nats.url" $ | quote }} --creds /etc/nats-creds/subscriber/user.creds consumer info {{ $.Values.nats.stream.name }} "$d" >/dev/null 2>&1; do echo "waiting pull consumer $d"; sleep 1; done; done
+            {{- else }}
             - until nats --server {{ include "rrcs.nats.url" $ | quote }} --creds /etc/nats-creds/subscriber/user.creds consumer info {{ $.Values.nats.stream.name }} {{ $g.durable }} >/dev/null 2>&1; do echo waiting pull consumer; sleep 1; done
+            {{- end }}
           volumeMounts:
             - name: nats-creds
               mountPath: /etc/nats-creds/subscriber

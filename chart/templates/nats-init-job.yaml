@@ -6,7 +6,13 @@ metadata:
   # NEW Job name rather than failing `helm upgrade` on the immutable completed Job
   # (spec §5.2). sinkGroups/sinkDefaults are in the hash (design §4 item 4) so
   # adding/removing a group actually re-runs the per-group consumer reconcile.
-  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s|%s|%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) (toYaml .Values.connect.sinkGroups) (toYaml (.Values.connect.sinkDefaults | default dict)) | sha256sum | trunc 8))) }}
+  {{- /* sharding joins the hash ONLY when configured, so the unconfigured
+       job name (and render) stays byte-identical to the pre-sharding chart. */}}
+  {{- $shardHash := "" }}
+  {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
+  {{- $shardHash = toYaml .Values.connect.sharding }}
+  {{- end }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s|%s|%s%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) (toYaml .Values.connect.sinkGroups) (toYaml (.Values.connect.sinkDefaults | default dict)) $shardHash | sha256sum | trunc 8))) }}
   labels:
     app: nats-init
 spec:
@@ -107,8 +113,12 @@ spec:
               #
               # GROUPS: one line, records ';'-separated, fields '|'-separated —
               #   DURABLE|FILTER(csv)|MAXPENDING|ACKWAIT|MAXDELIVER
-              SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s|%s|%v|%s|%v;" $g.durable $g.filter $g.maxAckPending $g.ackWait $g.maxDeliver }}{{ end }}{{ end }}'
-              DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s " $g.durable }}{{ end }}{{ end }}'
+              {{- /* One record per CONSUMER: non-shard groups have exactly one;
+                   sharded groups one per claimed shard, with max_ack_pending
+                   HARD-CODED to 1 by the helper (ordering link O-6 — never the
+                   consumer.* inheritance chain). */}}
+              SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s|%s|%v|%s|%v;" $c.durable $c.filter $c.maxAckPending $g.ackWait $g.maxDeliver }}{{ end }}{{ end }}{{ end }}'
+              DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s " $c.durable }}{{ end }}{{ end }}{{ end }}'
               BASE_DURABLE={{ .Values.nats.stream.consumer.durable | quote }}
 
               # Normalize a desired ack_wait ("30s") to ns to diff it against the
@@ -193,6 +203,37 @@ spec:
                 nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
               done
 
+              {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
+
+              # ── Orphan pruning — MANUAL-GATED while sharding is configured ────
+              # Deleting a durable that fell out of the config is cutover STEP 4
+              # (docs/design/subject-sharding/cutover.md) and is only safe AFTER
+              # the drain criterion (num_pending==0 && num_ack_pending==0) holds:
+              # the old group's superset filter (kv.cdc.<family>.>) dual-consumes
+              # every shard subject, and WITHOUT a fence dual consumption is a
+              # correctness error, not waste. So with sharding configured this
+              # block only REPORTS orphans unless connect.sharding.pruneOrphans
+              # was deliberately set for the cutover upgrade.
+              PRUNE='{{ ternary "1" "0" (((.Values.connect.sharding).pruneOrphans) | default false) }}'
+              EXISTING=$(nats --server "$SERVER" --creds "$CREDS" consumer ls "$STREAM" --names 2>/dev/null || true)
+              for existing in $EXISTING; do
+                case "$existing" in
+                  "$BASE_DURABLE"|"$BASE_DURABLE"_*) ;;
+                  *) continue;;
+                esac
+                keep=0
+                for d in $DESIRED_DURABLES; do [ "$existing" = "$d" ] && keep=1 && break; done
+                if [ "$keep" = 0 ]; then
+                  if [ "$PRUNE" = 1 ]; then
+                    echo "orphan prune: removing unbound consumer $existing (no longer in sinkGroups; connect.sharding.pruneOrphans=true)"
+                    nats --server "$SERVER" --creds "$CREDS" consumer rm "$STREAM" "$existing" --force
+                  else
+                    echo "orphan prune SKIPPED for $existing: sharding is configured and connect.sharding.pruneOrphans=false — verify the drain criterion (num_pending==0 && num_ack_pending==0), then re-run the upgrade with pruneOrphans=true (cutover step 4)"
+                  fi
+                fi
+              done
+              {{- else }}
+
               # ── Orphan pruning (design §4 item 3) ──────────────────────────────
               # Scaling sinkGroups DOWN must delete the now-unbound durables (an
               # unbound pull consumer accrues num_pending forever). Only ever touch
@@ -213,6 +254,7 @@ spec:
                   nats --server "$SERVER" --creds "$CREDS" consumer rm "$STREAM" "$existing" --force
                 fi
               done
+              {{- end }}
           volumeMounts:
             - name: admin-creds
               mountPath: /etc/nats-creds/admin

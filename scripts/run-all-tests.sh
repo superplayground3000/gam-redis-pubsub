@@ -10,6 +10,11 @@
 #   in a SEPARATE namespace cdc-mg: verify-cdc-prefix.sh + verify-cdc-twoseg.sh at
 #   L3 and (with RUN_FAILOVER=1) verify-failover-prefix.sh at L4. Needs the wildcard subscriber
 #   grant (committed) — see scripts/gen-nats-auth.sh / values connect.sinkGroups.
+# RUN_SHARDING=1 additionally runs the subject-sharding v2 variants in namespace
+#   cdc-shard: verify-sharding.sh (T-4 ordering + T-9 consumer asserts) at L3 and
+#   (with RUN_FAILOVER=1) verify-sharding-failover.sh + verify-sharding-replay.sh
+#   at L4. measure-shard-throughput.sh (T-8, tc netem) and
+#   sharding-cutover-drill.sh (T-10) stay manual-only.
 # Env knobs: KIND_NAME (default cdc), RRCS_NS (default cdc-k8s), RRCS_RELEASE (default cdc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -156,6 +161,76 @@ done
 if helm template chart/ --set connect.sinkGroups[0].name=others --set connect.sinkGroups[0].catchAll=true >/dev/null 2>&1; then
   echo "[run-all-tests] catchAll without any prefixed group should fail-loud"; fail L1
 fi
+
+# ── Subject-sharding v2 (docs/design/subject-sharding/design.md) ──
+# T-1 (sharding ON assertions; sharding OFF byte-identity is implied by the
+# leak checks below — every sharding artifact is grepped absent from the
+# default render). Family lb:company, N=4, two shard groups + catchAll.
+SH_VALUES=$(mktemp); trap 'rm -f "$SH_VALUES"' EXIT
+cat > "$SH_VALUES" <<'EOF'
+connect:
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'
+    families:
+      "lb:company":
+        shards: 4
+  sinkGroups:
+    - { name: shard-a, shardsOf: "lb:company", shards: [0, 1] }
+    - { name: shard-b, shardsOf: "lb:company", shards: [2, 3, "x"] }
+    - { name: others,  catchAll: true }
+EOF
+SH_OUT=$(helm template chart/ -f "$SH_VALUES") || fail L1
+# INV-O1: forward serialization — threads:1, max_in_flight:1, NO fallback/reject.
+FWD=$(awk '/name: .*connect-source-pipeline$/{f=1} f' <<<"$SH_OUT")
+grep -q 'threads: 1' <<<"$FWD" || { echo "[run-all-tests] sharded forward missing threads: 1 (O-3)"; fail L1; }
+grep -q 'max_in_flight: 1' <<<"$FWD" || { echo "[run-all-tests] sharded forward missing max_in_flight: 1 (O-4)"; fail L1; }
+if grep -qE 'fallback:|reject:' <<<"$FWD"; then
+  echo "[run-all-tests] sharded forward still renders a fallback/reject path (O-4 broken)"; fail L1
+fi
+# Sink broker variant: copies:1 + threads:1 hard-coded, one durable per shard.
+grep -q 'copies: 1' <<<"$SH_OUT" || { echo "[run-all-tests] sharded sink missing broker copies: 1"; fail L1; }
+for d in s0 s1 s2 s3 sx; do
+  grep -q "durable: \"cdc_sink_lb_company_${d}\"" <<<"$SH_OUT" \
+    || { echo "[run-all-tests] sharded sink missing durable cdc_sink_lb_company_${d}"; fail L1; }
+done
+# nats-init: every shard durable record carries max_ack_pending=1 (O-6).
+for d in s0 s1 s2 s3 sx; do
+  grep -oE "SINK_GROUPS='[^']*'" <<<"$SH_OUT" | grep -q "cdc_sink_lb_company_${d}|kv.cdc.lb.company.${d}.>|1|" \
+    || { echo "[run-all-tests] nats-init record for ${d} missing hard-coded maxpending=1"; fail L1; }
+done
+# wait-consumer gates ALL shard durables of each group.
+grep -q 'for d in cdc_sink_lb_company_s0 cdc_sink_lb_company_s1;' <<<"$SH_OUT" \
+  || { echo "[run-all-tests] wait-consumer does not gate all shard durables"; fail L1; }
+# T-5 / INV-S8: kv_key must never be a metric label (metric label blocks only —
+# kv_key legitimately appears in mappings/log fields).
+if grep -A5 -e '- metric:' <<<"$SH_OUT" | grep -q 'kv_key:'; then
+  echo "[run-all-tests] a metric block labels by kv_key (unbounded cardinality)"; fail L1
+fi
+# Default render must stay clean of ALL sharding machinery (T-1 byte-identity proxy).
+if grep -qE 'shard_map|kv_shard_reason|cdc_forward_cross_shard_rename|reverse-sharded|copies: 1' <<<"$DEFAULT_OUT"; then
+  echo "[run-all-tests] default render leaked sharding machinery"; fail L1
+fi
+# T-3 fail-loud matrix: each bad config must fail the render.
+SH_BASE=(--set 'connect.sharding.families.lb:company.shards=4'
+         --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company'
+         --set 'connect.sinkGroups[0].shards={0,1,2,3,x}')
+for badsh in \
+  "--set connect.sinkGroups[0].shards={0,1,2,x}" \
+  "--set connect.sinkGroups[0].shards={0,1,2,3,3,x}" \
+  "--set connect.sinkGroups[0].shards={0,1,2,3}" \
+  "--set connect.sinkGroups[0].shards={0,1,2,3,7,x}" \
+  "--set connect.sinkGroups[1].name=p --set connect.sinkGroups[1].prefixes[0]=lb:company" \
+  "--set connect.sinkGroups[1].name=p --set connect.sinkGroups[1].prefixes[0]=lb" \
+  "--set connect.sinkGroups[0].consumer.maxAckPending=1024" \
+  "--set connect.sinkGroups[0].catchAll=true" \
+  "--set connect.source.maxInFlight=256" \
+  "--set connect.sharding.keyPattern=nocapture" \
+  "--set connect.sinkGroups[0].shardsOf=nope"; do
+  # shellcheck disable=SC2086
+  if helm template chart/ "${SH_BASE[@]}" $badsh >/dev/null 2>&1; then
+    echo "[run-all-tests] expected fail-loud sharding render for '$badsh' but it succeeded"; fail L1
+  fi
+done
 pass L1
 
 echo "[run-all-tests] == L2: error-alerting lab proof =="
@@ -163,6 +238,7 @@ if [ "${SKIP_L2:-0}" = "1" ]; then
   skip L2 "SKIP_L2=1"
 else
   scripts/test-forward-routing.sh || fail L2
+  scripts/test-shard-mapping.sh || fail L2
   labs/redis-cdc-error-alerting/scripts/verify-alert.sh || fail L2
   docker compose -f labs/redis-cdc-error-alerting/docker-compose.yml down -v >/dev/null 2>&1
   pass L2
@@ -178,6 +254,9 @@ else
     RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-cdc-prefix.sh || fail L3
     RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-cdc-twoseg.sh || fail L3
   fi
+  if [ "${RUN_SHARDING:-0}" = "1" ]; then
+    RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding.sh || fail L3
+  fi
   pass L3
 fi
 
@@ -186,6 +265,10 @@ if [ "${RUN_FAILOVER:-0}" = "1" ]; then
   scripts/verify-failover.sh || fail L4
   if [ "${RUN_PREFIX:-0}" = "1" ]; then
     RRCS_NS=cdc-mg RRCS_RELEASE=cdcmg scripts/verify-failover-prefix.sh || fail L4
+  fi
+  if [ "${RUN_SHARDING:-0}" = "1" ]; then
+    RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-failover.sh || fail L4
+    RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding-replay.sh || fail L4
   fi
   pass L4
 else

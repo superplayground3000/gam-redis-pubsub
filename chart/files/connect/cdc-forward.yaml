@@ -42,7 +42,15 @@ input:
     auto_replay_nacks: true
 
 pipeline:
+  {{- if eq (include "rrcs.connect.shardingEnabled" .) "true" }}
+  # O-3 (design v2 §3): read order == process order. Serialized pipeline is a
+  # link in the ordering chain that REPLACES the LWW fence — hard-coded, no
+  # values override. Loosening it silently reintroduces old-overwrites-new
+  # with no metric able to detect it.
+  threads: 1
+  {{- else }}
   threads: 2
+  {{- end }}
   processors:
     {{- if .Values.connect.contentLog.enabled }}
     # Dump the raw inbound Redis stream entry (app.events): XADD fields arrive as
@@ -98,8 +106,48 @@ pipeline:
         let p2      = $segs.slice(0, 2).join(":")
         let routes  = {{ include "rrcs.connect.routeMap" . }}
         let hit     = $routes.get($p2).or($routes.get($p1))
+        {{- if eq (include "rrcs.connect.shardingEnabled" .) "true" }}
+        let base_prefix = $hit.or("others")
+        # ── Per-key sharding (design v2 D-1/D-2): family hit => fold the shard
+        # token into kv_prefix (kv.cdc.<family>.s<K>.<op>). Shard key = the
+        # numeric id captured by keyPattern — deliberately excludes the
+        # active/standby segment, so every variant of one entity lands on one
+        # shard, one durable, one consumer. Computed via $base_prefix (a let,
+        # NOT a meta read-back: meta() reads the INPUT message's metadata, so
+        # reading kv_prefix back here would see pre-mapping state).
+        # shard_map is keyed by the RAW (colon) family and looked up with the
+        # same $p2/$p1 keys as the routeMap: Bloblang .get() path-splits on '.',
+        # so a dotted-token key would never match.
+        let shard_map = {{ include "rrcs.connect.shardMap" . }}
+        let fam_n     = $shard_map.get($p2).or($shard_map.get($p1))
+        let sh_id     = if $fam_n != null {
+            $raw_key.re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
+          } else { "" }
+        let sh_tok    = if $fam_n == null { "" }
+          else if $sh_id == "" { "sx" }
+          else { "s" + ($sh_id.number().int64() % $fam_n.int64()).string() }
+        # Cross-shard rename assertion (INV-S7): old/new resolving to different
+        # shards means the same-entity-same-shard premise broke — quarantine to
+        # sx instead of splitting one rename across two consumers.
+        let old_id = meta("old_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
+        let new_id = meta("new_key").or("").re_find_object({{ include "rrcs.connect.sharding.keyPatternLit" . }}).catch({}).get("id").or("")
+        let x_shard = $fam_n != null && meta("op").or("") == "rename" &&
+                      $old_id != "" && $new_id != "" &&
+                      ($old_id.number().int64() % $fam_n.int64()) != ($new_id.number().int64() % $fam_n.int64())
+        meta kv_prefix = if $fam_n == null { $base_prefix }
+          else if $x_shard { $base_prefix + ".sx" }
+          else { $base_prefix + "." + $sh_tok }
+        meta kv_prefix_reason = if $p1 == "" { "empty_prefix" } else if $hit == null { "no_match" } else { "matched" }
+        # "none" (not ""): empty-string metadata reads back as absent across
+        # processors, which would make the counter switch below unreliable.
+        meta kv_shard_reason = if $fam_n == null { "none" }
+          else if $x_shard { "cross_shard_rename" }
+          else if $sh_id == "" { "unparseable" }
+          else { "sharded" }
+        {{- else }}
         meta kv_prefix        = $hit.or("others")
         meta kv_prefix_reason = if $p1 == "" { "empty_prefix" } else if $hit == null { "no_match" } else { "matched" }
+        {{- end }}
         {{- end }}
     {{- if eq (include "rrcs.connect.prefixRouting" .) "true" }}
     # Routing-miss visibility (INV-2). empty_prefix (no derivable key segment —
@@ -132,6 +180,26 @@ pipeline:
                 labels:
                   reason: no_match
             {{- end }}
+        {{- if eq (include "rrcs.connect.shardingEnabled" .) "true" }}
+        # Sharding isolation lane (design v2 D-9): both land on the family's sx
+        # subject — still delivered (sx durable), never dropped. unparseable =
+        # a family key without the keyPattern id (key contract broken);
+        # cross_shard_rename = INV-S7 violation, any non-zero value is a bug.
+        - check: meta("kv_shard_reason") == "unparseable"
+          processors:
+            - metric:
+                type: counter
+                name: cdc_forward_unrouted
+                labels:
+                  reason: unparseable_shard
+        - check: meta("kv_shard_reason") == "cross_shard_rename"
+          processors:
+            - metric:
+                type: counter
+                name: cdc_forward_cross_shard_rename
+                labels:
+                  reason: invariant_violation
+        {{- end }}
     {{- end }}
     {{- if .Values.connect.contentLog.enabled }}
     # Dump the self-contained JSON envelope about to be published to JetStream,
@@ -151,6 +219,28 @@ pipeline:
 
 output:
   label: __POD__
+  {{- if eq (include "rrcs.connect.shardingEnabled" .) "true" }}
+  # O-4 (design v2 §3, D-6/D-7): SERIALIZED publish — wait for each PubAck
+  # before the next publish; on failure retry IN PLACE (blocking backpressure).
+  # There is deliberately NO fallback/reject path here: a forward-leg nack goes
+  # back to the Redis PEL, and PEL replay would re-emit the nacked (older)
+  # event AFTER later events that already published — silent out-of-order
+  # apply. Blocking beats reordering (fail-stop > silent corruption). Publish
+  # failures are visible via output_error / output_connection_* + the backlog
+  # alert (CDCForwardPublishBlocked) instead of cdc_forward_publish_failed.
+  # Ceiling: ~1/RTT(central Connect ↔ NATS) msg/s for ALL families combined —
+  # the known price of the no-fence design (design v2 §14).
+  nats_jetstream:
+    urls:
+      - "{{ include "rrcs.nats.url" . }}"
+    auth:
+      user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }}
+    subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
+    headers:
+      Nats-Msg-Id: ${! meta("event_id") }
+      Content-Type: application/json
+    max_in_flight: 1
+  {{- else }}
   fallback:
     # Child 1 — the real publish. Every load-bearing setting (Nats-Msg-Id dedup
     # header, publish-then-XACK ordering via the input's commit_period) lives
@@ -177,3 +267,4 @@ output:
             name: cdc_forward_publish_failed
             labels:
               reason: publish_error
+  {{- end }}

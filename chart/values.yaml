@@ -154,12 +154,17 @@ connect:
     # (backlog read from "0"), deduped downstream by Nats-Msg-Id. Set to __POD__
     # only to reproduce the pre-fix message-loss baseline.
     consumerClientId: cdc_propagator_active
-    # Max concurrent un-acked NATS publishes for the forward output. 256 in prod.
-    # The failover verifier lowers this (e.g. 1) so the input reads batches into its
-    # Redis PEL faster than the serialized publisher can drain them — forming a
-    # deterministic, catchable un-acked PEL to SIGKILL against. Does not change the
-    # loss mechanism, only widens the vulnerable window.
-    maxInFlight: 256
+    # Max concurrent un-acked NATS publishes for the forward output. Unset =>
+    # the template renders its default 256 (prod value). The failover verifier
+    # lowers this (e.g. 1) so the input reads batches into its Redis PEL faster
+    # than the serialized publisher can drain them — forming a deterministic,
+    # catchable un-acked PEL to SIGKILL against. Does not change the loss
+    # mechanism, only widens the vulnerable window.
+    # MUST stay unset when connect.sharding.families is configured: sharding
+    # hard-codes max_in_flight: 1 (ordering link O-4) and the render FAILS if a
+    # leftover value is present — an explicit 256 here would otherwise silently
+    # re-parallelize publishes and reintroduce old-overwrites-new.
+    maxInFlight:
     # Redis XREADGROUP batch size (input `limit`). 50 in prod. The failover verifier
     # raises this so the reader pulls a large chunk into its PEL that the serialized
     # publisher (maxInFlight:1) cannot drain before the SIGKILL — enlarging the genuine
@@ -258,7 +263,58 @@ connect:
   # Durables become cdc_sink_caveat ... cdc_sink_others; a key like
   # tg:caveat:123 publishes to kv.cdc.tg.caveat.<op>; any other key (e.g.
   # tg:new_family:1) flows to kv.cdc.others.<op> via the others group.
+  #
+  #   Sharding — a group may instead claim SHARDS of a family declared under
+  #   connect.sharding (docs/design/subject-sharding/design.md):
+  #     shardsOf: "lp:m2g"       # family name; must exist in sharding.families
+  #     shards: [0,1,2,3]        # claimed shards; "x" = the isolation shard
+  #   A shard group renders the BROKER sink variant: one pipeline binding one
+  #   durable PER claimed shard (cdc_sink_lp_m2g_s0 ... filter
+  #   kv.cdc.lp.m2g.s0.>), broker copies:1 + pipeline threads:1 hard-coded,
+  #   and every shard durable is created with max_ack_pending: 1 (NOT the
+  #   consumer.* inheritance chain — ordering link O-6; overriding
+  #   consumer.maxAckPending on a shard group fails the render). The union of
+  #   shards across enabled groups must equal {0..N-1, "x"} exactly once.
+  #   shardsOf excludes prefixes/filterSubject/catchAll on the same group.
   sinkGroups: []
+
+  # ── Per-key sharding (subject-sharding v2: strict per-key ordering) ──────────
+  # Declares key FAMILIES whose subjects are split into per-shard subjects:
+  # a key like lp:m2g:active:{employee:123} publishes to
+  # kv.cdc.lp.m2g.s<123 mod N>.<op>; sinkGroups claim shards via shardsOf/shards
+  # (see above). EMPTY/UNSET => everything below is inert and the render is
+  # byte-identical to the non-sharded chart (INV-S1).
+  #
+  # Enabling sharding SERIALIZES the forward leg (pipeline threads: 1,
+  # max_in_flight: 1, no reject fallback — ordering links O-3/O-4): correctness
+  # without an LWW fence is carried entirely by the ordering chain, and the
+  # forward throughput ceiling becomes ~1/RTT(central Connect ↔ NATS) for ALL
+  # families combined (design v2 §14 — the known price of the no-fence design).
+  # Requires connect.source.maxInFlight to be UNSET (fail-loud otherwise).
+  sharding:
+    # RE2 pattern extracting the numeric shard key from a kv key. MUST contain
+    # the named capture (?P<id>...). Deliberately matches only the {entity:id}
+    # hash-tag segment so every variant of the same entity (active/standby/…)
+    # lands on the same shard — the correctness premise for per-key ordering.
+    # Keys of a sharded family that DON'T match route to the isolation shard sx
+    # and count cdc_forward_unrouted{reason="unparseable_shard"}.
+    keyPattern: '\{employee:(?P<id>[0-9]+)\}'
+    # families:
+    #   "lp:m2g":
+    #     shards: 32        # N; virtual-shard over-provision — pick ONCE, large
+    #                       # (design D-10). Changing N later requires the
+    #                       # pause-drain procedure in
+    #                       # docs/design/subject-sharding/cutover.md.
+    families: {}
+    # nats-init orphan pruning while sharding is configured. false (default) =>
+    # the init Job only REPORTS durables that fell out of the desired set and
+    # never deletes them — cutover step 4 (delete the old superset-filter
+    # durable) must be a deliberate manual act AFTER the drain criterion holds
+    # (num_pending==0 && num_ack_pending==0), because deleting it early while
+    # both old and new consumers exist creates the dual-consumption window that
+    # is a CORRECTNESS error without a fence (design v2 §10). Set true only for
+    # the upgrade that performs cutover step 4, then revert.
+    pruneOrphans: false
 
   # Defaults every sinkGroup inherits when it omits a key (group -> sinkDefaults
   # -> legacy connect.sink.* / nats.stream.consumer.*). Leave empty to inherit the
