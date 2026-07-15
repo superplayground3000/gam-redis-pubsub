@@ -31,7 +31,10 @@ data:
 {{- /* One reverse pipeline ConfigMap per ENABLED sinkGroup (design D3). The sole
      "default" group renders name connect-sink-pipeline with durable cdc_sink —
      byte-identical to the pre-D3 single sink. .Group is passed into tpl so
-     cdc-reverse.yaml binds this group's per-group durable. */ -}}
+     cdc-reverse.yaml binds this group's per-group durable. SHARDED groups
+     (shardsOf/shards — subject-sharding v2) render the broker variant
+     <profile>-reverse-sharded.yaml instead: one bind child per shard durable,
+     copies:1 + threads:1 hard-coded. */ -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}
 {{- if $g.enabled }}
 ---
@@ -43,6 +46,10 @@ metadata:
     app: {{ $g.appLabel }}
 data:
   pipeline.yaml: |-
+{{- if $g.sharded }}
+{{ tpl ($.Files.Get (printf "files/connect/%s-reverse-sharded.yaml" $.Values.profile)) (merge (dict "Group" $g) $) | indent 4 }}
+{{- else }}
 {{ tpl ($.Files.Get (printf "files/connect/%s-reverse.yaml" $.Values.profile)) (merge (dict "Group" $g) $) | indent 4 }}
+{{- end }}
 {{- end }}
 {{- end }}

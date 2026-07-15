@@ -2,6 +2,25 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-15 — Three Bloblang/Helm value-passing traps that lint+template cannot catch
+- What happened: the subject-sharding forward mapping passed `helm lint`, `helm template`, and
+  `rpk connect lint`, yet routed EVERY key to the wrong subject at runtime. Three independent
+  causes, all invisible until the behavioral docker test (`scripts/test-shard-mapping.sh`) ran:
+  (1) sprig's `quote` is `%q`-style and already doubles backslashes — adding a manual
+  `replace "\\" "\\\\"` pass rendered `"\\\\{employees:…"` and the regex silently matched
+  nothing; (2) Bloblang `.get("lb.company")` treats `.` as a PATH separator (`obj["lb"]["company"]`),
+  so a map keyed by dotted subject tokens never matches — key such maps by the raw (colon) form;
+  (3) metadata assigned an empty string reads back as ABSENT in later processors
+  (`meta("x").or("fallback")` fires), so branch flags must use a non-empty sentinel ("none"),
+  never "".
+- Rule that would have prevented it: any new Helm-templated Bloblang must ship, in the same
+  change, a behavioral test that runs the REAL rendered pipeline in the connect image with a
+  got-vs-want case table (pattern: `scripts/test-forward-routing.sh`). Render-level greps prove
+  presence, never semantics.
+- Applied: `scripts/test-shard-mapping.sh` (wired into L2) caught all three on first run;
+  fixes in `_helpers.tpl` (keyPatternLit, shardMap keying) and `cdc-forward.yaml` ("none"
+  sentinel), each with a comment naming the trap.
+
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
 - What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
   lab-connect-sink-a" / "two-seg render missing name: cdc_forward_others" — but chart-identical

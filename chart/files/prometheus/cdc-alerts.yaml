@@ -65,3 +65,134 @@ groups:
             group deployed) — they accumulate in the stream unconsumed. Fix the
             writer's key format, add a sink group whose prefixes cover the
             missing key family, or deploy a catchAll: true group to drain them.
+  # ── Subject-sharding v2 (docs/design/subject-sharding/design.md §11) ────────
+  # v2 has NO LWW fence, therefore NO direct out-of-order signal exists. Every
+  # rule below is a PROXY guarding one link of the ordering chain O-1..O-7.
+  # All rules are inert (empty query result) unless sharding is deployed.
+  # A1/A6 additionally need a NATS Prometheus exporter (jetstream_consumer_*
+  # series with the durable/is_consumer_leader labels, e.g.
+  # prometheus-nats-exporter) — the bundled lab NATS does not ship one, so in
+  # the lab they are exercised by scripts/verify-sharding.sh asserting the same
+  # facts via `nats consumer info` instead.
+  - name: cdc-sharding
+    rules:
+      # A1 — shard stuck: THAT shard's backlog grows while THAT shard applies
+      # nothing. Causes: a poison message redelivery-looping under
+      # max_ack_pending=1 (fail-stop by design — cdc_unprocessable names it)
+      # or region Redis down. Deliberately PER-SHARD (deviates from the spec's
+      # A1, which ANDed a GLOBAL zero-apply-rate clause): broker child
+      # isolation means one blocked shard leaves every other shard flowing, so
+      # a global clause would suppress the alert in exactly the scenario it
+      # exists for. The join extracts the shard token from the durable name
+      # (cdc_sink_<family>_s<K>) via label_replace and drops any backlogged
+      # durable whose shard still shows apply throughput.
+      - alert: CDCShardStuck
+        expr: |
+          label_replace(
+            max by (durable) (jetstream_consumer_num_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}),
+            "shard", "$1", "durable", ".*_(s[0-9]+|sx)$"
+          ) > 1000
+          unless on (shard)
+            (sum by (shard) (rate({__name__=~"cdc_apply(_total)?", shard!=""}[5m])) > 0)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC shard durable {{ $labels.durable }} has backlog but zero applies"
+          description: >-
+            Shard durable {{ $labels.durable }} has >1000 pending messages while
+            the sharded sink applies nothing. Under max_ack_pending=1 a single
+            poison message blocks its whole shard (deliberate fail-stop; check
+            cdc_unprocessable for the reason) — or region Redis is unreachable.
+      # A2 — shard skew: hottest shard >3x the average (hot employee). The
+      # serialized per-shard lane caps at ~1/RTT; a hot shard saturates while
+      # others idle. sx excluded — it belongs at zero and would poison the avg.
+      - alert: CDCShardSkew
+        expr: |
+          max(rate({__name__=~"cdc_apply(_total)?", shard!="", shard!~"sx"}[10m]))
+            / avg(rate({__name__=~"cdc_apply(_total)?", shard!="", shard!~"sx"}[10m])) > 3
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC shard skew: hottest shard >3x average apply rate"
+          description: >-
+            One shard applies >3x the average (hot entity). Its serialized lane
+            (~1/RTT ceiling) may saturate while others idle. Re-balancing the
+            shard→group assignment does not help a SINGLE hot entity (same
+            shard); it only spreads co-resident shards.
+      # A3 — isolation lane non-empty (INV-S7). cross_shard_rename: any nonzero
+      # value is a bug in the key contract or shard function. unparseable_shard:
+      # a sharded-family key without the keyPattern id. sx applies: SOMETHING is
+      # flowing through the quarantine shard. (Generic cdc_unprocessable
+      # already alerts via CDCUnprocessableMessages above — not repeated here.)
+      - alert: CDCShardIsolationLane
+        expr: |
+          sum(increase({__name__=~"cdc_forward_cross_shard_rename(_total)?"}[5m])) > 0
+            or sum(increase({__name__=~"cdc_forward_unrouted(_total)?", reason="unparseable_shard"}[5m])) > 0
+            or sum(rate({__name__=~"cdc_apply(_total)?", shard="sx"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC sharding isolation lane is non-empty"
+          description: >-
+            Events are routing to the sx isolation shard: a cross-shard rename
+            (invariant violation — investigate immediately), an unparseable
+            family key, or plain sx traffic. Nothing is lost (sx is consumed),
+            but the key contract or shard function is broken.
+      # A4 — end-to-end freshness (spec A4 rewritten onto the repo's existing
+      # INV-2 sync-latency histogram; buckets are SECONDS). Scoped to sharded
+      # groups via shard!="" so non-sharded installs keep their own SLOs.
+      - alert: CDCSyncLatencyHigh
+        expr: |
+          histogram_quantile(0.99, sum by (le) (rate(cdc_sync_latency_seconds_bucket{shard!=""}[5m]))) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CDC sharded sink e2e p99 latency >5s"
+          description: >-
+            Writer-mint → successful-region-apply p99 exceeds 5s across sharded
+            groups. Check shard balance (CDCShardSkew), a stuck shard
+            (CDCShardStuck), and the forward leg's serialized publish lane
+            (CDCForwardPublishBlocked).
+      # A5 — forward blocking retry (O-4 backpressure made visible). The
+      # sharded forward output has NO reject fallback: publish failures retry
+      # in place and cdc_forward_publish_failed no longer exists on that
+      # render — output_error is the replacement signal. Scoped to the source
+      # leg's job (the connect-source Service name; the job label is the
+      # Service name regardless of resourcePrefix). Emission verified
+      # empirically: scripts/verify-sharding-partition.sh observed output_error
+      # 0->9 on the source leg during a 45s NATS partition with zero nacks.
+      - alert: CDCForwardPublishBlocked
+        expr: |
+          sum by (namespace, job) (increase({__name__=~"output_error(_total)?", job=~".*connect-source.*"}[5m])) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC forward leg publish errors (blocking retry in progress)"
+          description: >-
+            The serialized forward output (max_in_flight=1, no reject path) is
+            failing to publish and retrying in place — propagation is stalled
+            and backpressure is building in the central Redis stream/PEL. Check
+            NATS availability and the stream's MAXLEN/retention headroom
+            (design v2 §10 P-1).
+      # A6 — O-6 assertion: a shard durable with more than one un-acked
+      # delivery means max_ack_pending!=1 (someone edited the consumer) —
+      # redelivery can now overtake later messages and ordering breaks with NO
+      # other signal. Needs the NATS exporter (see group header).
+      - alert: CDCShardAckPendingViolation
+        expr: |
+          max by (durable) (jetstream_consumer_num_ack_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}) > 1
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Shard durable {{ $labels.durable }} has >1 un-acked delivery (O-6 broken)"
+          description: >-
+            Shard durables MUST run max_ack_pending=1; more than one in-flight
+            delivery re-enables redelivery overtaking and silently breaks
+            per-shard apply order. Restore the consumer to max_ack_pending=1
+            (nats-init creates it that way) and audit for out-of-order applies.

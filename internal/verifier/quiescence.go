@@ -36,10 +36,11 @@ func WaitQuiescent(ctx context.Context, central *RedisClient, sourceGroup, natsU
 		if lag, pending, err := central.GroupBacklog(ctx, "app.events", sourceGroup); err == nil && lag == 0 && pending == 0 {
 			srcOK = true
 		}
-		// MaxPending is the max num_pending across the stream's JetStream consumers.
-		// For KV_CDC that equals the sink durable's pending because the stream has
-		// exactly one JetStream consumer (cdc_sink); the SOURCE side drains via the
-		// Redis consumer group (checked above), not a NATS consumer.
+		// MaxPending is the max num_pending across the stream's JetStream consumers,
+		// so quiescence = EVERY sink durable drained. That covers the single default
+		// cdc_sink, per-group durables (cdc_sink_<group>), and per-shard durables
+		// (cdc_sink_<family>_s<K>, subject-sharding v2) alike; the SOURCE side
+		// drains via the Redis consumer group (checked above), not a NATS consumer.
 		sinkOK := false
 		if snap, err := ScrapeJSZ(ctx, natsURL, stream); err == nil && snap.MaxPending == 0 {
 			sinkOK = true

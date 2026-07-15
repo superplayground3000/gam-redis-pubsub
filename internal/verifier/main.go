@@ -20,9 +20,10 @@ func Run(args []string) {
 	natsURL := fs.String("nats", "http://nats:8222", "NATS monitoring URL")
 	stream := fs.String("nats-stream", "KV_CDC", "JetStream stream name")
 	// --nats-consumer is accepted (the verifier Job passes --nats-consumer=cdc_sink)
-	// but intentionally discarded: quiescence keys off stream-wide MaxPending, which
-	// equals the sink durable's pending because KV_CDC has exactly one JetStream
-	// consumer. The value is informational only — not an oversight.
+	// but intentionally discarded: quiescence keys off stream-wide MaxPending, i.e.
+	// the max across ALL of KV_CDC's consumers — correct for the single default
+	// durable, per-group durables, and per-shard durables (subject-sharding v2)
+	// alike. The value is informational only — not an oversight.
 	_ = fs.String("nats-consumer", "cdc_sink", "sink durable name (informational)")
 	sourceGroup := fs.String("source-group", "cdc_propagator", "source consumer group")
 	quiesce := fs.Duration("quiesce-timeout", 15*time.Second, "per-op quiescence deadline")

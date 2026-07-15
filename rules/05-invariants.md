@@ -35,10 +35,11 @@ Duplicates are allowed (absorbed by idempotency); loss is not.
 | 5 | `chart/values.yaml` (`nats.stream.dupeWindow: 5m`) | Dedup window stays ≥ the realistic replay window | Same as #4 |
 | 6 | `chart/files/connect/cdc-reverse.yaml` | Sink binds to pre-created durable pull consumer: `cdc_sink`, `bind: true` | Ad-hoc consumers reset delivery state |
 | 7 | `chart/values.yaml` (`nats.stream.consumer`) | `maxDeliver: -1` (redeliver forever), `ackWait` finite (30s default) | Poison messages must redeliver, not vanish |
-| 8 | `chart/files/connect/cdc-reverse.yaml` | Output is `reject_errored` + `drop`: Redis apply runs **before** ack; processor failure nacks | Message acked to JetStream only after region write succeeded |
+| 8 | `chart/files/connect/cdc-reverse.yaml` + `chart/files/connect/cdc-reverse-sharded.yaml` | Output is `reject_errored` + `drop`: Redis apply runs **before** ack; processor failure nacks | Message acked to JetStream only after region write succeeded |
 | 9 | `chart/files/connect/cdc_rename.lua` | Rename guarded by `EXISTS` (idempotent no-op on redelivery) | Redelivered rename must not error-loop or corrupt |
 | 10 | `internal/elector/` + `chart/values.yaml` lease settings | Leader election keeps exactly one active leg; standby takes over on lease expiry | Recovery path for #2 |
-| 11 | `chart/files/connect/cdc-forward.yaml` | The output `fallback`'s failure child stays `reject` (nack → replay). Never `drop` or any child that succeeds without a JetStream PubAck | The fallback child runs when the publish failed; anything that "succeeds" there would XACK entries that never reached JetStream — silent loss. It exists only to count (`cdc_forward_publish_failed`) and nack |
+| 11 | `chart/files/connect/cdc-forward.yaml` | The output `fallback`'s failure child stays `reject` (nack → replay). Never `drop` or any child that succeeds without a JetStream PubAck. **Sharded render exception (subject-sharding v2, owner-approved 2026-07-15):** when `connect.sharding.families` is configured the fallback is REMOVED BY DESIGN — the output is a bare `nats_jetstream` with `max_in_flight: 1` that blocks and retries in place (a forward nack would PEL-replay an older event after newer ones already published → silent reorder, which v2 cannot detect without a fence). Write-then-XACK is unchanged: no PubAck ⇒ no ack. Do NOT re-add a reject path to the sharded variant, and do NOT remove the fallback from the non-sharded render | The fallback child runs when the publish failed; anything that "succeeds" there would XACK entries that never reached JetStream — silent loss. It exists only to count (`cdc_forward_publish_failed`) and nack |
+| 13 | `chart/files/connect/cdc-forward.yaml`, `chart/files/connect/cdc-reverse-sharded.yaml`, `chart/templates/_helpers.tpl` | Sharded render (v2 ordering chain O-3..O-7): forward `pipeline.threads: 1` + `max_in_flight: 1`; sink broker `copies: 1` + `pipeline.threads: 1`; every shard durable `max_ack_pending: 1` (hard-coded in the helper's consumers list, never the values inheritance chain). **Loosening ANY of these silently reintroduces old-overwrites-new and no metric can detect it** (`docs/design/subject-sharding/design.md` §3) — L3 `RUN_SHARDING=1` + L4 sharding scripts required if touched | v2 removed the LWW fence; per-key apply order IS the correctness mechanism |
 | 12 | `chart/templates/connect-source.yaml`, `chart/templates/connect-sink.yaml` | Pod template keeps the `checksum/connect-config` annotation over the connect ConfigMaps | The elector POSTs the pipeline only when it wins the Lease; without the checksum-triggered rollout, a helm upgrade that edits a pipeline never reaches the running leg — you verify stale config (bit this repo on 2026-07-05, `rules/50-lessons.md`) |
 
 ### How to verify
@@ -72,7 +73,9 @@ dashboard in the same change.
 | File | What must stay true |
 |---|---|
 | `chart/files/connect/cdc-reverse.yaml` | `cdc_unprocessable{reason=...}` counter fires on every permanent-failure branch (today: `decode_error`, `unknown_op`). **Any new failure branch added to a pipeline must add a `reason` label value.** |
-| `chart/files/connect/cdc-forward.yaml` | `cdc_forward_publish_failed{reason}` increments in the output `fallback` failure child (fires per failed JetStream publish; the message is then nacked — INV-1 row 11) |
+| `chart/files/connect/cdc-forward.yaml` | `cdc_forward_publish_failed{reason}` increments in the output `fallback` failure child (fires per failed JetStream publish; the message is then nacked — INV-1 row 11). **Sharded render:** the fallback (and this counter) does not exist — the replacement signal is `output_error` on the connect-source job (dashboard panel 5 second series + `CDCForwardPublishBlocked` alert) |
+| `chart/files/connect/cdc-forward.yaml` (sharded render) | `cdc_forward_unrouted{reason="unparseable_shard"}` and `cdc_forward_cross_shard_rename` fire on the sx isolation lane (dashboard panel 16 + `CDCShardIsolationLane`); `cdc_forward_cross_shard_rename` must stay 0 (INV-S7) |
+| `chart/files/connect/cdc-reverse-sharded.yaml` | Same contract as cdc-reverse.yaml (`cdc_unprocessable{shard,reason}`, `cdc_apply{shard,op,type}` after successful apply, `cdc_sync_latency_seconds{op,shard}` post-apply with clamp + int-ns, `cdc_sync_skew_negative{shard}`) — the shard label comes from the broker child, never `kv_key` (INV-S8) |
 | `chart/files/connect/cdc-reverse.yaml` | `cdc_apply{op,type}` increments only after a successful apply |
 | `chart/files/connect/cdc-reverse.yaml` | `cdc_sync_latency_seconds{op}` timing records only after a successful apply (`!errored()` + `sync_has_ts` guard); its value stays clamped ≥ 0 and `.int64().string()`-formatted — a negative or float value makes the metric processor error AFTER the apply and nack an already-applied message. Negative deltas increment `cdc_sync_skew_negative` instead |
 | `chart/files/connect/observability.yaml` | `use_histogram_timing: true`. Quirk of the pinned build: the timing metrics keep `_ns` names (`processor_latency_ns` etc.) but the histogram **buckets record seconds** — dashboards must treat values as seconds |
@@ -90,7 +93,7 @@ dashboard in the same change.
   latency-calculator Service appear; `helm template chart/` (default) — confirm the
   observability objects do not.
 - Metric name check after editing a pipeline: grep the dashboard + alert files for every metric
-  name you touched: `grep -n "cdc_unprocessable\|cdc_apply\|cdc_forward_publish_failed\|cdc_latency_seconds\|cdc_sync_latency_seconds\|cdc_sync_skew_negative\|cdc_writer\|elector_" chart/files/grafana/cdc-dashboard.json chart/files/prometheus/cdc-alerts.yaml`
+  name you touched: `grep -n "cdc_unprocessable\|cdc_apply\|cdc_forward_publish_failed\|cdc_forward_unrouted\|cdc_forward_cross_shard_rename\|cdc_latency_seconds\|cdc_sync_latency_seconds\|cdc_sync_skew_negative\|cdc_writer\|elector_\|output_error" chart/files/grafana/cdc-dashboard.json chart/files/prometheus/cdc-alerts.yaml`
 - Behavior check (L2, ~7 min): `labs/redis-cdc-error-alerting/scripts/verify-alert.sh` proves
   the alert + dashboard against a real Connect sink (single-source bind mounts).
 - Behavior check (L3): run `verify-cdc.sh`, then curl `:4195/metrics` on the sink pod and
@@ -161,6 +164,7 @@ deliberate scope for now, an L3 nightly would strengthen it further.
 | Go code in `internal/` or `main.go` | L0; + L3 if it touches writer/verifier/elector behavior |
 | Chart templates or `values*.yaml` | L1; + L3 if it affects any deployed-by-default component |
 | Connect pipeline YAML (`chart/files/connect/*`) or Lua | L1 + L3 |
+| Sharding machinery (`cdc-reverse-sharded.yaml`, the forward shard mapping/output variant, shard helpers in `_helpers.tpl`, shard consumer creation in nats-init) | L1 + L2 (`test-shard-mapping.sh`) + L3 with `RUN_SHARDING=1`; + the L4 sharding scripts (`verify-sharding-failover.sh`, `verify-sharding-replay.sh`) if it touches INV-1 row 13 |
 | Anything in the INV-1 load-bearing table | L1 + L3, **+ L4 where the table says so** |
 | Metrics, dashboard JSON, alert rules | L1 + the INV-2 grep check + L2; L3 if metric emission changed |
 | The lab itself (`labs/redis-cdc-error-alerting/**`) | L2 |

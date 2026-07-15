@@ -105,8 +105,16 @@ spec:
               # is unusable (PUSH), stale (wrong filter), or weakens at-least-once
               # (ack_policy != explicit, or a divergent max_deliver). One line,
               # records ';'-separated: DURABLE|FILTER(csv)|ACKWAIT
+              {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
+              # Sharded record format adds MAXPENDING|SHARDED per consumer:
+              # shard durables are created with (and validated against)
+              # max_ack_pending=1 — ordering link O-6 breaks silently otherwise.
+              SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s|%s|%s|%v|%v;" $c.durable $c.filter $g.ackWait $c.maxAckPending $g.sharded }}{{ end }}{{ end }}{{ end }}'
+              echo "$SINK_GROUPS" | tr ';' '\n' | while IFS='|' read -r CONSUMER FILTER DESIRED_ACKWAIT DESIRED_MAXPENDING_C SHARDED_C; do
+              {{- else }}
               SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ printf "%s|%s|%s;" $g.durable $g.filter $g.ackWait }}{{ end }}{{ end }}'
               echo "$SINK_GROUPS" | tr ';' '\n' | while IFS='|' read -r CONSUMER FILTER DESIRED_ACKWAIT; do
+              {{- end }}
                 [ -z "$CONSUMER" ] && continue
                 FILTER_SORTED=$(sort_csv "$FILTER")
                 FILTER_ARGS=""; OLDIFS=$IFS; IFS=','
@@ -139,9 +147,20 @@ spec:
                     exit 1
                   fi
                   CUR_MAXPENDING=$(jq -r '.config.max_ack_pending' /tmp/cons.json)
+                  {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
+                  if [ "$SHARDED_C" = "true" ] && [ "$CUR_MAXPENDING" != "1" ]; then
+                    echo "ERROR: shard consumer '$CONSUMER' has max_ack_pending=$CUR_MAXPENDING but MUST be 1 — with more than one in-flight delivery a redelivery can overtake a later message and the per-shard apply order breaks SILENTLY (no metric detects it; ordering link O-6, design v2 D-8)." >&2
+                    echo "The chart will not mutate a user-owned consumer. Recreate it with --max-pending 1 (or delete it and re-run this Job)." >&2
+                    exit 1
+                  fi
+                  if [ "$CUR_MAXPENDING" != "$DESIRED_MAXPENDING_C" ]; then
+                    echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values $DESIRED_MAXPENDING_C (throughput only; still usable, not changing a user-owned consumer)." >&2
+                  fi
+                  {{- else }}
                   if [ "$CUR_MAXPENDING" != "$DESIRED_MAXPENDING" ]; then
                     echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values $DESIRED_MAXPENDING (throughput only; still usable, not changing a user-owned consumer)." >&2
                   fi
+                  {{- end }}
                   echo "pull consumer '$CONSUMER' already exists on '$STREAM' with desired filter [$FILTER_SORTED], ack_policy=explicit, max_deliver=$CUR_MAXDELIVER; usable"
                 else
                   echo "creating pull consumer '$CONSUMER' (filter [$FILTER_SORTED]) on external stream '$STREAM'"
@@ -152,7 +171,11 @@ spec:
                     --deliver all \
                     --replay instant \
                     --wait "$DESIRED_ACKWAIT" \
+                    {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
+                    --max-pending "$DESIRED_MAXPENDING_C" \
+                    {{- else }}
                     --max-pending "$DESIRED_MAXPENDING" \
+                    {{- end }}
                     --max-deliver="$DESIRED_MAXDELIVER" \
                     --defaults
                 fi

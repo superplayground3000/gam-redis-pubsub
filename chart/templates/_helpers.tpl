@@ -298,12 +298,54 @@ in this pass); the 57-char name budget.
      '.' (tg:caveat -> subject kv.cdc.tg.caveat.<op>, filter kv.cdc.tg.caveat.>;
      the stream binds kv.cdc.> so subject depth is free). */ -}}
 {{- $prefixRe := "^[a-z0-9]([a-z0-9_-]*[a-z0-9])?(:[a-z0-9]([a-z0-9_-]*[a-z0-9])?)?$" -}}
+{{- /* ── per-key sharding config (subject-sharding v2) ──
+     families = { "<family>": { shards: N } }. A family is a key prefix (same
+     grammar as group prefixes) whose subjects gain a shard token derived from
+     the employee id: kv.cdc.<family dotted>.s<K>.<op>. Groups claim shards via
+     shardsOf + shards; the union across ENABLED groups must equal
+     {0..N-1, "x"} exactly once (INV-S4). All checks fail-loud at render. */ -}}
+{{- $shardCfg := $v.connect.sharding | default dict -}}
+{{- $families := $shardCfg.families | default dict -}}
+{{- $shardingOn := gt (len $families) 0 -}}
+{{- if $shardingOn -}}
+{{-   $kp := include "rrcs.connect.sharding.keyPattern" $root -}}
+{{-   if not (contains "(?P<id>" $kp) -}}
+{{-     fail (printf "connect.sharding.keyPattern=%q must contain the named capture group (?P<id>...) — the forward leg extracts the numeric shard key from it" $kp) -}}
+{{-   end -}}
+{{-   if not (eq (kindOf $v.connect.source.maxInFlight) "invalid") -}}
+{{-     fail (printf "connect.source.maxInFlight=%v is set while connect.sharding.families is configured — sharding hard-codes the forward output to max_in_flight: 1 (ordering link O-4, design v2 §4.1); REMOVE the key. A leftover value would otherwise silently loosen publish serialization and reintroduce old-overwrites-new with no detecting metric." $v.connect.source.maxInFlight) -}}
+{{-   end -}}
+{{- end -}}
+{{- range $fam, $fcfg := $families -}}
+{{-   if not (regexMatch $prefixRe $fam) -}}
+{{-     fail (printf "connect.sharding.families: family %q must be one or two ':'-separated segments, each matching ^[a-z0-9]([a-z0-9_-]*[a-z0-9])?$ (same grammar as sinkGroup prefixes)" $fam) -}}
+{{-   end -}}
+{{-   $seg0f := index (splitList ":" $fam) 0 -}}
+{{-   if or (eq $seg0f "others") (eq $seg0f "unknown") -}}
+{{-     fail (printf "connect.sharding.families: family %q — first segment %q is reserved" $fam $seg0f) -}}
+{{-   end -}}
+{{-   $nRaw := $fcfg.shards | default 0 -}}
+{{-   if ne (printf "%v" $nRaw) (printf "%d" (int $nRaw)) -}}
+{{-     fail (printf "connect.sharding.families[%s].shards=%v must be an integer" $fam $nRaw) -}}
+{{-   end -}}
+{{-   if lt (int $nRaw) 2 -}}
+{{-     fail (printf "connect.sharding.families[%s].shards=%v must be an integer >= 2 (virtual-shard over-provision, design D-10: pick N once, large)" $fam $nRaw) -}}
+{{-   end -}}
+{{- end -}}
 {{- $groups := $v.connect.sinkGroups -}}
 {{- if not $groups -}}
 {{-   $groups = list (dict "name" "default" "enabled" $legSink.enabled) -}}
 {{- end -}}
 {{- $out := list -}}
 {{- $seenPrefixes := dict -}}
+{{- /* Families join the prefix-conflict domain: a family may not double as a
+     group prefix (double delivery: the group filter <p>.<fam>.> is a superset
+     of every <p>.<fam>.s<K>.> shard filter), and the 1-seg/2-seg overlap sweep
+     below must see them too. */ -}}
+{{- range $fam, $fcfg := $families -}}
+{{-   $_ := set $seenPrefixes $fam (printf "connect.sharding.families[%s]" $fam) -}}
+{{- end -}}
+{{- $famClaims := dict -}}
 {{- $catchAllCount := 0 -}}
 {{- $anyPrefixedEnabled := false -}}
 {{- $wholeStream := list -}}
@@ -322,6 +364,17 @@ in this pass); the 57-char name budget.
 {{-   $prefixes := $g.prefixes | default list -}}
 {{-   $filterSubject := $g.filterSubject | default "" -}}
 {{-   $catchAll := $g.catchAll | default false -}}
+{{-   $shardsOf := $g.shardsOf | default "" -}}
+{{-   $sharded := ne $shardsOf "" -}}
+{{-   if and $sharded (or (gt (len $prefixes) 0) (ne $filterSubject "") $catchAll) -}}
+{{-     fail (printf "connect.sinkGroups[%s]: shardsOf excludes prefixes, filterSubject and catchAll — a shard group's filters are derived from its claimed shards" $name) -}}
+{{-   end -}}
+{{-   if and $sharded $isDefault -}}
+{{-     fail "connect.sinkGroups: the \"default\" group cannot be sharded (default = the legacy whole-stream sink names; give shard groups explicit names, e.g. m2g-a)" -}}
+{{-   end -}}
+{{-   if and $sharded (not (hasKey $families $shardsOf)) -}}
+{{-     fail (printf "connect.sinkGroups[%s].shardsOf=%q — no such family under connect.sharding.families (configured: %v)" $name $shardsOf (keys $families | sortAlpha)) -}}
+{{-   end -}}
 {{-   if and $catchAll $isDefault -}}
 {{-     fail "connect.sinkGroups: the \"default\" group cannot be catchAll (default = the legacy whole-stream sink; name the catch-all group e.g. \"others\")" -}}
 {{-   end -}}
@@ -333,7 +386,51 @@ in this pass); the 57-char name budget.
 {{-   end -}}
 {{-   $prefixed := gt (len $prefixes) 0 -}}
 {{-   $filter := printf "%s.>" $prefix -}}
-{{-   if $prefixed -}}
+{{-   $consumers := list -}}
+{{-   if $sharded -}}
+{{- /* One durable + filter PER claimed shard (D-3: 1 durable = 1
+     FilterSubject). max_ack_pending is HARD-CODED to 1 — ordering link O-6:
+     with MAP=1 a redelivery can never overtake a later message; the
+     group→sinkDefaults→legacy inheritance chain (default 1024) is DELIBERATELY
+     not consulted (design v2 §3 asymmetry #2). */ -}}
+{{-     if $enabled -}}{{- $anyPrefixedEnabled = true -}}{{- end -}}
+{{-     $fcfg := get $families $shardsOf -}}
+{{-     $n := int $fcfg.shards -}}
+{{-     $famUs := replace ":" "_" $shardsOf -}}
+{{-     $famDot := replace ":" "." $shardsOf -}}
+{{-     $claims := get $famClaims $shardsOf | default dict -}}
+{{-     $gshards := $g.shards | default list -}}
+{{-     if eq (len $gshards) 0 -}}
+{{-       fail (printf "connect.sinkGroups[%s]: shardsOf=%q requires a non-empty shards list (e.g. shards: [0,1,2,3] or [28,29,30,31,\"x\"])" $name $shardsOf) -}}
+{{-     end -}}
+{{-     $subs := list -}}
+{{-     range $s := $gshards -}}
+{{-       $sv := printf "%v" $s -}}
+{{-       $tok := "" -}}
+{{-       if eq $sv "x" -}}
+{{-         $tok = "sx" -}}
+{{-       else if regexMatch "^[0-9]+$" $sv -}}
+{{-         if ge (atoi $sv) $n -}}
+{{-           fail (printf "connect.sinkGroups[%s].shards: %v is out of range for family %q (shards: %d — valid: 0..%d and \"x\")" $name $s $shardsOf $n (sub $n 1)) -}}
+{{-         end -}}
+{{-         $tok = printf "s%d" (atoi $sv) -}}
+{{-       else -}}
+{{-         fail (printf "connect.sinkGroups[%s].shards: %q is neither an integer in 0..%d nor the isolation token \"x\"" $name $sv (sub $n 1)) -}}
+{{-       end -}}
+{{-       if $enabled -}}
+{{-         if hasKey $claims $tok -}}
+{{-           fail (printf "connect.sinkGroups[%s].shards: shard %q of family %q is already claimed by enabled group %q — every shard belongs to exactly one enabled group (INV-S4)" $name $tok $shardsOf (get $claims $tok)) -}}
+{{-         end -}}
+{{-         $_ := set $claims $tok $name -}}
+{{-       end -}}
+{{-       $durableK := printf "%s_%s_%s" $baseDurable $famUs $tok -}}
+{{-       $filterK := printf "%s.%s.%s.>" $prefix $famDot $tok -}}
+{{-       $subs = append $subs $filterK -}}
+{{-       $consumers = append $consumers (dict "token" $tok "durable" $durableK "filter" $filterK "maxAckPending" 1) -}}
+{{-     end -}}
+{{-     $_ := set $famClaims $shardsOf $claims -}}
+{{-     $filter = join "," $subs -}}
+{{-   else if $prefixed -}}
 {{-     if $enabled -}}{{- $anyPrefixedEnabled = true -}}{{- end -}}
 {{-     $subs := list -}}
 {{-     range $p := $prefixes -}}
@@ -346,7 +443,7 @@ in this pass); the 57-char name budget.
 {{-       end -}}
 {{-       if $enabled -}}
 {{-         if hasKey $seenPrefixes $p -}}
-{{-           fail (printf "connect.sinkGroups[%s].prefixes: %q is already owned by enabled group %q — a prefix may belong to exactly one enabled group" $name $p (get $seenPrefixes $p)) -}}
+{{-           fail (printf "connect.sinkGroups[%s].prefixes: %q is already owned by %q — a prefix may belong to exactly one enabled owner (a sinkGroup's prefixes or a connect.sharding family)" $name $p (get $seenPrefixes $p)) -}}
 {{-         end -}}
 {{-         $_ := set $seenPrefixes $p $name -}}
 {{-       end -}}
@@ -359,7 +456,7 @@ in this pass); the 57-char name budget.
 {{-     if $enabled -}}{{- $catchAllCount = add1 $catchAllCount -}}{{- end -}}
 {{-     $filter = printf "%s.others.>" $prefix -}}
 {{-   end -}}
-{{-   if and $enabled (not $prefixed) (eq $filterSubject "") (not $catchAll) -}}
+{{-   if and $enabled (not $prefixed) (not $sharded) (eq $filterSubject "") (not $catchAll) -}}
 {{-     $wholeStream = append $wholeStream $name -}}
 {{-   end -}}
 {{-   $durable := $baseDurable -}}
@@ -380,6 +477,18 @@ in this pass); the 57-char name budget.
 {{-   end -}}
 {{-   $glease := $g.lease | default dict -}}
 {{-   $gcons := $g.consumer | default dict -}}
+{{-   if and $sharded (not (eq (kindOf $gcons.maxAckPending) "invalid")) -}}
+{{-     fail (printf "connect.sinkGroups[%s].consumer.maxAckPending=%v — a shard group's durables are HARD-CODED to max_ack_pending: 1 (ordering link O-6, design D-8) and cannot be overridden; remove the key" $name $gcons.maxAckPending) -}}
+{{-   end -}}
+{{-   $ackWait := ($gcons.ackWait | default $defCons.ackWait | default $legCons.ackWait) -}}
+{{-   $maxAckPending := ($gcons.maxAckPending | default $defCons.maxAckPending | default $legCons.maxAckPending) -}}
+{{-   $maxDeliver := ($gcons.maxDeliver | default $defCons.maxDeliver | default $legCons.maxDeliver) -}}
+{{-   if $sharded -}}
+{{-     $maxAckPending = 1 -}}
+{{-     $durable = "" -}}
+{{-   else -}}
+{{-     $consumers = list (dict "token" "" "durable" $durable "filter" $filter "maxAckPending" $maxAckPending) -}}
+{{-   end -}}
 {{-   $elem := dict
              "name" $name
              "enabled" $enabled
@@ -387,13 +496,16 @@ in this pass); the 57-char name budget.
              "prefixed" $prefixed
              "prefixes" $prefixes
              "catchAll" $catchAll
+             "sharded" $sharded
+             "family" $shardsOf
+             "consumers" $consumers
              "durable" $durable
              "filter" $filter
              "streamID" ($g.streamID | default $streamID)
              "replicas" ($g.replicas | default $defs.replicas | default $legSink.replicas)
-             "ackWait" ($gcons.ackWait | default $defCons.ackWait | default $legCons.ackWait)
-             "maxAckPending" ($gcons.maxAckPending | default $defCons.maxAckPending | default $legCons.maxAckPending)
-             "maxDeliver" ($gcons.maxDeliver | default $defCons.maxDeliver | default $legCons.maxDeliver)
+             "ackWait" $ackWait
+             "maxAckPending" $maxAckPending
+             "maxDeliver" $maxDeliver
              "leaseDuration" ($glease.duration | default $defLease.duration | default $legLease.duration)
              "renewDeadline" ($glease.renewDeadline | default $defLease.renewDeadline | default $legLease.renewDeadline)
              "retryPeriod" ($glease.retryPeriod | default $defLease.retryPeriod | default $legLease.retryPeriod)
@@ -421,6 +533,22 @@ in this pass); the 57-char name budget.
 {{-     end -}}
 {{-   end -}}
 {{- end -}}
+{{- /* INV-S4: every configured family must have {0..N-1} plus the isolation
+     shard "x" claimed EXACTLY once by enabled shardsOf groups. An unclaimed
+     shard means a subject nobody consumes — its messages would park in the
+     stream until maxAge silently discards them. */ -}}
+{{- range $fam, $fcfg := $families -}}
+{{-   $claims := get $famClaims $fam | default dict -}}
+{{-   $n := int $fcfg.shards -}}
+{{-   range $i := until $n -}}
+{{-     if not (hasKey $claims (printf "s%d" $i)) -}}
+{{-       fail (printf "connect.sharding.families[%s]: shard %d is not claimed by any ENABLED sinkGroup — enabled shardsOf groups must cover {0..%d} plus \"x\" exactly once (INV-S4); messages published to its subject would never be consumed" $fam $i (sub $n 1)) -}}
+{{-     end -}}
+{{-   end -}}
+{{-   if not (hasKey $claims "sx") -}}
+{{-     fail (printf "connect.sharding.families[%s]: the isolation shard \"x\" is not claimed by any ENABLED sinkGroup — add \"x\" to one group's shards list (it receives unparseable-key and cross-shard-rename events; INV-S4)" $fam) -}}
+{{-   end -}}
+{{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
 
@@ -432,9 +560,61 @@ non-prefix install stays on the legacy <subjectPrefix>.<op> subject and grant.
 {{- define "rrcs.connect.prefixRouting" -}}
 {{- $any := false -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
-{{- if and $g.enabled $g.prefixed -}}{{- $any = true -}}{{- end -}}
+{{- if and $g.enabled (or $g.prefixed $g.sharded) -}}{{- $any = true -}}{{- end -}}
 {{- end -}}
 {{- ternary "true" "false" $any -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.shardingEnabled — "true" iff connect.sharding.families is non-empty
+(subject-sharding v2). Gates the forward leg's shard mapping, its serialized
+output variant (threads:1 + max_in_flight:1 + no fallback — ordering links
+O-3/O-4), and the nats-init prune gate. Validation of the sharding config lives
+in rrcs.connect.sinkGroups (invoked by every consumer of this helper's result).
+*/}}
+{{- define "rrcs.connect.shardingEnabled" -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- ternary "true" "false" (gt (len ($s.families | default dict)) 0) -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sharding.keyPattern — the RE2 pattern (with a (?P<id>...) named
+capture) the forward leg uses to extract the numeric shard key from a kv key.
+One default in one place; consumers quote it into Bloblang.
+*/}}
+{{- define "rrcs.connect.sharding.keyPattern" -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- $s.keyPattern | default "\\{employee:(?P<id>[0-9]+)\\}" -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sharding.keyPatternLit — the keyPattern as a QUOTED BLOBLANG STRING
+LITERAL. Bloblang strings are double-quoted with Go-style escapes; sprig's
+`quote` is %q-style and already doubles every regex backslash ("\{" becomes
+"\\{"), which is exactly the Bloblang (and Go) escaping needed. Do NOT add
+another escaping pass on top — that renders "\\\\{" and the regex silently
+matches nothing (every key would land on sx).
+*/}}
+{{- define "rrcs.connect.sharding.keyPatternLit" -}}
+{{- include "rrcs.connect.sharding.keyPattern" . | quote -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.shardMap — JSON object {rawFamily: shardCount} over
+connect.sharding.families, e.g. {"lp:m2g":32}. Rendered into the forward leg's
+shard mapping as a Bloblang object literal. Keyed by the RAW (colon) family —
+NOT the dotted subject token — because Bloblang's .get() treats '.' as a path
+separator ("lp.m2g" would be looked up as obj["lp"]["m2g"] and always miss);
+the mapping looks it up with the same $p2/$p1 keys as the routeMap. toJson
+emits sorted keys => deterministic render.
+*/}}
+{{- define "rrcs.connect.shardMap" -}}
+{{- $m := dict -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- range $fam, $fcfg := ($s.families | default dict) -}}
+{{- $_ := set $m $fam (int $fcfg.shards) -}}
+{{- end -}}
+{{- $m | toJson -}}
 {{- end -}}
 
 {{/*
@@ -468,6 +648,15 @@ the pipeline ConfigMap checksum is stable). Token = prefix with ':' -> '.'
 {{- $_ := set $m $p (replace ":" "." $p) -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+{{- /* Sharded families are routed prefixes too (v1 §4.4 rule 5: the routeMap
+     auto-includes every family — no duplicate declaration). The shard token is
+     appended to kv_prefix afterwards by the forward leg's shard mapping. The
+     coverage validation in rrcs.connect.sinkGroups guarantees a configured
+     family always has enabled consumers, so this is unconditional. */ -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- range $fam, $fcfg := ($s.families | default dict) -}}
+{{- $_ := set $m $fam (replace ":" "." $fam) -}}
 {{- end -}}
 {{- $m | toJson -}}
 {{- end -}}

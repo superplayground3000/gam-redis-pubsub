@@ -22,8 +22,11 @@
     { "id": 4, "title": "Connect processor errors (context)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
       "targets": [ { "expr": "sum(rate({__name__=~\"processor_error(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "processor_error/s" } ] },
     { "id": 5, "title": "Forward-leg JetStream publish failures", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "description": "cdc_forward_publish_failed: publishes that errored and were NACKed back to the redis_streams input for replay (no ack, no loss). Nonzero means NATS is rejecting/unreachable while the source keeps retrying.",
-      "targets": [ { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_publish_failed(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" } ] },
+      "description": "cdc_forward_publish_failed: publishes that errored and were NACKed back to the redis_streams input for replay (no ack, no loss). Nonzero means NATS is rejecting/unreachable while the source keeps retrying. SHARDED render (subject-sharding v2): the reject fallback (and this counter) is removed — publish failures retry IN PLACE and surface as output_error on the connect-source job instead (second series; drives CDCForwardPublishBlocked).",
+      "targets": [
+        { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_publish_failed(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" },
+        { "expr": "sum(increase({__name__=~\"output_error(_total)?\",namespace=~\"$namespace\",job=~\".*connect-source.*\"}[$__rate_interval]))", "legendFormat": "output_error (sharded forward, blocking retry)" }
+      ] },
     { "id": 6, "title": "Connect processing latency p50/p95/p99 (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "description": "Connect timing histograms (use_histogram_timing: true). Metric name says _ns but the histogram buckets record SECONDS in this Connect build — treat values as seconds.",
       "fieldConfig": { "defaults": { "unit": "s" } },
@@ -124,6 +127,24 @@
        "legendFormat": "negative deltas (clamped to 0)"
       }
      ]
-    }
+    },
+    { "id": 15, "title": "Sharded apply throughput by shard (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "description": "cdc_apply rate per shard (subject-sharding v2). Only sharded sink groups emit the shard label. Watch for balance: a hot shard (hot employee) saturates its serialized 1/RTT fetch lane while others idle — drives the CDCShardSkew alert. shard=sx is the isolation lane and belongs at zero (panel 16).",
+      "targets": [
+        { "expr": "sum by (shard) (rate({__name__=~\"cdc_apply(_total)?\",shard!=\"\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{shard}}" }
+      ] },
+    { "id": 16, "title": "Shard isolation lane (must stay 0)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+      "description": "Sharding invariant signals (design v2 §11 A3): cross_shard_rename = a rename whose old/new keys resolve to different shards (INV-S7 — any nonzero value is a bug); unparseable_shard = a sharded-family key without a keyPattern id (key contract broken); sx applies = traffic through the isolation shard. All three route to sx so nothing is lost — but nonzero means the key contract or the shard function is broken. NOTE: v2 has NO direct out-of-order signal (no fence) — these are proxies. Drives the CDCShardIsolationLane alert.",
+      "targets": [
+        { "expr": "sum(increase({__name__=~\"cdc_forward_cross_shard_rename(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "cross_shard_rename" },
+        { "expr": "sum(increase({__name__=~\"cdc_forward_unrouted(_total)?\",reason=\"unparseable_shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "unparseable_shard" },
+        { "expr": "sum(rate({__name__=~\"cdc_apply(_total)?\",shard=\"sx\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "sx apply rate" }
+      ] },
+    { "id": 17, "title": "Sync latency p99 (s) by shard", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+      "description": "cdc_sync_latency_seconds p99 per shard (sharded groups only; buckets are SECONDS). A single shard's p99 climbing while others stay flat = that shard's serialized lane is saturated or blocked (a poison message under max_ack_pending=1 blocks the whole shard — see CDCShardStuck). Companion of the CDCSyncLatencyHigh alert.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "histogram_quantile(0.99, sum by (le, shard) (rate(cdc_sync_latency_seconds_bucket{shard!=\"\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "{{shard}} p99" }
+      ] }
   ]
 }

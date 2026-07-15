@@ -1,0 +1,257 @@
+# cdc-reverse-sharded.yaml — STREAMS-MODE stream config for a SHARDED sink
+# group (subject-sharding v2: docs/design/subject-sharding/design.md). Selected
+# by connect-configmaps.yaml when the group carries shardsOf/shards; non-shard
+# groups keep cdc-reverse.yaml byte-for-byte.
+#
+# ORDERING CHAIN LINKS CARRIED BY THIS FILE (design v2 §3 — every one is a MUST,
+# hard-coded, no values override; loosening any of them silently reintroduces
+# old-overwrites-new and NO metric can detect it, because v2 has no LWW fence):
+#   O-6  per-shard delivery order: one durable per shard (1 durable = 1
+#        FilterSubject), server-side max_ack_pending=1 (nats-init hard-codes it;
+#        a redelivery can never overtake a later message), single active puller
+#        (Lease per group + broker copies:1).
+#   O-7  delivery order == apply order: broker fan-in preserves per-child FIFO,
+#        pipeline.threads:1 serializes apply, and reject_errored acks only
+#        after a successful region write.
+# DELIBERATE ASYMMETRY (do not "unify" with the forward leg): this sink KEEPS
+# reject_errored — a sink nack redelivers via JetStream, which CANNOT reorder
+# under max_ack_pending=1, so nack-on-error is the correct retry mechanism
+# here. The forward leg must never nack (PEL replay reorders); see
+# cdc-forward.yaml's sharded output block.
+#
+# Apply semantics are the repo's existing idempotent writes (SET / HSET / DEL /
+# value-preserving cdc_rename.lua) — v2 removed the v1 LWW fence: correctness
+# is carried by source-order apply, so no version comparison is needed.
+# rename envelopes carry NO body (the Lua moves the value); create/update are
+# op-gated gzip:base64 decoded exactly like cdc-reverse.yaml.
+#
+# POSTed verbatim by the group's sink elector while it holds the Lease; one
+# stream = ALL of this group's shard children, so leadership moves atomically
+# for the whole shard set (elector is pipeline-agnostic — design v2 §8).
+input:
+  label: sink_{{ replace "-" "_" .Group.name }}
+  broker:
+    # D-4: copies MUST stay 1 — copies>1 spawns multiple pullers on the SAME
+    # durable and per-shard delivery order dies (F4).
+    copies: 1
+    inputs:
+      {{- $famUs := replace ":" "_" .Group.family }}
+      {{- range $c := .Group.consumers }}
+      - label: {{ $famUs }}_{{ $c.token }}
+        nats_jetstream:
+          urls:
+            - "{{ include "rrcs.nats.url" $ }}"
+          auth:
+            user_credentials_file: {{ $.Values.nats.auth.creds.subscriber | quote }}
+          stream: {{ $.Values.nats.stream.name | quote }}
+          # bind:true attaches to the pre-created durable; in pull(bind) mode
+          # the server-side consumer settings rule (max_ack_pending=1 — O-6).
+          durable: {{ $c.durable | quote }}
+          bind: true
+        processors:
+          - mapping: 'meta shard = {{ $c.token | quote }}'
+      {{- end }}
+
+pipeline:
+  # O-7: broker per-child FIFO would be destroyed by concurrent processing —
+  # threads MUST stay 1 (design D-4). Apply is local-region Redis (sub-ms);
+  # serialization here is not the bottleneck (the fetch path is, hence K
+  # parallel shard children).
+  threads: 1
+  processors:
+    {{- if .Values.connect.contentLog.enabled }}
+    # Dump the raw inbound JetStream message (the full envelope JSON) FIRST, before
+    # any processor touches it — the `redis` processor below REPLACES content with
+    # the Redis reply, so this is the only place the original NATS payload is intact.
+    # Debug-only, gated by connect.contentLog.enabled (dumps real payload data).
+    - log:
+        level: {{ .Values.connect.contentLog.level }}
+        message: "cdc-reverse nats_in"
+        fields_mapping: |
+          root.leg      = "reverse"
+          root.stage    = "nats_in"
+          root.shard    = meta("shard")
+          root.envelope = content().string()
+    {{- end }}
+    # Stash the envelope fields into metadata FIRST (the `redis` processors
+    # REPLACE content with the Redis reply). Identical to cdc-reverse.yaml:
+    # op-gated body decode (only create/update carry a body; rename carries
+    # none in v2 — the rename Lua moves the value), .catch(null) + decode_failed
+    # for poison visibility, writer ts stashed for the post-apply sync sample.
+    - mapping: |
+        meta op      = this.op
+        meta type    = this.type.or("string")
+        meta kv_key  = this.kv_key
+        meta old_key = this.old_key
+        meta new_key = this.new_key
+        let is_encoded = (this.op == "create" || this.op == "update") && this.enc.or("") == "gzip:base64"
+        let decoded = if this.op == "create" || this.op == "update" {
+          if $is_encoded {
+            this.body.decode("base64").decompress("gzip").catch(null)
+          } else { this.body }
+        } else { null }
+        meta body = $decoded
+        meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
+        # Sync-latency stash (INV-2): envelope ts = writer mint time (epoch ms).
+        # Delta is computed AFTER the apply switch so the sample includes the
+        # region write. .catch(0) => a missing/garbled ts skips the sample
+        # instead of nacking.
+        let ts_ms = this.ts.number().catch(0)
+        meta sync_has_ts = if $ts_ms > 0 { "yes" } else { "no" }
+        meta sync_ts_ms = $ts_ms.round().int64().string()
+    {{- if .Values.connect.contentLog.enabled }}
+    # Dump exactly what is about to be applied to region Redis. body length only
+    # (may be binary). Debug-only, gated by connect.contentLog.enabled.
+    - log:
+        level: {{ .Values.connect.contentLog.level }}
+        message: "cdc-reverse redis_apply"
+        fields_mapping: |
+          root.leg     = "reverse"
+          root.stage   = "redis_apply"
+          root.shard   = meta("shard")
+          root.op      = meta("op")
+          root.type    = meta("type")
+          root.kv_key  = meta("kv_key")
+          root.old_key = meta("old_key")
+          root.new_key = meta("new_key")
+          root.body_len = meta("body").or("").length()
+    {{- end }}
+    - switch:
+        - check: meta("decode_failed") == "yes"
+          processors:
+            # Permanent poison: count + throw to nack. Under max_ack_pending=1
+            # a poison message BLOCKS its shard (redelivery loop) — that is the
+            # designed fail-stop: alert CDCShardStuck (A1) catches it; the
+            # other shards keep flowing (broker child isolation, F3).
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: decode_error
+            - mapping: 'root = throw("decode_error: undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?")))'
+        - check: meta("op") == "create" || meta("op") == "update"
+          processors:
+            # Best-effort latency telemetry, emitted BEFORE the SET. ts-bearing
+            # bodies only (verifier-injected events without ts are skipped).
+            - try:
+                - switch:
+                    - check: meta("body").parse_json().ts.or(0) > 0
+                      processors:
+                        - redis:
+                            url: {{ include "rrcs.redis.region.url" . }}
+                            kind: {{ include "rrcs.redis.region.connectKind" . }}
+                            command: xadd
+                            args_mapping: |
+                              root = [
+                                {{ .Values.latencyCalculator.stream | quote }},
+                                "MAXLEN", "~", {{ .Values.latencyCalculator.streamMaxLen | quote }}, "*",
+                                "op", meta("op"),
+                                "kv_key", meta("kv_key"),
+                                "writer_ts", meta("body").parse_json().ts.int64().string(),
+                                "sink_ts", now().ts_unix_milli().string()
+                              ]
+            - catch:
+                - log:
+                    level: WARN
+                    message: 'latency xadd failed (best-effort, ignored): ${! error() }'
+            # Authoritative apply, type-aware. NOT wrapped — a failure must nack/redeliver.
+            - switch:
+                - check: meta("type") == "hash"
+                  processors:
+                    - redis:
+                        url: {{ include "rrcs.redis.region.url" . }}
+                        kind: {{ include "rrcs.redis.region.connectKind" . }}
+                        command: hset
+                        # Flatten the JSON field-map body into HSET args (ONE line —
+                        # Bloblang rejects a method chain split across newlines here).
+                        args_mapping: 'root = [meta("kv_key")].concat(meta("body").parse_json().key_values().map_each(kv -> [kv.key, kv.value.string()]).flatten())'
+                - processors:
+                    - redis:
+                        url: {{ include "rrcs.redis.region.url" . }}
+                        kind: {{ include "rrcs.redis.region.connectKind" . }}
+                        command: set
+                        args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  shard: '${! meta("shard") }'
+                  op: '${! meta("op") }'
+                  type: '${! meta("type") }'
+        - check: meta("op") == "delete"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: {{ include "rrcs.redis.region.connectKind" . }}
+                command: del
+                args_mapping: 'root = [ meta("kv_key") ]'
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  shard: '${! meta("shard") }'
+                  op: delete
+                  type: '${! meta("type") }'
+        - check: meta("op") == "rename"
+          processors:
+            - redis:
+                url: {{ include "rrcs.redis.region.url" . }}
+                kind: {{ include "rrcs.redis.region.connectKind" . }}
+                command: eval
+                args_mapping: |
+                  let script = {{ .Files.Get "files/connect/cdc_rename.lua" | toJson }}
+                  root = [ $script, 2, meta("old_key"), meta("new_key") ]
+            - metric:
+                type: counter
+                name: cdc_apply
+                labels:
+                  shard: '${! meta("shard") }'
+                  op: rename
+                  type: '${! meta("type") }'
+        - processors:
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: unknown_op
+            - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
+    # ── Sync-latency recording (INV-2) ────────────────────────────────────
+    # Same shape as cdc-reverse.yaml (delta computed POST-apply so the sample
+    # includes the region write; !errored() so nacked messages record on their
+    # successful redelivery; clamp >=0 + integer-ns string — the timing
+    # processor hard-errors on negatives/floats AFTER the apply, which would
+    # nack an already-applied message), plus the shard label. Exported
+    # histogram is SECONDS under use_histogram_timing.
+    - switch:
+        - check: '!errored() && meta("sync_has_ts") == "yes"'
+          processors:
+            - mapping: |
+                let ts_ms = meta("sync_ts_ms").number().catch(0)
+                let sync_delta_ns = if $ts_ms > 0 { timestamp_unix_nano() - ($ts_ms * 1000000).round() } else { 0 }
+                meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().int64().string()
+                meta sync_skew_neg = if $sync_delta_ns < 0 { "yes" } else { "no" }
+            - metric:
+                type: timing
+                name: cdc_sync_latency_seconds
+                labels:
+                  op: '${! meta("op") }'
+                  shard: '${! meta("shard") }'
+                value: '${! meta("sync_latency_ns") }'
+            - switch:
+                - check: meta("sync_skew_neg") == "yes"
+                  processors:
+                    - metric:
+                        type: counter
+                        name: cdc_sync_skew_negative
+                        labels:
+                          shard: '${! meta("shard") }'
+
+output:
+  # Success acks JetStream; processor failure nacks -> redelivery on the SAME
+  # shard durable, which cannot reorder under max_ack_pending=1 (O-6). Ack
+  # routing follows the transaction back to the originating broker child (F3),
+  # so one shard's nack never blocks another shard.
+  reject_errored:
+    drop: {}
