@@ -205,22 +205,27 @@ retention limits.
 
 ## 7. Testing performed
 
-I did **not** run the kind end-to-end or behavioral scripts in this
-documentation session — this was a docs-only change (the verification ladder
-requires read-back only for docs). The commands below are the ones that prove the
-feature; run them to reproduce. Their coverage is documented in each script's
-header and I verified the pipeline/template behavior by reading the source cited
-throughout this page.
+The end-to-end proof below was run against this exact page's claims on
+2026-07-16 (kind cluster `cdc`, chart at the commit that introduced this doc) and
+passed. The guard-behavior script was **not** run in that session — its coverage
+is described from its own header, and the pipeline/template behavior is verified
+by the source citations throughout this page.
 
-- **End-to-end (L3 kind, ~5 min).** `scripts/verify-dlq-e2e.sh` — on a fresh
-  namespace with the DLQ enabled: poison bodies park on
-  `dlq.cdc.hash_decode_error`, the ack floor advances, no redelivery loop forms,
-  and a normal message injected afterward still reaches region Redis
-  (`scripts/verify-dlq-e2e.sh` header). Run it with:
+- **End-to-end (L3 kind, ~5 min) — RUN 2026-07-16, PASS (exit 0).**
   ```bash
   scripts/build-images.sh --kind --kind-name=cdc
   RRCS_NS=cdc-dlq RRCS_RELEASE=cdc-dlq scripts/verify-dlq-e2e.sh
   ```
+  What it proved, in the script's own result lines: the embedded baseline
+  `verify-cdc.sh` passed with the DLQ enabled ("PASS — dedup + per-op + replay
+  all green"); the stream bound `kv.cdc.>,dlq.cdc.>` (§2's binding claim); and
+  the final verdict — "PASS — poison parked (dlq +5), confirmed
+  (output_sent{dlq_out} +5, error 0), consumer unblocked (ack_pending->0,
+  redeliver +0), normal delivered, headers OK" — i.e. 5 poison hash bodies
+  parked on `dlq.cdc.hash_decode_error`, parking PubAck-confirmed with zero
+  publish failures, the ack floor advanced with no redelivery loop, a normal
+  message injected afterward still reached region Redis, and the §2 header
+  contract held on the parked messages.
 - **Guard behavior (no cluster needed).** `scripts/test-dlq-guard.sh` extracts the
   reverse pipeline's stash+guard mapping from the DLQ-enabled render and runs it in
   the pinned Connect image against a case table (plain and gzip:base64 poison,
