@@ -3,4 +3,4 @@
 # Rendered manifests
 out/
 # Local run output (HTML report, JSON, etc.)
-reports/
+/reports/

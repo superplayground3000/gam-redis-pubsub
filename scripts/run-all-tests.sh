@@ -15,6 +15,15 @@
 #   (with RUN_FAILOVER=1) verify-sharding-failover.sh + verify-sharding-replay.sh
 #   at L4. measure-shard-throughput.sh (T-8, tc netem) and
 #   sharding-cutover-drill.sh (T-10) stay manual-only.
+# RUN_E2E_MATRIX=1 additionally runs the permanent e2e MATRIX (verify-e2e-matrix.sh)
+#   in namespace cdc-e2e at L3: one install coexisting sharded lb:company + 2-seg
+#   tg:caveat + catchAll (P1 render, P2 traffic/isolation/ordering/loss, P3 graceful
+#   leader change), then a default single-sink install for P4 ack-after-apply faults.
+#   STANDALONE ONLY — must NOT be combined with RUN_PREFIX/RUN_SHARDING in the same
+#   invocation: their live cdc-mg/cdc-shard releases (~19 of 32 node CPU) plus the
+#   matrix's Install-A would oversubscribe connect CPU limits and flake P2's
+#   quiescence polls. Run it alone, or after scaling those releases to 0. The separate
+#   namespace prevents name collision but not CPU co-tenancy, which is the real risk.
 # Env knobs: KIND_NAME (default cdc), RRCS_NS (default cdc-k8s), RRCS_RELEASE (default cdc).
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -256,6 +265,10 @@ else
   fi
   if [ "${RUN_SHARDING:-0}" = "1" ]; then
     RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding.sh || fail L3
+  fi
+  # STANDALONE (see header): do not co-run with RUN_PREFIX/RUN_SHARDING (CPU co-tenancy).
+  if [ "${RUN_E2E_MATRIX:-0}" = "1" ]; then
+    RRCS_NS=cdc-e2e RRCS_RELEASE=cdce2e scripts/verify-e2e-matrix.sh || fail L3
   fi
   pass L3
 fi

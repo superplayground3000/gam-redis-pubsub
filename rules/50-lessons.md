@@ -214,3 +214,22 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
 - What happened: the sync-latency plan asserted `sync_count <= cdc_apply_count` at L3; it false-failed because `cdc_apply` has NO delete/rename series (pre-existing `{op,type}` vs `{op}` label-set inconsistency silently rejects the second shape — same quirk the 2026-07-07 run logged as a minor). The new histogram counted ops that cdc_apply cannot.
 - Rule that would have prevented it: new — before writing an assertion that compares two metrics, curl/dump the live series of BOTH and compare per-label-set, not whole-metric totals; treat a ledger "minor, pre-existing" note as an input to later plans.
 - Applied: plan step fixed to per-op create/update equality (commit b875315); recorded only, no rule file change.
+
+## 2026-07-16 — At-least-once pipelines forbid equality oracles; scope every fault-phase counter
+- What happened: the new e2e matrix (`scripts/verify-e2e-matrix.sh`) false-failed twice on a
+  healthy pipeline: (a) an isolation gate asserted per-group `cdc_apply == emitted` and tripped
+  on 2 legal redelivery duplicates; (b) a "nothing applied during the outage" gate read the
+  GLOBAL `cdc_apply` delta and absorbed 34 straggler duplicate applies from the PREVIOUS fault
+  phase. A third failure was pure bash: tab-delimited op-log fields collapse under `IFS=$'\t'
+  read` (tab is whitespace), which emptied a rename's newkey and crashed on `SEEN[""]` —
+  and that fatal error unwound the enclosing compound, silently skipping the next phase.
+- Rules that would have prevented it: (1) counts in an at-least-once system may only gate as
+  `>= expected` (liveness) or `== 0` (isolation/foreign lanes); exact equality is a false-FAIL
+  generator. Authoritative loss checks must be key-scoped terminal-state reconciliation.
+  (2) any cross-phase metric baseline needs a settle barrier (poll until steady) and, where
+  possible, a key-scoped probe instead of a global counter. (3) multi-field logs need a
+  non-whitespace delimiter (e.g. $'\037'); phase runners must isolate fatal aborts per phase
+  (flat top-level dispatch, ABORT status distinct from SKIP).
+- Applied: design §1.2/§5 amendments + verify-e2e-matrix.sh (run 3 = 21/21 green); also
+  confirmed the cross-model review rule again — Codex caught a cleanup-trap bug that would have
+  left a node-level iptables DROP to NATS after an aborted run.

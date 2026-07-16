@@ -1,0 +1,462 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>CDC E2E Matrix — Test Report 2026-07-16</title>
+<style>
+  :root {
+    --paper: #F5F8F7; --panel: #FFFFFF; --panel2: #ECF1EF;
+    --ink: #182420; --muted: #5B6B66; --line: #D8E2DE;
+    --accent: #0A8465; --accent-ink: #075E48;
+    --pass: #2F7D46; --pass-bg: #E3F0E7;
+    --gap: #9A6A0B; --gap-bg: #F5EDDA;
+    --fail: #B3362C; --fail-bg: #F6E4E2;
+    --mono: ui-monospace, "SF Mono", "Cascadia Code", Menlo, Consolas, monospace;
+    --sans: -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --paper: #0F1614; --panel: #16201D; --panel2: #1C2825;
+      --ink: #E5EEEA; --muted: #93A39D; --line: #2A3833;
+      --accent: #279D85; --accent-ink: #4FC0A6;
+      --pass: #54A46C; --pass-bg: #1A2E21;
+      --gap: #B58133; --gap-bg: #2E2717;
+      --fail: #E06A5E; --fail-bg: #331B18;
+    }
+  }
+  :root[data-theme="light"] {
+    --paper: #F5F8F7; --panel: #FFFFFF; --panel2: #ECF1EF;
+    --ink: #182420; --muted: #5B6B66; --line: #D8E2DE;
+    --accent: #0A8465; --accent-ink: #075E48;
+    --pass: #2F7D46; --pass-bg: #E3F0E7;
+    --gap: #9A6A0B; --gap-bg: #F5EDDA;
+    --fail: #B3362C; --fail-bg: #F6E4E2;
+  }
+  :root[data-theme="dark"] {
+    --paper: #0F1614; --panel: #16201D; --panel2: #1C2825;
+    --ink: #E5EEEA; --muted: #93A39D; --line: #2A3833;
+    --accent: #279D85; --accent-ink: #4FC0A6;
+    --pass: #54A46C; --pass-bg: #1A2E21;
+    --gap: #B58133; --gap-bg: #2E2717;
+    --fail: #E06A5E; --fail-bg: #331B18;
+  }
+  html { background: var(--paper); }
+  body {
+    background: var(--paper); color: var(--ink); font-family: var(--sans);
+    line-height: 1.55; margin: 0; padding: 0 20px 80px;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; }
+  h1, h2, h3 { font-family: var(--mono); text-wrap: balance; line-height: 1.25; }
+  h1 { font-size: 1.7rem; margin: 0.4rem 0 0.6rem; letter-spacing: -0.01em; }
+  h2 { font-size: 1.18rem; margin: 0 0 0.7rem; }
+  h3 { font-size: 0.98rem; margin: 1.3rem 0 0.4rem; }
+  p { max-width: 68ch; margin: 0.55rem 0; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 0.72rem; letter-spacing: 0.14em;
+    text-transform: uppercase; color: var(--accent-ink); margin: 0 0 0.2rem;
+  }
+  header.masthead { padding: 46px 0 10px; border-bottom: 2px solid var(--ink); margin-bottom: 12px; }
+  .runmeta { font-family: var(--mono); font-size: 0.78rem; color: var(--muted); display: flex; flex-wrap: wrap; gap: 6px 22px; padding: 8px 0 16px; }
+  .verdict-line { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin: 14px 0 4px; }
+  .pill {
+    font-family: var(--mono); font-weight: 700; font-size: 0.82rem;
+    padding: 4px 14px; border-radius: 3px; letter-spacing: 0.06em;
+  }
+  .pill.pass { background: var(--pass-bg); color: var(--pass); border: 1px solid var(--pass); }
+  .pill.gap  { background: var(--gap-bg);  color: var(--gap);  border: 1px solid var(--gap); }
+  section { margin: 44px 0 0; }
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 20px 0 6px; }
+  .tile { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 14px 16px 12px; }
+  .tile .num { font-family: var(--mono); font-size: 1.65rem; font-weight: 700; font-variant-numeric: tabular-nums; }
+  .tile .num.pass { color: var(--pass); } .tile .num.gap { color: var(--gap); }
+  .tile .lbl { font-size: 0.76rem; color: var(--muted); margin-top: 2px; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.86rem; }
+  .tblwrap { overflow-x: auto; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; margin: 12px 0; }
+  th { font-family: var(--mono); font-size: 0.7rem; letter-spacing: 0.09em; text-transform: uppercase; color: var(--muted); text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  td { padding: 8px 12px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  tr:last-child td { border-bottom: none; }
+  td.n, th.n { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  code, .mono { font-family: var(--mono); font-size: 0.85em; }
+  code { background: var(--panel2); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
+  .ok   { color: var(--pass); font-weight: 700; font-family: var(--mono); white-space: nowrap; }
+  .warn { color: var(--gap);  font-weight: 700; font-family: var(--mono); white-space: nowrap; }
+  .bad  { color: var(--fail); font-weight: 700; font-family: var(--mono); white-space: nowrap; }
+  figure { margin: 18px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 18px 18px 12px; overflow-x: auto; }
+  figcaption { font-size: 0.78rem; color: var(--muted); margin-top: 10px; max-width: 72ch; }
+  .callout { border-left: 4px solid var(--gap); background: var(--gap-bg); border-radius: 0 4px 4px 0; padding: 14px 18px; margin: 18px 0; }
+  .callout.passc { border-left-color: var(--pass); background: var(--pass-bg); }
+  .callout h3 { margin: 0 0 6px; }
+  .callout p { font-size: 0.9rem; }
+  /* bar chart rows */
+  .bars { display: grid; grid-template-columns: 92px 1fr 150px; gap: 7px 12px; align-items: center; min-width: 560px; }
+  .bars .blbl { font-family: var(--mono); font-size: 0.78rem; text-align: right; color: var(--ink); }
+  .bars .bval { font-family: var(--mono); font-size: 0.78rem; font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+  .btrack { position: relative; height: 18px; background: var(--panel2); border-radius: 3px; }
+  .bfill { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 3px 4px 4px 3px; }
+  .bdup { position: absolute; top: 0; bottom: 0; background: var(--gap); border-radius: 0 4px 4px 0; }
+  .btick { position: absolute; top: -3px; bottom: -3px; width: 2px; background: var(--ink); opacity: 0.65; }
+  /* timeline rows */
+  .tl { display: grid; grid-template-columns: 108px 1fr; gap: 8px 12px; align-items: center; min-width: 560px; }
+  .tl .tlbl { font-family: var(--mono); font-size: 0.78rem; text-align: right; }
+  .tltrack { position: relative; height: 26px; background: var(--panel2); border-radius: 3px; }
+  .tlseg { position: absolute; top: 3px; bottom: 3px; border-radius: 3px; font-family: var(--mono); font-size: 0.68rem; display: flex; align-items: center; justify-content: center; color: #fff; overflow: hidden; white-space: nowrap; }
+  .tlaxis { position: relative; height: 18px; font-family: var(--mono); font-size: 0.66rem; color: var(--muted); }
+  .tlaxis span { position: absolute; transform: translateX(-50%); }
+  .seg-fault { background: var(--fail); }
+  .seg-hold  { background: var(--gap); }
+  .seg-drain { background: var(--accent); }
+  .seg-ok    { background: var(--pass); }
+  .legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 0.76rem; color: var(--muted); margin-top: 10px; }
+  .legend .sw { display: inline-block; width: 11px; height: 11px; border-radius: 2px; vertical-align: -1px; margin-right: 6px; }
+  svg text { font-family: var(--mono); }
+  a { color: var(--accent-ink); }
+  .foot { margin-top: 60px; padding-top: 14px; border-top: 1px solid var(--line); font-size: 0.76rem; color: var(--muted); font-family: var(--mono); }
+</style>
+
+<div class="wrap">
+
+<header class="masthead">
+  <p class="eyebrow">redis-cdc-le-k8s · end-to-end verification</p>
+  <h1>CDC E2E Matrix — subject routing, sharding coexistence, graceful leader change, ack-after-apply</h1>
+  <div class="verdict-line">
+    <span class="pill pass">OVERALL PASS — 21 / 21 GATES</span>
+    <span class="pill gap">1 KNOWN PRODUCT GAP DOCUMENTED</span>
+  </div>
+  <div class="runmeta">
+    <span>run_id 1784133219</span><span>2026-07-16</span><span>kind cluster: cdc</span>
+    <span>namespace: cdc-e2e</span><span>wall clock: 4 m 26 s</span>
+    <span>script: scripts/verify-e2e-matrix.sh</span>
+  </div>
+</header>
+
+<section>
+  <p class="eyebrow">TL;DR</p>
+  <h2>Every guarantee we set out to test held. One known gap was confirmed and measured.</h2>
+  <p>
+    The test drove real traffic through a single install where <strong>sharded, prefix-routed and catch-all
+    pipelines coexist</strong>, then gracefully killed the leader on both legs, then injected two
+    infrastructure faults aimed exactly at the ack path. Across all of it,
+    <strong>not a single message was lost</strong> and per-key ordering never went backwards.
+    The one behavior that is <em>not</em> there — an explicit pipeline hand-off when a leader pod is
+    terminated gracefully — was confirmed absent and quantified (§4): failover works, but it rides on
+    lease expiry (~6 s), not on a graceful shutdown hook.
+  </p>
+  <div class="tiles">
+    <div class="tile"><div class="num pass">21/21</div><div class="lbl">gating checks green</div></div>
+    <div class="tile"><div class="num pass">0</div><div class="lbl">messages lost (all phases)</div></div>
+    <div class="tile"><div class="num pass">891</div><div class="lbl">messages driven through 5 lanes</div></div>
+    <div class="tile"><div class="num pass">6 s</div><div class="lbl">leader hand-off, both legs</div></div>
+    <div class="tile"><div class="num gap">1</div><div class="lbl">known gap: no graceful DELETE hand-off</div></div>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">System under test</p>
+  <h2>What the pipeline looks like during the coexistence phase</h2>
+  <p>
+    One Redis stream feeds one forward (source) leg, which stamps every message with a routing
+    subject and publishes it to NATS JetStream. Four independent sink groups — two sharded, one
+    prefix-routed, one catch-all — each subscribe to only their slice of the subject space and write
+    to the region Redis. Each leg and each sink group has its own leader election
+    (2 pods for the groups we kill in §4, 1 for the rest).
+  </p>
+  <figure>
+    <svg viewBox="0 0 840 330" width="840" height="330" role="img" aria-label="Pipeline topology: central Redis stream to forward leg to NATS JetStream subjects to four sink groups to region Redis">
+      <defs>
+        <marker id="arr" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto">
+          <path d="M0,0 L8,4 L0,8 z" fill="var(--muted)"/>
+        </marker>
+      </defs>
+      <!-- central redis -->
+      <rect x="8" y="130" width="118" height="66" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="67" y="158" text-anchor="middle" font-size="12" fill="var(--ink)" font-weight="bold">central Redis</text>
+      <text x="67" y="176" text-anchor="middle" font-size="10" fill="var(--muted)">stream app.events</text>
+      <!-- forward leg -->
+      <rect x="168" y="122" width="132" height="82" rx="5" fill="var(--panel2)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="234" y="147" text-anchor="middle" font-size="12" fill="var(--ink)" font-weight="bold">forward leg</text>
+      <text x="234" y="164" text-anchor="middle" font-size="10" fill="var(--muted)">connect-source ×2</text>
+      <text x="234" y="180" text-anchor="middle" font-size="10" fill="var(--accent-ink)">leader + standby</text>
+      <text x="234" y="196" text-anchor="middle" font-size="10" fill="var(--muted)">XACK after PubAck</text>
+      <!-- NATS -->
+      <rect x="342" y="96" width="150" height="134" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="417" y="120" text-anchor="middle" font-size="12" fill="var(--ink)" font-weight="bold">NATS JetStream</text>
+      <text x="417" y="137" text-anchor="middle" font-size="10" fill="var(--muted)">stream KV_CDC</text>
+      <text x="417" y="158" text-anchor="middle" font-size="9.5" fill="var(--ink)">kv.cdc.lb.company.s0–s3.*</text>
+      <text x="417" y="174" text-anchor="middle" font-size="9.5" fill="var(--ink)">kv.cdc.lb.company.sx.*</text>
+      <text x="417" y="190" text-anchor="middle" font-size="9.5" fill="var(--ink)">kv.cdc.tg.caveat.*</text>
+      <text x="417" y="206" text-anchor="middle" font-size="9.5" fill="var(--ink)">kv.cdc.others.*</text>
+      <!-- sink groups -->
+      <rect x="546" y="14" width="168" height="56" rx="5" fill="var(--panel2)" stroke="var(--accent)" stroke-width="1.5"/>
+      <text x="630" y="36" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">sink shard-a ×2</text>
+      <text x="630" y="52" text-anchor="middle" font-size="9.5" fill="var(--muted)">durables s0, s1 (map=1)</text>
+      <rect x="546" y="88" width="168" height="56" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="630" y="110" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">sink shard-b ×1</text>
+      <text x="630" y="126" text-anchor="middle" font-size="9.5" fill="var(--muted)">durables s2, s3, sx (map=1)</text>
+      <rect x="546" y="162" width="168" height="56" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="630" y="184" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">sink caveat ×1</text>
+      <text x="630" y="200" text-anchor="middle" font-size="9.5" fill="var(--muted)">durable cdc_sink_caveat</text>
+      <rect x="546" y="236" width="168" height="56" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="630" y="258" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">sink others ×1</text>
+      <text x="630" y="274" text-anchor="middle" font-size="9.5" fill="var(--muted)">durable cdc_sink_others</text>
+      <!-- region redis -->
+      <rect x="748" y="130" width="84" height="66" rx="5" fill="var(--panel2)" stroke="var(--line)"/>
+      <text x="790" y="158" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">region</text>
+      <text x="790" y="174" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="bold">Redis</text>
+      <!-- edges -->
+      <line x1="126" y1="163" x2="162" y2="163" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="300" y1="163" x2="336" y2="163" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="492" y1="128" x2="540" y2="46"  stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="492" y1="150" x2="540" y2="116" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="492" y1="180" x2="540" y2="190" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="492" y1="205" x2="540" y2="262" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="714" y1="42"  x2="744" y2="140" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="714" y1="116" x2="744" y2="152" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="714" y1="190" x2="744" y2="172" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+      <line x1="714" y1="264" x2="744" y2="185" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#arr)"/>
+    </svg>
+    <figcaption>
+      Fig. 1 — Coexistence topology (Install-A). The forward leg computes a routing token per key:
+      keys of the sharded family <code>lb:company</code> also get a shard suffix
+      (<code>id mod 4</code> → s0…s3; unparseable ids → the sx isolation lane). Each sink group binds only
+      its own pre-created durable consumers, so isolation is enforced by NATS subject filters, not by code
+      in the sinks. Phases §5 (ack faults) run on a second, default single-sink install (Install-B).
+    </figcaption>
+  </figure>
+</section>
+
+<section>
+  <p class="eyebrow">Coverage</p>
+  <h2>Scenario matrix — every routing shape the chart supports</h2>
+  <p>
+    The chart's values file can express seven distinct routing shapes. All seven are covered:
+    the three runtime lanes carry live traffic in one shared install (P2), and the rest are proven at
+    render level (P1) or inherit coverage from the existing per-feature suites.
+  </p>
+  <div class="tblwrap"><table>
+    <tr><th>Routing shape</th><th>Example subject</th><th>Covered by</th><th>Result</th></tr>
+    <tr><td>Sharded family (4 shards + sx)</td><td class="mono">kv.cdc.lb.company.s2.update</td><td>P2 runtime lane (2 groups)</td><td class="ok">PASS</td></tr>
+    <tr><td>Two-segment prefix (<code>tg:caveat</code>)</td><td class="mono">kv.cdc.tg.caveat.create</td><td>P2 runtime lane</td><td class="ok">PASS</td></tr>
+    <tr><td>Catch-all group (<code>others</code>)</td><td class="mono">kv.cdc.others.delete</td><td>P2 runtime lane</td><td class="ok">PASS</td></tr>
+    <tr><td>All three coexisting in one install</td><td class="mono">— (the point of P2)</td><td>P2, simultaneous traffic</td><td class="ok">PASS</td></tr>
+    <tr><td>Legacy single default sink (<code>kv.cdc.&gt;</code>)</td><td class="mono">kv.cdc.update</td><td>P4 runtime (Install-B) + existing L3</td><td class="ok">PASS</td></tr>
+    <tr><td>One-segment prefix routing</td><td class="mono">kv.cdc.prefix-a.create</td><td>Existing suite (<code>verify-cdc-prefix.sh</code>); same helper path as two-segment, render-proven in P1</td><td class="ok">PASS</td></tr>
+    <tr><td>Explicit <code>filterSubject</code> escape hatch</td><td class="mono">any</td><td>Render level (same binding machinery as above)</td><td class="ok">PASS (render)</td></tr>
+    <tr><td>Conflicting / invalid configs</td><td class="mono">—</td><td>P1: both fail-loud guards must fire at render time</td><td class="ok">PASS</td></tr>
+    <tr><td>Wrong <code>keyPattern</code> trap (see §6)</td><td class="mono">—</td><td>P1 guard: overlay must set the plural pattern</td><td class="ok">PASS</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <p class="eyebrow">Phase 2 · 19 s · 8 gates</p>
+  <h2>Coexistence under simultaneous traffic: isolation, ordering, zero loss</h2>
+  <p>
+    Five key lanes were emitted concurrently into the shared stream: the sharded family
+    (spread across the 4 shards), the <code>tg:caveat</code> prefix lane, a catch-all lane, an
+    ordering stress lane (2 hot keys × 200 sequenced updates), and 3 deliberately malformed keys
+    aimed at the sx isolation lane. Each lane uses a disjoint key range, so the final state of the
+    region Redis can be checked key-by-key against the exact ops that were emitted.
+  </p>
+  <figure>
+    <div class="bars">
+      <div class="blbl">shard-a</div><div class="btrack"><div class="bfill" style="width:100%"></div></div><div class="bval">420 applied / 420 expected</div>
+      <div class="blbl">shard-b</div><div class="btrack" style="max-width:120px"><div class="bfill" style="width:100%"></div></div><div class="bval">20 / 20</div>
+      <div class="blbl">caveat</div><div class="btrack" style="max-width:180px"><div class="bfill" style="width:94%"></div><div class="bdup" style="left:94%; width:6%"></div><div class="btick" style="left:94%"></div></div><div class="bval">33 / 31 (+2 dupes)</div>
+      <div class="blbl">others</div><div class="btrack" style="max-width:126px"><div class="bfill" style="width:100%"></div></div><div class="bval">21 / 21</div>
+      <div class="blbl">sx lane</div><div class="btrack" style="max-width:60px"><div class="bfill" style="width:100%; background:var(--gap)"></div></div><div class="bval">3 / 3 quarantined</div>
+    </div>
+    <div class="legend">
+      <span><span class="sw" style="background:var(--accent)"></span>applies of the lane's own keys</span>
+      <span><span class="sw" style="background:var(--gap)"></span>legal duplicate re-applies / sx quarantine</span>
+      <span>▎ black tick = expected count</span>
+    </div>
+    <figcaption>
+      Fig. 2 — Applies per sink group vs. what was emitted (bar lengths proportional within each lane).
+      The two extra applies in <code>caveat</code> are redelivery duplicates — legal under at-least-once
+      delivery and absorbed by idempotent writes; they are reported, not failed. The 3 sx-lane messages
+      are the 3 malformed keys, quarantined exactly as designed with zero cross-shard renames.
+    </figcaption>
+  </figure>
+  <div class="tblwrap"><table>
+    <tr><th>Check</th><th>What it proves</th><th>Evidence</th><th>Gate</th></tr>
+    <tr><td>Per-key ordering</td><td>Within one key, updates never go backwards even with 4 shards + 3 other lanes running</td><td class="mono">7 052 samples · 104 keys · monotone · both hot keys ended at seq 200/200</td><td class="ok">PASS</td></tr>
+    <tr><td>Liveness</td><td>Every group applied at least what its lane emitted</td><td class="mono">420/420 · 20/20 · 33/31 · 21/21</td><td class="ok">PASS</td></tr>
+    <tr><td>Isolation — foreign shards</td><td>shard-a never applied s2/s3/sx traffic; shard-b never applied s0/s1</td><td class="mono">foreign_shard_applies = 0</td><td class="ok">PASS</td></tr>
+    <tr><td>Isolation — key leakage</td><td>No key ever landed outside its lane's namespace</td><td class="mono">keys_outside_lane_ranges = 0</td><td class="ok">PASS</td></tr>
+    <tr><td>Zero loss (terminal state)</td><td>Region Redis ends exactly as the emitted op log dictates</td><td class="mono">91/91 keys · 0 missing · 0 corrupt · 2 deletes + 1 rename verified</td><td class="ok">PASS</td></tr>
+    <tr><td>Shard durables (server-side)</td><td>Every shard durable is pull/explicit-ack with <code>max_ack_pending=1</code> — the setting that makes per-key order possible</td><td class="mono">all 5 durables: map=1, ack=explicit, exact filter</td><td class="ok">PASS</td></tr>
+    <tr><td>sx isolation lane</td><td>Malformed keys are quarantined, never guessed into a shard</td><td class="mono">3 applied on sx · unparseable Δ=3 · cross-shard renames = 0</td><td class="ok">PASS</td></tr>
+    <tr><td>Dedup</td><td>Re-publishing the same event id does not double-apply</td><td class="mono">stream count stable</td><td class="ok">PASS</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <p class="eyebrow">Phase 3 · 18 s · 4 gates + 1 finding</p>
+  <h2>Graceful leader termination: no loss — but the hand-off is lease expiry, not a graceful shutdown</h2>
+  <p>
+    While a hot key was receiving a continuous stream of sequenced updates, the current
+    <em>leader</em> pod was deleted gracefully (normal <code>kubectl delete pod</code>, default 30 s grace) —
+    first on the forward leg, then on the shard-a sink group. The question: does anything get lost or
+    reordered in the gap, and <em>how</em> does the standby take over?
+  </p>
+  <figure>
+    <div class="tl">
+      <div class="tlbl">source leg</div>
+      <div class="tltrack">
+        <div class="tlseg seg-fault" style="left:0%; width:33%">leaderless 6 s</div>
+        <div class="tlseg seg-ok" style="left:34%; width:66%">standby leads — stream drains, 0 lost</div>
+      </div>
+      <div class="tlbl">sink shard-a</div>
+      <div class="tltrack">
+        <div class="tlseg seg-fault" style="left:0%; width:33%">leaderless 6 s</div>
+        <div class="tlseg seg-ok" style="left:34%; width:66%">standby leads — stream drains, 0 lost</div>
+      </div>
+      <div class="tlbl"></div>
+      <div class="tlaxis"><span style="left:0%">t=0 delete pod</span><span style="left:33%">6 s lease expires</span><span style="left:97%">18 s</span></div>
+    </div>
+    <figcaption>
+      Fig. 3 — Both legs: the victim's Lease is <em>not</em> released on termination; the standby waits out
+      the 6 s lease duration, then acquires it and POSTs the pipeline. Unacked work simply replays to the
+      new leader (that is the at-least-once machinery doing its job), so the gates still pass.
+    </figcaption>
+  </figure>
+  <div class="tblwrap"><table>
+    <tr><th>Leg</th><th>Victim pod</th><th class="n">Hand-off</th><th>Mechanism</th><th class="n">Lost</th><th>Ordering</th><th>Gate</th></tr>
+    <tr><td>source (forward)</td><td class="mono">…source-7df9fdc5fc-qvs82</td><td class="n">6 s</td><td class="mono">lease_expiry</td><td class="n">0</td><td class="mono">monotone</td><td class="ok">PASS</td></tr>
+    <tr><td>sink (shard-a)</td><td class="mono">…shard-a-56c8bcdb64-s2ln8</td><td class="n">6 s</td><td class="mono">lease_expiry</td><td class="n">0</td><td class="mono">monotone</td><td class="ok">PASS</td></tr>
+  </table></div>
+  <div class="callout">
+    <h3>Known gap (confirmed): no graceful pipeline shutdown on SIGTERM</h3>
+    <p>
+      The elector sidecar has no signal handler and the pods have no <code>preStop</code> hook, so on a
+      graceful termination the <code>OnStoppedLeading</code> path — which would explicitly
+      <code>DELETE</code> the running pipeline and release leadership — never executes. The test followed
+      each victim's elector log through its entire termination: the <code>OnStoppedLeading</code> marker
+      never appeared on either leg (<code>elector_delete_ran=false</code>). Failover therefore always pays
+      the full lease timeout (~6 s of leaderless pipeline per event) even when Kubernetes asked politely.
+      <strong>Impact today: latency only, not loss</strong> — every gate above passed. Per your instruction
+      this run documents the gap; the natural fix (a SIGTERM handler and/or preStop hook in the elector)
+      is left as a follow-up product change.
+    </p>
+  </div>
+</section>
+
+<section>
+  <p class="eyebrow">Phase 4 · 185 s · 2 gates</p>
+  <h2>Ack-after-apply: messages are never acknowledged before they are durably applied</h2>
+  <p>
+    This is the heart of the at-least-once guarantee, tested once per leg by breaking the step
+    <em>right after</em> which the acknowledgment would be sent, and watching whether the pipeline
+    holds the message or wrongly lets it go.
+  </p>
+  <h3>F-1 · source leg — NATS unreachable</h3>
+  <figure>
+    <div class="tl">
+      <div class="tlbl">f1:* burst (200)</div>
+      <div class="tltrack">
+        <div class="tlseg seg-fault" style="left:0%; width:42%">NATS blocked 45 s — PEL holds all 200, 0 applied</div>
+        <div class="tlseg seg-drain" style="left:43%; width:24%">partition lifted — drain</div>
+        <div class="tlseg seg-ok" style="left:68%; width:32%">PEL 0 · region 200/200 · 0 lost</div>
+      </div>
+      <div class="tlbl"></div>
+      <div class="tlaxis"><span style="left:1%">t=0 iptables DROP</span><span style="left:42%">45 s heal</span><span style="left:95%">verified</span></div>
+    </div>
+    <figcaption>
+      Fig. 4 — With the network to NATS dropped at the node's firewall, the forward leg could not get a
+      publish acknowledgment — and correctly refused to XACK anything: all 200 stream entries stayed in
+      the consumer group's pending list (PEL=200, region=0) for the whole outage. After healing, the PEL
+      drained to zero and all 200 messages reached the region. Nothing was acked before it was safe.
+    </figcaption>
+  </figure>
+  <h3>F-2 · sink leg — region Redis gone</h3>
+  <figure>
+    <div class="tl">
+      <div class="tlbl">f2:* burst (200)</div>
+      <div class="tltrack">
+        <div class="tlseg seg-fault" style="left:0%; width:42%">region scaled to 0 — f2 keys applied: 0</div>
+        <div class="tlseg seg-hold" style="left:0%; width:42%; top:auto; height:7px; bottom:3px">unacked: pending&gt;0, redeliveries climbing</div>
+        <div class="tlseg seg-drain" style="left:43%; width:24%">region back — redeliver + apply</div>
+        <div class="tlseg seg-ok" style="left:68%; width:32%">region 200/200 · 0 lost</div>
+      </div>
+      <div class="tlbl"></div>
+      <div class="tlaxis"><span style="left:2%">t=0 scale to 0</span><span style="left:42%">45 s scale to 1</span><span style="left:95%">verified</span></div>
+    </div>
+    <figcaption>
+      Fig. 5 — With the region Redis deployment scaled to zero, the sink could not complete a write — and
+      correctly refused to ack: a region scan showed <strong>zero</strong> f2 keys applied during the outage
+      while JetStream held deliveries unacknowledged (pending up to 5 under the shard's
+      <code>max_ack_pending</code>-style flow control; delivery counter climbing 205→233 as it retried,
+      6 redeliveries recorded). When the pod returned, everything redelivered and applied: 200/200, zero loss.
+    </figcaption>
+  </figure>
+  <div class="tblwrap"><table>
+    <tr><th>Leg / fault</th><th>Held where, while broken</th><th class="n">Applied during fault</th><th class="n">After recovery</th><th class="n">Lost</th><th>Gate</th></tr>
+    <tr><td>Source — NATS partition (45 s)</td><td>central Redis PEL (200 entries un-XACKed)</td><td class="n">0</td><td class="n">200 / 200, PEL 0</td><td class="n">0</td><td class="ok">PASS</td></tr>
+    <tr><td>Sink — region outage (45 s)</td><td>JetStream (unacked, redelivering)</td><td class="n">0 f2 keys</td><td class="n">200 / 200</td><td class="n">0</td><td class="ok">PASS</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <p class="eyebrow">Method</p>
+  <h2>How the oracles work — and why two of them had to be redesigned</h2>
+  <p>
+    A test of an at-least-once pipeline has one classic trap: <strong>duplicates are legal</strong>.
+    Any oracle written as "applies must equal what we sent" will randomly fail on a perfectly healthy
+    system the moment a redelivery lands. The first live run hit exactly that (a benign +2 in one lane,
+    and 34 straggler duplicates from one fault phase bleeding into the next phase's counter), so the
+    oracles were redesigned to be duplicate-proof:
+  </p>
+  <div class="tblwrap"><table>
+    <tr><th>Oracle</th><th>Naive form (rejected)</th><th>Final form (duplicate-proof)</th></tr>
+    <tr><td>Isolation</td><td>per-group apply count == emitted count</td><td>Exact-zero checks only: foreign-shard applies = 0, keys outside the lane's namespace = 0. Counts become "≥ emitted" liveness; the surplus is reported as duplicates.</td></tr>
+    <tr><td>Zero loss</td><td>count comparison</td><td>Key-by-key terminal-state reconciliation: replay the emitted op log (creates, updates, deletes, renames) and require the region to match exactly — including keys that must be <em>absent</em> after a delete.</td></tr>
+    <tr><td>Ordering</td><td>—</td><td>A poller samples hot keys thousands of times during the chaos; every observed value must be ≥ the previous one (7 052 samples this run).</td></tr>
+    <tr><td>F-2 "nothing applied while broken"</td><td>global apply-counter delta == 0</td><td>Key-scoped region scan (f2 keys = 0 during fault) plus a settle barrier between fault phases, since the global counter can't tell one phase's stragglers from another's applies.</td></tr>
+  </table></div>
+  <p>
+    It took three runs to get a fully green board — all three failures were <em>harness</em> defects,
+    not pipeline defects (a bash crash on rename bookkeeping, the two naive oracles above, a monitoring
+    pod dying under load, and a results-file race). The product-side behavior was consistent across all
+    three runs. The test also survived its own adversarial review: a cross-model (Codex) review before
+    the first run caught a cleanup bug that could have left the kind node's NATS firewalled cluster-wide.
+  </p>
+</section>
+
+<section>
+  <p class="eyebrow">Caveats</p>
+  <h2>Known gaps and what this test deliberately does not claim</h2>
+  <div class="tblwrap"><table>
+    <tr><th>Item</th><th>Status</th><th>Detail</th></tr>
+    <tr><td>Graceful SIGTERM pipeline hand-off</td><td class="warn">GAP (product)</td><td>Confirmed absent on both legs (§4). Failover works via ~6 s lease expiry; zero loss observed. Fix would be an elector signal handler / preStop hook.</td></tr>
+    <tr><td>Default <code>keyPattern</code> mismatch trap</td><td class="warn">TRAP (config)</td><td>The chart default matches <code>{employee:…}</code> (singular) but the writer's real keys use plural tags like <code>{employees:…}</code> — a sharded install left on the default would quarantine <em>everything</em> to sx. The e2e overlay sets the plural pattern explicitly and P1 has a guard that fails if it ever goes missing.</td></tr>
+    <tr><td>Cross-key reordering</td><td class="mono">by design</td><td>Ordering is guaranteed per key, not across keys (documented lab design decision). Not tested, not claimed.</td></tr>
+    <tr><td>F-2 scope</td><td class="mono">by design</td><td>The region store is wiped when its pod is deleted (emptyDir), so the sink-fault phase reconciles only its own disjoint key range — earlier phases' keys are legitimately gone by then.</td></tr>
+    <tr><td>Concurrent pull ("shared") consumer mode</td><td class="mono">out of scope</td><td>Explicitly unimplemented in the chart; rejected loudly at render time.</td></tr>
+  </table></div>
+</section>
+
+<section>
+  <p class="eyebrow">Reproduce</p>
+  <h2>The test is now a permanent part of the repo</h2>
+  <div class="tblwrap"><table>
+    <tr><th>Artifact</th><th>Where</th></tr>
+    <tr><td>Umbrella test script (phases P1–P4, per-phase gates, machine-readable results)</td><td class="mono">scripts/verify-e2e-matrix.sh</td></tr>
+    <tr><td>Coexistence values overlay (sharded + two-segment prefix + catch-all)</td><td class="mono">chart/ci/e2e-coexist-values.yaml</td></tr>
+    <tr><td>Ladder wiring (runs standalone — not alongside RUN_PREFIX / RUN_SHARDING)</td><td class="mono">RUN_E2E_MATRIX=1 scripts/run-all-tests.sh</td></tr>
+    <tr><td>This run's evidence JSON</td><td class="mono">reports/e2e-matrix/1784133219.json</td></tr>
+    <tr><td>Design + critique record</td><td class="mono">docs/superpowers/plans/2026-07-15-e2e-matrix-design.md · …-critique.md</td></tr>
+  </table></div>
+  <p>Direct invocation:</p>
+  <p><code>RRCS_NS=cdc-e2e RRCS_RELEASE=cdce2e scripts/verify-e2e-matrix.sh</code></p>
+  <p>
+    Useful knobs: <code>VERIFY_PHASES="p1 p2"</code> to run a subset,
+    <code>SETTLE_TIMEOUT_S</code> / <code>REGION_OUTAGE_S</code> / <code>E2E_DEADLINE_S</code> for timing,
+    and every run writes <code>reports/e2e-matrix/&lt;runid&gt;.json</code> plus a one-line
+    <code>RESULT_JSON:</code> for machines.
+  </p>
+</section>
+
+<p class="foot">
+  redis-cdc-le-k8s · e2e matrix run 1784133219 · 2026-07-16 · exit 0 · verify-e2e-matrix.sh on kind/cdc, ns cdc-e2e ·
+  21 gating checks green · 1 known gap documented (§4)
+</p>
+
+</div>
