@@ -60,6 +60,16 @@ each one fixes a defect found during the port, the design intent is unchanged:
    `output_error{label="dlq_out"}` ("publish failures"): healthy = routed == confirmed,
    failures 0; routed climbing with confirmed flat = DLQ publish failing, poison still
    looping.
+8. **Creds regen executed; §4.4's deferral is closed (2026-07-16).** `gen-nats-auth.sh
+   --force` was run and the rotated fixtures committed — the subscriber JWT now carries
+   the `dlq.cdc.>` pub grant (decoded and verified). The enabled path is proven
+   end-to-end in kind by `scripts/verify-dlq-e2e.sh`: fresh install with
+   `connect.deadLetter.enabled=true`, verify-cdc happy path green, 5 injected hash
+   poisons → exactly 5 on `dlq.cdc.hash_decode_error` with PubAck-confirmed
+   `output_sent{label="dlq_out"}`=+5 / `output_error`=0, ack floor +6 (5 poison + 1
+   control), zero redeliveries, header contract verified on a parked message. The L1
+   merge-base byte-identical check now normalizes creds-derived material (JWT blobs,
+   nkeys, the creds-hashed nats-init Job name) since the fixtures legitimately rotate.
 
 ## Problem
 

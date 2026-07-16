@@ -147,13 +147,17 @@ connect:
   # forever as before. Subject MUST be outside nats.stream.subjectPrefix so no
   # sink consumer re-consumes it (fail-loud otherwise).
   deadLetter:
-    # Activating the DLQ requires the subscriber creds to grant pub on <subject>.> .
-    # scripts/gen-nats-auth.sh already emits that grant, but the committed
-    # chart/files/nats-auth/ creds are NOT regenerated here (a --force regen rotates
-    # the operator+account identities and would orphan an existing KV_CDC stream).
-    # To enable end-to-end: run scripts/gen-nats-auth.sh --force, commit
-    # chart/files/nats-auth/, and redeploy. Until then a DLQ publish is
-    # permission-denied — which fails SAFE (nack/retry, no loss).
+    # The DLQ needs the subscriber creds to grant pub on <subject>.> . The committed
+    # chart/files/nats-auth/ creds WERE regenerated with that grant (2026-07-16), so
+    # on a FRESH install enabling is just this toggle — proven end-to-end by
+    # scripts/verify-dlq-e2e.sh (poison parked, ack floor advances, consumer
+    # unblocked). CAUTION for deployments installed with the PRE-rotation creds:
+    # the regen rotated the operator+account identities, so redeploying with these
+    # creds orphans that release's existing KV_CDC stream state — plan a fresh NATS
+    # (new install/namespace) or migrate, rather than upgrading in place. If creds
+    # are ever out of sync (missing grant), a DLQ publish is permission-denied —
+    # which fails SAFE (nack/retry, no loss), and shows on the dashboard as
+    # "routed" climbing while "confirmed parked" stays flat.
     enabled: false
     subject: "dlq.cdc"      # published per-reason as <subject>.<reason>; stream binds <subject>.>
   source:
