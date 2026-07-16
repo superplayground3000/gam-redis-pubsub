@@ -9,6 +9,9 @@
 #   - Which Grafana panel and metrics confirm poison is really being parked.
 #   - The exact command that proves the whole thing end-to-end.
 #
+# Full operator/maintainer guide (rationale, rollout, failure modes, citations):
+# docs/dlq.md.
+#
 # What the DLQ is for:
 #   The sink applies each NATS message to region Redis, then acks. A "poison"
 #   message can NEVER be applied no matter how many times it is retried — for

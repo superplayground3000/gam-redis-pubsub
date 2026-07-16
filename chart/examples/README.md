@@ -69,6 +69,8 @@ carry the publish grant, and which Grafana panel confirms parking.
 - **Confirm in Grafana:** panel 18, "DLQ: routed vs confirmed parked" — healthy is
   `routed == confirmed parked` with `publish failures` at 0. See the observability
   note inside the example for how to read a stuck DLQ.
+- **Full operator/maintainer guide:** `docs/dlq.md` (rationale, rollout incl. the
+  pre-2026-07-16 creds caution, failure modes, and per-claim source citations).
 
 ## Untested / unsupported combinations
 
