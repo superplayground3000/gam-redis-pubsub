@@ -1,4 +1,11 @@
 # Distilled sink pipeline (run mode). Same metric names as chart cdc-reverse.yaml.
+# DLQ mirror (Task 5): this lab always runs the equivalent of the chart's
+# connect.deadLetter.enabled=true shape — decode_error / hash_decode_error /
+# unknown_op are published to a sibling subject (dlq.cdc.<reason>) on the SAME
+# JetStream stream, then acked (write-then-ack), instead of nacking forever. This
+# lab has NO NATS creds (auth-less), so there is no permission concern publishing
+# the DLQ subject — that's why the plan proves DLQ here rather than via the
+# chart's deferred subscriber-creds grant (Task 3).
 http: { address: 0.0.0.0:4195, enabled: true }
 metrics: { prometheus: {} }
 logger: { level: INFO, format: json }
@@ -26,16 +33,73 @@ pipeline:
         let decoded = if this.op == "create" || this.op == "update" {
           if $is_encoded { this.body.decode("base64").decompress("gzip").catch(null) } else { this.body }
         } else { null }
+        # Keep decode_failed in a `let` too, NOT only in metadata: inside a Connect
+        # `mapping` processor at RUNTIME, `meta("x")` reads the metadata as it was
+        # at mapping ENTRY — assignments made earlier in the SAME mapping are only
+        # committed when the mapping finishes. (`blobl` on the CLI does see them
+        # mid-mapping, which masks the bug.) So the hash guard below MUST gate on
+        # the `$decode_failed` let, not `meta("decode_failed")`, or its precondition
+        # reads null, the whole AND is false, and the guard silently never runs —
+        # letting a malformed hash body fall through to the HSET and get dropped.
+        let decode_failed = $is_encoded && $decoded == null
         meta body = $decoded
-        meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
+        meta decode_failed = if $decode_failed { "yes" } else { "no" }
+        # DLQ guard (mirrors chart/files/connect/cdc-reverse.yaml): a hash body must
+        # be a valid JSON OBJECT for the HSET args_mapping below, which does
+        # .parse_json().key_values() and throws on arrays/scalars. Validate up front
+        # so a malformed hash body is COUNTED (cdc_unprocessable{reason=hash_decode_error})
+        # and dead-lettered instead of throwing UN-COUNTED inside the HSET args_mapping.
+        # Only checked for create/update hash bodies that decoded OK (via $decode_failed,
+        # see note above). .string() coerces $decoded (which the decode/decompress
+        # branch types as bytes) back to a string so parse_json is well-defined;
+        # .catch(null).type() turns a parse failure into "null" -> also classified
+        # failed. NOTE: this Connect runtime's parse_json TOLERATES some malformed
+        # JSON (e.g. a trailing comma parses as a plain string, not an error), so the
+        # reliable "non-object" poison is a JSON ARRAY/scalar body (what the
+        # generator's hashpoison mode emits) rather than a trailing comma.
+        let hash_body_ok = if (this.op == "create" || this.op == "update") && this.type.or("string") == "hash" && !$decode_failed {
+          $decoded.string().parse_json().catch(null).type() == "object"
+        } else { true }
+        meta hash_decode_failed = if $hash_body_ok { "no" } else { "yes" }
+        # DLQ dedup identity (mirrors chart): the DLQ output stamps
+        # Nats-Msg-Id: dlq.<event_id>. The "dlq." prefix is LOAD-BEARING — JetStream
+        # msg-id dedup is STREAM-wide and the generator already published the
+        # ORIGINAL message with Nats-Msg-Id=event_id on this same stream; a bare
+        # event_id would dedupe the DLQ publish against the original within the
+        # dupe window -> PubAck{duplicate} -> ack -> nothing parked, and Phase 3's
+        # exact-count D_DLQ==10 assertion would catch exactly that.
+        meta event_id = this.event_id.or(content().hash("sha256").encode("hex"))
     - switch:
         - check: meta("decode_failed") == "yes"
           processors:
             - metric: { type: counter, name: cdc_unprocessable, labels: { reason: decode_error } }
-            - mapping: 'root = throw("decode_error")'
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "decode_error"
+                meta dlq_error  = "undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?"))
+            - metric: { type: counter, name: cdc_dlq_forwarded, labels: { reason: decode_error } }
+        - check: meta("hash_decode_failed") == "yes"
+          processors:
+            - metric: { type: counter, name: cdc_unprocessable, labels: { reason: hash_decode_error } }
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "hash_decode_error"
+                meta dlq_error  = "hash body is not valid JSON for kv_key %s".format(meta("kv_key").or("?"))
+            - metric: { type: counter, name: cdc_dlq_forwarded, labels: { reason: hash_decode_error } }
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
-            - redis: { url: "redis://redis:6379", command: set, args_mapping: 'root = [ meta("kv_key"), meta("body") ]' }
+            - switch:
+                - check: meta("type") == "hash"
+                  processors:
+                    - redis:
+                        url: "redis://redis:6379"
+                        command: hset
+                        # Flatten the JSON field-map body into HSET args (mirrors chart):
+                        # key_values() -> [{key,value}]; map_each -> [[k,v]]; flatten ->
+                        # [k,v,...]; concat prepends the key.
+                        args_mapping: 'root = [meta("kv_key")].concat(meta("body").parse_json().key_values().map_each(kv -> [kv.key, kv.value.string()]).flatten())'
+                - processors:
+                    - redis: { url: "redis://redis:6379", command: set, args_mapping: 'root = [ meta("kv_key"), meta("body") ]' }
             - metric: { type: counter, name: cdc_apply, labels: { op: '${! meta("op") }', type: '${! meta("type") }' } }
         - check: meta("op") == "delete"
           processors:
@@ -47,8 +111,40 @@ pipeline:
             - metric: { type: counter, name: cdc_apply, labels: { op: rename } }
         - processors:
             - metric: { type: counter, name: cdc_unprocessable, labels: { reason: unknown_op } }
-            - mapping: 'root = throw("unknown op")'
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "unknown_op"
+                meta dlq_error  = "unknown op: %s".format(meta("op").or("missing"))
+            - metric: { type: counter, name: cdc_dlq_forwarded, labels: { reason: unknown_op } }
 
 output:
+  # Applied messages (dlq unset) -> drop (ack). Permanent poison (dlq==yes) ->
+  # publish to dlq.cdc.<reason> on the same stream (subjects extended by
+  # nats-init), THEN ack (the nats_jetstream send is the write; a send failure
+  # surfaces as an output error so reject_errored nacks -> retry = write-then-ack).
+  # NOTE: unlike the chart's switch OUTPUT cases, this Connect version's switch
+  # output only accepts check/output/continue per case (no per-case `processors`
+  # field — that's valid on the switch PROCESSOR, not the switch OUTPUT). So
+  # cdc_dlq_forwarded is incremented in the PIPELINE, right where each dlq_reason
+  # is set (best-effort: counts "classified for DLQ", not "confirmed published";
+  # a send failure would nack/retry and double-count on redelivery, same
+  # over-count risk the pipeline's other counters already accept).
   reject_errored:
-    drop: {}
+    switch:
+      cases:
+        - check: meta("dlq") == "yes"
+          output:
+            label: dlq_out
+            nats_jetstream:
+              urls: ["nats://nats:4222"]
+              subject: 'dlq.cdc.${! meta("dlq_reason") }'
+              headers:
+                # See the "DLQ dedup identity" note in the pipeline mapping: the
+                # dlq. prefix keeps this id disjoint from the original publish's
+                # Nats-Msg-Id=event_id on the same stream (stream-wide dedup).
+                Nats-Msg-Id: dlq.${! meta("event_id") }
+                dlq_reason: ${! meta("dlq_reason") }
+                dlq_error: ${! meta("dlq_error") }
+                dlq_orig_subject: ${! meta("nats_subject") }
+        - output:
+            drop: {}

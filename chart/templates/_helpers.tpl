@@ -239,7 +239,20 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 */}}
 {{- define "rrcs.nats.stream.subjects" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
-{{- printf "%s.>" $p -}}
+{{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- if $dl.enabled -}}
+{{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
+{{-   if gt (len $families) 0 -}}
+{{-     fail (printf "connect.deadLetter.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set) — the sharded sink pipeline (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be silently half-protected (unsharded poison parked, sharded poison still loops). Disable one of them.") -}}
+{{-   end -}}
+{{-   $sub := required "connect.deadLetter.subject is required when deadLetter.enabled" $dl.subject -}}
+{{-   if or (eq $sub $p) (hasPrefix (printf "%s." $p) $sub) -}}
+{{-     fail (printf "connect.deadLetter.subject %q must be OUTSIDE nats.stream.subjectPrefix %q — a subject under %s.> would be re-consumed by a whole-stream sink. Use e.g. dlq.cdc." $sub $p $p) -}}
+{{-   end -}}
+{{-   printf "%s.>,%s.>" $p $sub -}}
+{{- else -}}
+{{-   printf "%s.>" $p -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

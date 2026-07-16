@@ -96,6 +96,38 @@ pipeline:
         } else { null }
         meta body = $decoded
         meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
+    {{- if .Values.connect.deadLetter.enabled }}
+        # DLQ guard: hash bodies must be a valid JSON OBJECT for the HSET args_mapping
+        # below. Validate up front so a malformed body is COUNTED
+        # (cdc_unprocessable{reason=hash_decode_error}) and dead-lettered, instead of
+        # throwing UN-COUNTED inside the HSET args_mapping (silent poison loop). Only
+        # checked for create/update hash bodies that decoded OK.
+        # The decode-OK precondition MUST be re-derived from the lets, NOT read via
+        # meta("decode_failed"): inside a Connect `mapping` processor at RUNTIME,
+        # meta("x") reads the metadata as it was at mapping ENTRY — assignments made
+        # earlier in the SAME mapping commit only when the mapping finishes (`blobl`
+        # on the CLI does see them mid-mapping, which masks the bug). Gating on
+        # meta("decode_failed") == "no" reads null, the AND is always false, and the
+        # guard silently never runs. (Trap documented in the L2 lab's config.yaml.)
+        let hash_body_ok = if (this.op == "create" || this.op == "update") && this.type.or("string") == "hash" && !($is_encoded && $decoded == null) {
+          # Must be a JSON OBJECT: the HSET args_mapping below does
+          # .parse_json().key_values(), which throws on arrays/scalars/strings. A
+          # parseable-but-non-object body (e.g. `["a","b"]` or `"5566"`) would slip
+          # past a bare != null check and throw UN-COUNTED inside args_mapping. On
+          # parse failure .catch(null) yields null whose .type() is "null" -> also
+          # (correctly) classified failed. .string() coerces $decoded (typed BYTES by
+          # the decode/decompress branch) so parse_json is well-defined; a null
+          # $decoded (missing body on a hash create) errors into the catch -> also
+          # correctly classified failed.
+          $decoded.string().parse_json().catch(null).type() == "object"
+        } else { true }
+        meta hash_decode_failed = if $hash_body_ok { "no" } else { "yes" }
+        # DLQ dedup identity: the reverse leg never needed event_id before, so it is
+        # NOT stashed above. The DLQ output's Nats-Msg-Id header needs it — an unset
+        # meta would interpolate EMPTY and silently disable JetStream dedup of DLQ
+        # republishes. Same fallback as the forward leg mints (content hash).
+        meta event_id = this.event_id.or(content().hash("sha256").encode("hex"))
+    {{- end }}
         # ── Sync-latency stash (spec 2026-07-13-sync-latency-histogram) ──
         # Envelope ts = writer mint time (epoch ms, stamped for EVERY op).
         # Only the writer timestamp is stashed here (the redis processors below
@@ -133,13 +165,55 @@ pipeline:
         - check: meta("decode_failed") == "yes"
           processors:
             # Permanent poison: the gzip:base64 body could not be decoded. Count it,
+            {{- if .Values.connect.deadLetter.enabled }}
+            # then set dlq meta -> the output publishes to <subject>.decode_error and
+            # acks only after PubAck (captured, not retried forever).
+            {{- else }}
             # then throw to nack (redelivered under maxDeliver=-1 until removed).
+            {{- end }}
             - metric:
                 type: counter
                 name: cdc_unprocessable
                 labels:
                   reason: decode_error
+            {{- if .Values.connect.deadLetter.enabled }}
+            # per-delivery count of messages routed to the DLQ (INV-2). Emitted in
+            # the pipeline (not the switch-output case, where `processors` is not a
+            # valid field on this Connect build) alongside the dlq meta.
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: decode_error
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "decode_error"
+                meta dlq_error  = "undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?"))
+            {{- else }}
             - mapping: 'root = throw("decode_error: undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?")))'
+            {{- end }}
+    {{- if .Values.connect.deadLetter.enabled }}
+        - check: meta("hash_decode_failed") == "yes"
+          processors:
+            # Permanent poison: create/update hash body is not a valid JSON object,
+            # so the HSET args_mapping's .parse_json().key_values() would throw
+            # UN-COUNTED. Count it (closes the INV-2 gap) and route to the DLQ.
+            # Placed BEFORE the create/update branch so poison never reaches HSET.
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  reason: hash_decode_error
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: hash_decode_error
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "hash_decode_error"
+                meta dlq_error  = "hash body is not valid JSON for kv_key %s".format(meta("kv_key").or("?"))
+    {{- end }}
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
             # Best-effort latency telemetry, emitted BEFORE the SET. ts-bearing
@@ -239,7 +313,19 @@ pipeline:
                 name: cdc_unprocessable
                 labels:
                   reason: unknown_op
+            {{- if .Values.connect.deadLetter.enabled }}
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  reason: unknown_op
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "unknown_op"
+                meta dlq_error  = "unknown op: %s".format(meta("op").or("missing"))
+            {{- else }}
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
+            {{- end }}
     # ── Sync-latency recording (INV-2; spec 2026-07-13) ──────────────────
     # ONE recording point for all three success branches. !errored() excludes
     # decode_error/unknown_op throws AND failed Redis applies — only
@@ -251,7 +337,18 @@ pipeline:
     # exporter divides by 1e9 — the EXPORTED histogram is SECONDS (hence the
     # name; never suffix _ns).
     - switch:
+        {{- if .Values.connect.deadLetter.enabled }}
+        # DLQ-routed poison (decode_error/hash_decode_error/unknown_op) no longer
+        # throws — it sets meta("dlq")=="yes" and falls through here un-errored, and
+        # such envelopes still carry a ts (so sync_has_ts=="yes"). Exclude them
+        # explicitly: they were never applied, so recording a sync-latency sample
+        # for them would poison the histogram with un-applied messages. (Disabled
+        # render keeps the original guard byte-identical — there poison throws, so
+        # !errored() already excludes it.)
+        - check: '!errored() && meta("dlq") != "yes" && meta("sync_has_ts") == "yes"'
+        {{- else }}
         - check: '!errored() && meta("sync_has_ts") == "yes"'
+        {{- end }}
           processors:
             # Delta computed HERE — after the apply switch — so the histogram
             # measures writer mint → sink successful apply INCLUSIVE of the
@@ -287,5 +384,40 @@ pipeline:
                         name: cdc_sync_skew_negative
 
 output:
+{{- if .Values.connect.deadLetter.enabled }}
+  # DLQ enabled: applied messages -> drop (ack). Permanent poison (dlq==yes) ->
+  # publish to <deadLetter.subject>.<reason> on the same stream, THEN ack (the
+  # nats_jetstream send is the write; a send failure surfaces as an output error so
+  # reject_errored nacks -> retry = write-then-ack, INV-1 preserved). Transient apply
+  # failures still error -> reject_errored -> nack -> redelivery.
+  reject_errored:
+    switch:
+      cases:
+        - check: meta("dlq") == "yes"
+          output:
+            label: dlq_out
+            nats_jetstream:
+              urls:
+                - "{{ include "rrcs.nats.url" . }}"
+              auth:
+                user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
+              subject: '{{ .Values.connect.deadLetter.subject }}.${! meta("dlq_reason") }'
+              headers:
+                # "dlq." prefix is LOAD-BEARING: JetStream msg-id dedup is
+                # STREAM-wide, and the original kv.cdc.* publish already used
+                # event_id as ITS Nats-Msg-Id on this same stream. Reusing it bare
+                # would dedupe the DLQ publish against the original within the
+                # dupeWindow -> PubAck{duplicate} -> ack -> NOTHING PARKED (silent
+                # INV-1 hole). The prefix keeps the id deterministic (a redelivered
+                # poison that re-publishes to the DLQ still dedupes against its own
+                # earlier DLQ publish) while staying disjoint from the original.
+                Nats-Msg-Id: dlq.${! meta("event_id") }
+                dlq_reason: ${! meta("dlq_reason") }
+                dlq_error: ${! meta("dlq_error") }
+                dlq_orig_subject: ${! meta("nats_subject") }
+        - output:
+            drop: {}
+{{- else }}
   reject_errored:
     drop: {}
+{{- end }}

@@ -20,6 +20,12 @@
 # cdc_unprocessable); depending on exposition it scrapes as cdc_unprocessable or
 # cdc_unprocessable_total. The __name__ regex matches both and (being a full-string
 # match) EXCLUDES the OpenMetrics cdc_unprocessable_created series.
+#
+# NOTE: with connect.deadLetter.enabled, a poison message increments
+# cdc_unprocessable ONCE (then it is DLQ'd + acked) rather than every ackWait
+# via redelivery. The increase[...] window (>= 2x ackWait) still fires on new
+# poison; it just no longer re-arms from redelivery. cdc_dlq_forwarded{reason}
+# tracks what was parked in the DLQ.
 groups:
   - name: cdc-sink
     rules:
