@@ -36,6 +36,28 @@ each one fixes a defect found during the port, the design intent is unchanged:
    enabled render extends that switch's guard with `meta("dlq") != "yes"` — un-applied
    poison must not record sync latency. Disabled render is untouched (poison throws there,
    `!errored()` already excludes it).
+6. **`connect.deadLetter` joins the nats-init Job name hash when enabled (§4.5 fix,
+   found in spec review).** The §4.5 claim "the existing subject-reconcile picks up the
+   extended subjects" held only via Job TTL reaping: `connect.deadLetter` was not a hash
+   input, so an in-place enable within the previous Job's `ttlSecondsAfterFinished`
+   window would patch-fail the immutable Job or skip the reconcile, leaving `dlq.cdc.>`
+   unbound (fail-safe nack loop — no loss, but the DLQ inert). Enabled now appends the
+   deadLetter block to the hash (same only-when-configured rule sharding uses), so the
+   disabled hash input — and default render — stay byte-identical while enabling always
+   yields a fresh Job.
+7. **`cdc_dlq_forwarded` semantics deviate from §4.6, compensated on the dashboard
+   (found in quality review).** §4.6 says the counter "increments on successful DLQ
+   publish"; the implementation increments at ROUTING time, before the publish — a
+   switch-output case cannot count post-write on this build (rules/50-lessons.md
+   2026-07-14), so the counter moves in lockstep with `cdc_unprocessable` and cannot
+   prove parking. With a misconfigured DLQ (e.g. creds missing the `dlq.cdc.>` pub
+   grant) it would keep climbing while poison still loops — false operator confidence.
+   The dashboard panel therefore plots it as "routed" alongside
+   `output_sent{label="dlq_out"}` ("confirmed parked", PubAck-counted by the output
+   itself — label verified present on the pinned build) and
+   `output_error{label="dlq_out"}` ("publish failures"): healthy = routed == confirmed,
+   failures 0; routed climbing with confirmed flat = DLQ publish failing, poison still
+   looping.
 
 ## Problem
 

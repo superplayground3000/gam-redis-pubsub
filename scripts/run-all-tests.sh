@@ -76,6 +76,12 @@ if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; the
     fi
     git worktree remove -f "$MBDIR"
     echo "[run-all-tests] L1: default render byte-identical to merge-base ✓"
+  else
+    # A silent skip here would let the script exit 0 having never run its
+    # strongest byte-identical proof (the substring greps only prove specific
+    # strings absent). Say so loudly, and don't leak the mktemp dir.
+    rmdir "$MBDIR" 2>/dev/null || true
+    echo "[run-all-tests] L1: WARNING — merge-base byte-identical check SKIPPED (git worktree add failed; only the weaker substring checks ran)"
   fi
 else
   echo "[run-all-tests] L1: skipping merge-base byte-identical check (no merge-base available)"
