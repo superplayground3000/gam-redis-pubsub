@@ -13,6 +13,8 @@ metadata:
     k8s-sidecar-target-directory: {{ . | quote }}
   {{- end }}
 data:
-  cdc-dashboard.json: |
-{{ .Files.Get "files/grafana/cdc-dashboard.json" | indent 4 }}
+  {{- range $path, $_ := .Files.Glob "files/grafana/*.json" }}
+  {{ base $path }}: |
+{{ $.Files.Get $path | indent 4 }}
+  {{- end }}
 {{- end }}

@@ -1,0 +1,99 @@
+{
+  "title": "CDC Sync — Health & Throughput",
+  "uid": "cdc-sync-health",
+  "schemaVersion": 39,
+  "editable": true,
+  "time": { "from": "now-1h", "to": "now" },
+  "templating": {
+    "list": [
+      { "name": "datasource", "type": "datasource", "query": "prometheus", "current": {}, "hide": 0 },
+      { "name": "namespace", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values(cdc_apply, namespace)", "refresh": 2, "includeAll": true, "multi": true },
+      { "name": "job", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values({__name__=~\"cdc_apply(_total)?|cdc_sync_latency_seconds_count\",namespace=~\"$namespace\"}, job)", "refresh": 2, "includeAll": true, "multi": true },
+      { "name": "shard", "type": "query", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "query": "label_values({__name__=~\"cdc_apply(_total)?\",shard!=\"\",namespace=~\"$namespace\"}, shard)", "refresh": 2, "includeAll": true, "multi": true, "description": "Sharded families only (subject-sharding v2). Empty and harmless in non-sharded installs." }
+    ]
+  },
+  "panels": [
+    { "id": 1, "title": "Key sync latency p50/p95/p99 (calculator, s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "description": "cdc_latency_seconds from the optional latency-calculator component (region XADD timestamp delta, rolling window; genuine seconds). Its job label is 'latency-calculator', distinct from the connect legs, so this panel scopes by namespace only. EMPTY if latencyCalculator.enabled=false.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "cdc_latency_seconds{namespace=~\"$namespace\"}", "legendFormat": "{{op}} p{{quantile}}" }
+      ] },
+    { "id": 2, "title": "Sink sync latency mean (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "description": "Mean writer-mint → sink-apply latency, per op. QUIRK of this pinned Connect build: cdc_sync_latency_seconds records RAW NANOSECONDS while its histogram buckets are labelled in seconds, so every real sample lands in +Inf and histogram_quantile over the _bucket series is unusable (returns +Inf). The mean is still recoverable from _sum/_count, and the trailing /1e9 converts ns → s. For true percentiles use the calculator panel above.",
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        { "expr": "sum by (op) (rate(cdc_sync_latency_seconds_sum{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])) / sum by (op) (rate(cdc_sync_latency_seconds_count{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])) / 1e9", "legendFormat": "{{op}} mean" }
+      ] },
+    { "id": 3, "title": "Connection events: up / lost / failed", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "description": "Connect input/output connection lifecycle counters (no _total suffix on this build). 'up' events are normal on startup/reconnect; sustained 'lost'/'failed' means the Redis input or NATS output is flapping. On a sharded sink the output splits per shard child (path/label labels), aggregated away here by summing per job.",
+      "fieldConfig": { "defaults": { "unit": "short" } },
+      "targets": [
+        { "expr": "sum by (job) (increase(input_connection_up{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} input up" },
+        { "expr": "sum by (job) (increase(input_connection_lost{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} input lost" },
+        { "expr": "sum by (job) (increase(input_connection_failed{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} input failed" },
+        { "expr": "sum by (job) (increase(output_connection_up{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} output up" },
+        { "expr": "sum by (job) (increase(output_connection_lost{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} output lost" },
+        { "expr": "sum by (job) (increase(output_connection_failed{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} output failed" }
+      ] },
+    { "id": 4, "title": "Connection lost/failed (15m)", "type": "stat", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "description": "Total input+output connection lost/failed events over 15m. Any nonzero value means a leg dropped its Redis or NATS connection in the window — investigate before it becomes redelivery backlog.",
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [
+        { "expr": "sum(increase({__name__=~\"(input|output)_connection_(lost|failed)\",namespace=~\"$namespace\",job=~\"$job\"}[15m]))", "legendFormat": "lost/failed" }
+      ] },
+    { "id": 5, "title": "Unprocessable messages (5m)", "type": "stat", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "description": "cdc_unprocessable over 5m: messages the sink permanently rejected (decode_error / unknown_op). Nonzero means real data the pipeline cannot apply — see the by-reason panel below.",
+      "fieldConfig": { "defaults": { "thresholds": { "steps": [ { "color": "green", "value": null }, { "color": "red", "value": 1 } ] } } },
+      "targets": [
+        { "expr": "sum(increase({__name__=~\"cdc_unprocessable(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[5m]))", "legendFormat": "unprocessable" }
+      ] },
+    { "id": 6, "title": "Unprocessable rate by reason", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "description": "cdc_unprocessable broken out by reason (decode_error = payload could not be parsed; unknown_op = op field outside the create/update/delete/rename set). Each rejected message is counted here and NOT applied.",
+      "targets": [
+        { "expr": "sum by (reason) (increase({__name__=~\"cdc_unprocessable(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" }
+      ] },
+    { "id": 7, "title": "JetStream publish failures (forward leg)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "description": "Forward-leg publish-failure signal, which DIFFERS BY MODE. Non-sharded: cdc_forward_publish_failed{reason} fires in the output fallback's reject child (the publish errored and was NACKed for replay — no ack, no loss). SHARDED (subject-sharding v2): that fallback and counter are removed by design; failures retry IN PLACE and surface as output_error on the connect-source job instead (second series). One of the two series is expected to be flat depending on the render.",
+      "targets": [
+        { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_publish_failed(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}} (non-sharded)" },
+        { "expr": "sum(increase({__name__=~\"output_error(_total)?\",namespace=~\"$namespace\",job=~\".*connect-source.*\"}[$__rate_interval]))", "legendFormat": "output_error (sharded forward)" }
+      ] },
+    { "id": 8, "title": "Sink apply throughput (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 24, "x": 0, "y": 24 },
+      "description": "cdc_apply rate per sink job and op (increments only after a successful region write). With multi-subject / sharded sink groups each group is its own Prometheus job, so `by (job)` breaks throughput out per group.",
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        { "expr": "sum by (job, op) (rate({__name__=~\"cdc_apply(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} {{op}}" }
+      ] },
+    {
+      "id": 9, "title": "Sharding (v2)", "type": "row", "collapsed": true,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 32 },
+      "panels": [
+        { "id": 10, "title": "Apply throughput by shard (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 33 },
+          "description": "cdc_apply rate per shard (subject-sharding v2). Only sharded sink groups emit the shard label, so this row stays empty in non-sharded installs. Watch for balance: a hot shard saturates its serialized max_ack_pending=1 lane while others idle.",
+          "fieldConfig": { "defaults": { "unit": "ops" } },
+          "targets": [
+            { "expr": "sum by (shard) (rate({__name__=~\"cdc_apply(_total)?\",shard!=\"\",shard=~\"$shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{shard}}" }
+          ] },
+        { "id": 11, "title": "Sync latency mean by shard (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 33 },
+          "description": "Mean writer-mint → sink-apply latency per shard. SAME QUIRK as the top-level mean panel: cdc_sync_latency_seconds records raw NANOSECONDS with seconds-labelled buckets, so histogram_quantile over the _bucket series is unusable (+Inf); the mean is recovered from _sum/_count and /1e9 converts ns → s. A single shard's mean climbing while others stay flat = that shard's serialized lane is saturated or blocked.",
+          "fieldConfig": { "defaults": { "unit": "s" } },
+          "targets": [
+            { "expr": "sum by (shard) (rate(cdc_sync_latency_seconds_sum{shard!=\"\",shard=~\"$shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])) / sum by (shard) (rate(cdc_sync_latency_seconds_count{shard!=\"\",shard=~\"$shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])) / 1e9", "legendFormat": "{{shard}} mean" }
+          ] },
+        { "id": 12, "title": "Unprocessable by shard", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 41 },
+          "description": "cdc_unprocessable per shard and reason (sharded groups only). Pinpoints which shard is receiving payloads it cannot decode or an op it does not recognise.",
+          "targets": [
+            { "expr": "sum by (shard, reason) (increase({__name__=~\"cdc_unprocessable(_total)?\",shard!=\"\",shard=~\"$shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{shard}} {{reason}}" }
+          ] },
+        { "id": 13, "title": "Shard isolation lane (must stay 0)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 41 },
+          "description": "Sharding invariant signals (design v2 §11 A3): cross_shard_rename = a rename whose old/new keys resolve to different shards (INV-S7 — any nonzero value is a bug); unparseable_shard = a sharded-family key without a keyPattern id (key contract broken); sx applies = traffic through the isolation shard. All three route to sx so nothing is lost — but nonzero means the key contract or the shard function is broken. NOTE: v2 has NO direct out-of-order signal (no fence) — these are proxies. Drives the CDCShardIsolationLane alert.",
+          "targets": [
+            { "expr": "sum(increase({__name__=~\"cdc_forward_cross_shard_rename(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "cross_shard_rename" },
+            { "expr": "sum(increase({__name__=~\"cdc_forward_unrouted(_total)?\",reason=\"unparseable_shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "unparseable_shard" },
+            { "expr": "sum(rate({__name__=~\"cdc_apply(_total)?\",shard=\"sx\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "sx apply rate" }
+          ] }
+      ]
+    }
+  ]
+}
