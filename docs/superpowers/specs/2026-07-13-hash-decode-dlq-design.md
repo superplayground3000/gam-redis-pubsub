@@ -17,9 +17,11 @@ each one fixes a defect found during the port, the design intent is unchanged:
    an explicit error, not a silent state. Sharded DLQ support is a follow-up.
 2. **`meta event_id` stash (bug fix).** The reverse pipeline never stashed `event_id`, so the
    DLQ output's `Nats-Msg-Id` header (§4.3) would have interpolated EMPTY — a silent dedup
-   no-op in the original PR. The enabled render now stashes
-   `meta event_id = this.event_id.or(content().hash("sha256").encode("hex"))` (same fallback
-   the forward leg mints).
+   no-op in the original PR. The enabled render now stashes the envelope's `event_id`,
+   falling back to `content().hash("sha256")` when it is missing OR empty-string (`.or()`
+   alone misses `""`, which would collapse all such poisons onto one dedup id); same
+   fallback the forward leg mints. `scripts/test-dlq-guard.sh` asserts the exact fallback
+   value for both cases.
 3. **DLQ msg-id is `dlq.<event_id>`, not bare `event_id` (bug fix to Decision 5).**
    JetStream msg-id dedup is STREAM-wide; the original publish already used `event_id` as its
    `Nats-Msg-Id` on the same stream, so a bare reuse would dedupe the DLQ publish against the

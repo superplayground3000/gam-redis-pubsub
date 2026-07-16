@@ -68,7 +68,9 @@ pipeline:
         # event_id would dedupe the DLQ publish against the original within the
         # dupe window -> PubAck{duplicate} -> ack -> nothing parked, and Phase 3's
         # exact-count D_DLQ==10 assertion would catch exactly that.
-        meta event_id = this.event_id.or(content().hash("sha256").encode("hex"))
+        # .or() fires on null/missing but NOT on "" — an empty event_id must also
+        # fall back or all such poisons share one dedup id (mirrors chart).
+        meta event_id = if this.event_id.or("") == "" { content().hash("sha256").encode("hex") } else { this.event_id }
     - switch:
         - check: meta("decode_failed") == "yes"
           processors:

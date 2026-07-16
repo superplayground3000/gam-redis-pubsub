@@ -2,6 +2,24 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-16 — A "Codex" review dispatch can silently execute on Claude; verify the provider before trusting cross-model coverage
+- What happened: the DLQ-port quality review was dispatched to the `codex:codex-rescue`
+  Agent type per the provider-routing rule, but the reviewer disclosed it actually ran as
+  Claude (Sonnet) — the mandatory cross-provider review had silently not happened. The
+  reliable Codex path in this harness is the `codex:rescue` SKILL → thin forwarder →
+  background codex-companion task, polled with
+  `node .../codex-companion.mjs status|result <task-id>` (the forwarder itself cannot
+  poll; the task-id comes back in its one-line result). The real Codex pass then found
+  3 findings the two same-session Claude reviews had not (weak subject validation,
+  optional-only enabled-path checks, untested event_id fallback) — the cross-model gap
+  is real, not theoretical.
+- Rule that would have prevented it: require the reviewer to state its provider/model in
+  the report, and treat "dispatched to a Codex agent type" as unconfirmed until the
+  report says Codex ran; fall back or re-dispatch via the skill path when it didn't.
+- Applied: this session re-ran the review through `codex:rescue` (skill) and fixed all
+  3 findings (commit after 1d0f03f); the routing rule's "announce the switch" now needs
+  its converse — announce when the switch silently failed.
+
 ## 2026-07-15 — Three Bloblang/Helm value-passing traps that lint+template cannot catch
 - What happened: the subject-sharding forward mapping passed `helm lint`, `helm template`, and
   `rpk connect lint`, yet routed EVERY key to the wrong subject at runtime. Three independent

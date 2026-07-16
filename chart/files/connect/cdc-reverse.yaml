@@ -126,7 +126,10 @@ pipeline:
         # NOT stashed above. The DLQ output's Nats-Msg-Id header needs it — an unset
         # meta would interpolate EMPTY and silently disable JetStream dedup of DLQ
         # republishes. Same fallback as the forward leg mints (content hash).
-        meta event_id = this.event_id.or(content().hash("sha256").encode("hex"))
+        # `.or()` fires on null/missing but NOT on "": an empty-string event_id
+        # must ALSO fall back, or every such poison shares Nats-Msg-Id "dlq." and
+        # all but the first within dupeWindow are deduped away (never parked).
+        meta event_id = if this.event_id.or("") == "" { content().hash("sha256").encode("hex") } else { this.event_id }
     {{- end }}
         # ── Sync-latency stash (spec 2026-07-13-sync-latency-histogram) ──
         # Envelope ts = writer mint time (epoch ms, stamped for EVERY op).

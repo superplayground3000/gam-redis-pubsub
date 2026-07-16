@@ -90,6 +90,14 @@ fi
 if helm template chart/ --set connect.deadLetter.enabled=true --set connect.deadLetter.subject=kv.cdc.dlq >/dev/null 2>&1; then
   echo "L1: deadLetter.subject under subjectPrefix must fail-loud"; fail L1
 fi
+# fail-loud A2: malformed base subjects must be rejected at render time, not
+# deferred to NATS (wildcards, empty segments, trailing dots, whitespace all
+# template fine and only blow up as bad stream config / failed publishes later).
+for badsub in 'dlq.cdc.>' 'dlq..cdc' 'dlq.cdc.' '.dlq.cdc' 'dlq.*.cdc' 'dlq cdc'; do
+  if helm template chart/ --set connect.deadLetter.enabled=true --set "connect.deadLetter.subject=$badsub" >/dev/null 2>&1; then
+    echo "L1: malformed deadLetter.subject '$badsub' must fail-loud"; fail L1
+  fi
+done
 # fail-loud B: DLQ + subject-sharding v2 is an unsupported mix (the sharded sink
 # has no DLQ routing) — the chart must reject deadLetter.enabled=true whenever
 # connect.sharding.families is configured. Reuse the same valid sharded family
@@ -123,11 +131,27 @@ grep -q 'cdc_dlq_forwarded' chart/files/grafana/cdc-dashboard.json || { echo "L1
 # Lint the ENABLED reverse pipeline against the real Connect binary. `helm template`
 # accepts config that `redpanda-connect lint` rejects (e.g. `processors` under a switch-
 # output case — the DLQ feature shipped that bug once, invisible because L3 runs with the
-# feature OFF; see rules/50-lessons.md 2026-07-14). Best-effort: skips when the pinned
-# image is not available locally (CI/dev with the image built still runs it). The `__POD__`
-# label is the elector's runtime placeholder, not a real lint error — filter it out.
+# feature OFF; see rules/50-lessons.md 2026-07-14). These runtime checks (lint + the
+# behavioral guard test below) are the ONLY tier that validates the DLQ-ENABLED pipeline
+# (L3 runs with the feature off), so they are MANDATORY: if the pinned image is missing
+# we try `docker pull` first and FAIL L1 if it still isn't runnable. Docker-less hosts
+# can set DLQ_RUNTIME_CHECKS=optional to skip with a loud warning — never silently.
+# The `__POD__` label is the elector's runtime placeholder, not a real lint error —
+# filter it out.
 CONNECT_IMG="${CONNECT_IMG:-hpdevelop/connect:4.92.0-claudefix}"
-if command -v docker >/dev/null 2>&1 && docker image inspect "$CONNECT_IMG" >/dev/null 2>&1; then
+DLQ_RUNTIME_OK=1
+if ! command -v docker >/dev/null 2>&1; then
+  DLQ_RUNTIME_OK=0
+elif ! docker image inspect "$CONNECT_IMG" >/dev/null 2>&1; then
+  echo "[run-all-tests] L1: $CONNECT_IMG not present locally — pulling for the mandatory DLQ-enabled checks"
+  docker pull "$CONNECT_IMG" >/dev/null 2>&1 || DLQ_RUNTIME_OK=0
+fi
+if [ "$DLQ_RUNTIME_OK" != 1 ] && [ "${DLQ_RUNTIME_CHECKS:-strict}" != "optional" ]; then
+  echo "[run-all-tests] L1: the DLQ-enabled pipeline checks REQUIRE docker + $CONNECT_IMG (missing and pull failed)."
+  echo "[run-all-tests] L1: they are the only checks exercising the enabled render (rules/50-lessons.md 2026-07-14/15) — set DLQ_RUNTIME_CHECKS=optional only on hosts that cannot run docker."
+  fail L1
+fi
+if [ "$DLQ_RUNTIME_OK" = 1 ]; then
   REV_PIPE=$(python3 -c 'import sys,yaml
 for d in yaml.safe_load_all(sys.stdin):
   if d and d.get("kind")=="ConfigMap":
@@ -142,7 +166,7 @@ for d in yaml.safe_load_all(sys.stdin):
   # semantics; the meta-vs-let guard bug lints clean and silently never fires).
   scripts/test-dlq-guard.sh || fail L1
 else
-  echo "[run-all-tests] L1: skipping enabled-pipeline connect-lint + guard behavioral test ($CONNECT_IMG not available locally)"
+  echo "[run-all-tests] L1: WARNING — enabled-pipeline connect-lint + guard behavioral test SKIPPED (DLQ_RUNTIME_CHECKS=optional; the DLQ-enabled render is UNVERIFIED in this run)"
 fi
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
