@@ -1,0 +1,155 @@
+# Example values for the opt-in Dead-Letter Queue (DLQ) on the sink (reverse) leg.
+#
+# What this shows:
+#   - How to turn the DLQ on and pick its subject.
+#   - The subject-naming and JetStream-stream expectations that come with it.
+#   - Which credentials must carry the DLQ publish grant, kept as safe defaults
+#     here so this file is safe to commit.
+#   - Why the DLQ cannot be combined with per-key sharding (a hard render error).
+#   - Which Grafana panel and metrics confirm poison is really being parked.
+#   - The exact command that proves the whole thing end-to-end.
+#
+# What the DLQ is for:
+#   The sink applies each NATS message to region Redis, then acks. A "poison"
+#   message can NEVER be applied no matter how many times it is retried — for
+#   example a body that is not decodable, an unknown op, or a hash body that is
+#   not a valid JSON object. Without the DLQ, that message nacks and redelivers
+#   forever, and because the sink consumer holds the ack floor at the oldest
+#   un-acked message, one poison message head-of-line-blocks every newer message
+#   behind it. The DLQ breaks that loop: a poison message is re-published to a
+#   sibling subject on the SAME JetStream stream and THEN acked (write-then-ack),
+#   so the ack floor advances and healthy traffic keeps flowing — while the
+#   poison is preserved for inspection, never dropped (INV-1, no loss).
+#
+# Install example (bundled NATS, fresh namespace):
+#   helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
+#     -f chart/examples/values-dlq.yaml
+#
+# Prove it works end-to-end in kind (~5 min):
+#   scripts/build-images.sh --kind --kind-name=cdc
+#   RRCS_NS=cdc-dlq RRCS_RELEASE=cdc-dlq scripts/verify-dlq-e2e.sh
+#   Exit 0 = N poison bodies parked on dlq.cdc.hash_decode_error, ack floor
+#   advanced, no redelivery loop, and a normal message injected afterward still
+#   reaches region Redis.
+
+connect:
+  deadLetter:
+    # Turn the DLQ on. Default is false, and with it false the rendered chart is
+    # byte-identical to the pre-DLQ chart — poison redelivers forever as before.
+    # Flip this to true to opt in.
+    enabled: true
+
+    # The base subject poison is re-published to. The pipeline appends the failure
+    # reason, so a message is published to "<subject>.<reason>", one of:
+    #   dlq.cdc.decode_error       — body could not be decoded
+    #   dlq.cdc.unknown_op         — op field was not create/update/delete/rename
+    #   dlq.cdc.hash_decode_error  — hash body was not a valid JSON object
+    # The JetStream stream is then bound to "<subject>.>" so all reasons land on it.
+    #
+    # HARD RULE: this subject MUST live OUTSIDE nats.stream.subjectPrefix (which is
+    # "kv.cdc" by default). If it overlapped, a sink consumer would re-consume its
+    # own dead letters and loop. The default "dlq.cdc" is safely disjoint from
+    # "kv.cdc"; keep that separation if you customise it.
+    subject: "dlq.cdc"
+
+# ── Credentials the DLQ needs ────────────────────────────────────────────────
+#
+# Publishing to "<subject>.>" needs the subscriber (sink) NATS creds to carry a
+# pub grant on that subject. In BUNDLED NATS mode (the default, shown above) the
+# committed chart/files/nats-auth/ creds were regenerated on 2026-07-16 WITH the
+# dlq.cdc.> grant, so on a FRESH install enabling the DLQ is just the toggle
+# above — nothing else to configure. This is proven by scripts/verify-dlq-e2e.sh.
+#
+# CAUTION for an existing release installed with the PRE-2026-07-16 creds: that
+# regeneration rotated the operator and account identities, so redeploying with
+# today's creds orphans the old release's KV_CDC stream state. Plan a fresh NATS
+# (new install or new namespace) or a deliberate migration rather than an
+# in-place upgrade. If the creds are ever out of sync and the grant is missing,
+# a DLQ publish is permission-denied — which fails SAFE (the original message
+# nacks and retries, so nothing is lost) and shows on the dashboard as "routed"
+# climbing while "confirmed parked" stays flat (see the observability note below).
+#
+# If you run EXTERNAL NATS instead, uncomment and point these at your own
+# pre-created Secrets, and make sure the subscriber creds inside them grant pub
+# on dlq.cdc.> (re-run scripts/gen-nats-auth.sh --force to mint creds that do,
+# or add the grant in your own NATS account config). These are placeholders —
+# replace the Secret names with your real ones:
+#
+# nats:
+#   external:
+#     enabled: true
+#     url: "nats://nats.your-cluster.example.com:4222"   # replace this
+#     monitorUrl: "http://nats.your-cluster.example.com:8222"  # optional
+#     auth:
+#       publisherSecret: "your-publisher-creds-secret"    # replace this
+#       subscriberSecret: "your-subscriber-creds-secret"  # replace this — MUST grant pub on dlq.cdc.>
+#       adminSecret: "your-admin-creds-secret"            # optional
+
+# ── Incompatibility: DLQ + per-key sharding ──────────────────────────────────
+#
+# The DLQ cannot be enabled at the same time as per-key sharding. If you set
+# connect.deadLetter.enabled=true AND configure connect.sharding.families, the
+# chart FAILS to render on purpose, with a message like:
+#
+#   connect.deadLetter.enabled=true is not supported with subject-sharding v2
+#   (connect.sharding.families is set) — the sharded sink pipeline
+#   (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be
+#   silently half-protected (unsharded poison parked, sharded poison still
+#   loops). Disable one of them.
+#
+# The reason is honesty: the sharded sink pipeline has the same poison hole but
+# no DLQ routing yet, so a mixed topology would protect only the unsharded half.
+# Rather than ship a silently half-protected system, the chart makes it a loud
+# error. Sharded DLQ support is a documented follow-up. So: use this example OR
+# chart/examples/values-sharding.yaml, never both at once.
+
+# ── How to confirm it is working (observability, INV-2) ──────────────────────
+#
+# Grafana panel 18, "DLQ: routed vs confirmed parked", is the panel to watch. It
+# plots three series that together tell you the truth about parking:
+#   - "routed"          (cdc_dlq_forwarded{reason})       — a ROUTING decision was
+#     made. This increments BEFORE the publish is attempted (a switch-output case
+#     cannot count post-write on this Connect build), so on its own it does NOT
+#     prove a message actually landed in the DLQ.
+#   - "confirmed parked" (output_sent{label="dlq_out"})   — a PubAck-confirmed DLQ
+#     publish. This is the trustworthy "it really parked" signal.
+#   - "publish failures" (output_error{label="dlq_out"})  — a failed DLQ publish.
+#     Each failure nacks the original, so poison keeps redelivering.
+# HEALTHY looks like: routed == confirmed parked, and publish failures at 0.
+# If "routed" climbs while "confirmed parked" stays flat, the DLQ publish is
+# failing — most often because the subscriber creds are missing the dlq.cdc.>
+# pub grant (see the credentials note above) — and poison is STILL looping even
+# though this panel is moving. The per-reason failure counter
+# cdc_unprocessable{reason=...} also increments for every poison message.
+#
+# The parked message carries a header contract you can inspect on the stream:
+#   Nats-Msg-Id: dlq.<event_id>   (the "dlq." prefix keeps it disjoint from the
+#                                  original publish's msg-id so JetStream dedup
+#                                  does not swallow the DLQ copy)
+#   dlq_reason:      the failure reason (e.g. hash_decode_error)
+#   dlq_error:       a human-readable description of what went wrong
+#   dlq_orig_subject: the subject the poison originally arrived on
+
+# ── Untested areas ───────────────────────────────────────────────────────────
+#
+# - EXTERNAL NATS with the DLQ: the bundled-mode path is proven by
+#   scripts/verify-dlq-e2e.sh, but the external-creds path in the commented block
+#   above has not been exercised here. Before production, verify in staging that
+#   your external subscriber creds really grant pub on dlq.cdc.> — a missing grant
+#   fails safe (no loss) but leaves the DLQ inert (poison keeps looping).
+# - Draining or replaying parked messages: this example only shows parking. There
+#   is no automated consumer of dlq.cdc.> yet; deciding what to do with parked
+#   poison (inspect, fix upstream, replay) is a manual operational step.
+# - Custom subjects: only the default "dlq.cdc" is covered by the e2e test. If you
+#   change it, re-run scripts/verify-dlq-e2e.sh against your value and confirm the
+#   subject stays outside nats.stream.subjectPrefix.
+
+# ── Potential improvements ───────────────────────────────────────────────────
+#
+# - Add DLQ routing to the sharded sink pipeline so the DLQ and sharding are no
+#   longer mutually exclusive (removes the render-time incompatibility above).
+# - Ship a small "DLQ drain" helper or documented runbook for inspecting and
+#   replaying parked messages, so operators are not left with a growing dlq.cdc.>
+#   subject and no tooling.
+# - Emit a post-write "parked" counter so the dashboard no longer needs to lean on
+#   the output_sent{label="dlq_out"} proxy to prove parking.

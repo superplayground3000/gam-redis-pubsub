@@ -135,6 +135,15 @@ connect:
 
 命名派生同 v1 §5(durable `cdc_sink_lp_m2g_s<K>`、filter `kv.cdc.lp.m2g.s<K>.>` 等)。
 
+**Worked example (commit-safe, richly commented):**
+`chart/examples/values-sharding.yaml` is a runnable version of the config above —
+one sharded family (`lp:m2g`, 8 shards) plus non-sharded prefix groups and a
+catch-all, with friendly comments on every field, the credential and DLQ-
+incompatibility notes, and the exact `helm template` / `scripts/verify-sharding.sh`
+commands that prove it. `chart/examples/README.md` indexes it alongside the other
+chart examples. Prefer editing/reading those files when you want a hands-on config;
+this section stays the normative spec.
+
 ---
 
 ## 6. 參考實作 A — forward patch

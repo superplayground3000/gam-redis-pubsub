@@ -1,10 +1,14 @@
 -- cdc_rename.lua — replay-idempotent rename via native Redis RENAME.
 -- KEYS[1]=old_key  KEYS[2]=new_key   (no ARGV: value is NOT carried)
 -- Value-preserving: new_key inherits old_key's CURRENT region value.
--- Guarded by EXISTS because bare RENAME raises "ERR no such key" when old_key is
--- already gone — which happens on every JetStream redelivery (at-least-once) and
--- whenever a reordered delete/rename ran first. Without the guard that error
--- nacks the message -> redelivery loop. With it, a second delivery is a no-op.
+--
+-- Load-bearing (INV-1 row 9, rules/05-invariants.md): the EXISTS guard is what makes
+-- rename safe under at-least-once. Because messages can be redelivered, this script
+-- WILL run again for a rename whose old_key is already gone. A bare RENAME on a
+-- missing key raises "ERR no such key", which errors the processor -> nacks the
+-- message -> JetStream redelivers it -> it errors again: a redelivery loop that never
+-- drains. The EXISTS check turns that second delivery into a clean no-op, so the
+-- rename is idempotent and the loop can never form. Do not remove the guard.
 -- RENAME overwrites new_key if it already exists (no-LWW: last delivered wins).
 -- Single EVAL = atomic per Redis; KEYS[1]/KEYS[2] must share a hash tag (same
 -- slot) on Redis Cluster — the writer's {entity:id} key patterns guarantee this.

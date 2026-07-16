@@ -31,12 +31,17 @@ input:
       user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
     stream: {{ .Values.nats.stream.name | quote }}
     durable: {{ .Group.durable | quote }}
-    # bind:true => attach to the EXISTING pull consumer the nats-init Job (or
-    # scripts/create-consumer.sh) created server-side. Without bind, this input
-    # would instead create a durable PUSH consumer. In pull(bind) mode Redpanda
-    # Connect derives the subject from the consumer's FilterSubject and IGNORES
-    # deliver / ack_wait / max_ack_pending here — those are set on
-    # `nats consumer add` (see values nats.stream.consumer.*).
+    # Load-bearing (INV-1 row 6, rules/05-invariants.md): bind:true => attach to the
+    # EXISTING durable pull consumer that the nats-init Job (or
+    # scripts/create-consumer.sh) created server-side. This is what preserves
+    # delivery state across pod restarts and failover: the durable remembers which
+    # messages are acked, so a new leader picks up exactly where the old one stopped.
+    # Without bind, this input would instead create a fresh AD-HOC durable PUSH
+    # consumer, resetting delivery position and breaking at-least-once. In pull(bind)
+    # mode Redpanda Connect derives the subject from the consumer's FilterSubject and
+    # IGNORES deliver / ack_wait / max_ack_pending here — those are set once on
+    # `nats consumer add` (see values nats.stream.consumer.*, INV-1 row 7:
+    # maxDeliver=-1 so poison redelivers forever, ackWait finite).
     bind: true
 
 pipeline:
@@ -386,6 +391,23 @@ pipeline:
                         type: counter
                         name: cdc_sync_skew_negative
 
+# Sink output. The whole leg is built around one rule.
+#
+# Why this exists:
+# - Load-bearing (INV-1 row 8, rules/05-invariants.md): the region-Redis apply runs
+#   in the pipeline ABOVE, and this output only ACKs the JetStream message when that
+#   apply succeeded. `reject_errored` is the mechanism: if any processor errored
+#   (throw on unknown_op/decode_error, or a failed Redis command), the message is
+#   NACKed and JetStream redelivers it (maxDeliver=-1). So a message is acked only
+#   after the region write actually happened — apply-before-ack, never the reverse.
+#
+# Important details:
+# - Redeliveries are safe because every apply is idempotent (SET/DEL overwrite;
+#   cdc_rename.lua is EXISTS-guarded — INV-1 row 9).
+# - Two shapes below: the DLQ-enabled branch parks permanent poison on a dead-letter
+#   subject (still write-then-ack), and the simple branch just drops on success /
+#   nacks on error. Keep `reject_errored` at the top of BOTH — swapping it for a
+#   plain `drop` would ack failed applies and silently lose them.
 output:
 {{- if .Values.connect.deadLetter.enabled }}
   # DLQ enabled: applied messages -> drop (ack). Permanent poison (dlq==yes) ->

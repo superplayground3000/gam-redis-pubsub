@@ -139,27 +139,64 @@ connect:
   contentLog:
     enabled: false
     level: INFO   # level for the content dump when enabled (e.g. INFO / DEBUG)
-  # Dead-letter queue (opt-in). When enabled, sink messages that can NEVER be
-  # applied (decode_error / unknown_op / hash_decode_error) are published to a
-  # sibling subject on the SAME JetStream stream and then acked (write-then-ack),
-  # instead of nacking + redelivering forever (which head-of-line-blocks the ack
-  # floor). Disabled => render is byte-identical to pre-DLQ and poison redelivers
-  # forever as before. Subject MUST be outside nats.stream.subjectPrefix so no
-  # sink consumer re-consumes it (fail-loud otherwise).
+  # ── Dead-letter queue (opt-in) ───────────────────────────────────────────────
+  # This lets the sink leg "park" a message it can NEVER apply — instead of
+  # nacking it and redelivering forever — by publishing it to a dead-letter
+  # subject on the SAME JetStream stream and then acking (write-then-ack).
+  #
+  # Why this exists:
+  # - A poison message (one that fails on every attempt) with the at-least-once
+  #   settings this chart requires (maxDeliver: -1 = redeliver forever) never
+  #   leaves the consumer. Because the sink applies with max_ack_pending small
+  #   and in delivery order, that one stuck message head-of-line-blocks the ack
+  #   floor: nothing behind it can advance, and the whole shard/consumer stalls.
+  # - The three poison reasons the sink recognises today are decode_error (the
+  #   gzip:base64 body will not decode), unknown_op (an op the pipeline has no
+  #   branch for), and hash_decode_error (a hash payload that will not parse).
+  #   These are permanent by nature — retrying them forever cannot help, so the
+  #   safe move is to set them aside for a human and keep the pipeline flowing.
+  #
+  # Safe default: DISABLED. With this off the render is byte-identical to the
+  # pre-DLQ chart and poison redelivers forever exactly as before — a
+  # conservative default because dropping a message off the main consumer is a
+  # deliberate operational choice, not something to turn on by accident. Turn it
+  # on only once you have somewhere to watch the DLQ subject and a plan to drain
+  # it. See chart/examples/values-dlq.yaml for a full worked example.
+  #
+  # Verified by: scripts/verify-dlq-e2e.sh (end-to-end: a poison message is
+  # parked, the ack floor advances, and the consumer is no longer blocked) and
+  # scripts/test-dlq-guard.sh (the render-time guards below).
   deadLetter:
-    # The DLQ needs the subscriber creds to grant pub on <subject>.> . The committed
-    # chart/files/nats-auth/ creds WERE regenerated with that grant (2026-07-16), so
-    # on a FRESH install enabling is just this toggle — proven end-to-end by
-    # scripts/verify-dlq-e2e.sh (poison parked, ack floor advances, consumer
-    # unblocked). CAUTION for deployments installed with the PRE-rotation creds:
-    # the regen rotated the operator+account identities, so redeploying with these
-    # creds orphans that release's existing KV_CDC stream state — plan a fresh NATS
-    # (new install/namespace) or migrate, rather than upgrading in place. If creds
-    # are ever out of sync (missing grant), a DLQ publish is permission-denied —
-    # which fails SAFE (nack/retry, no loss), and shows on the dashboard as
-    # "routed" climbing while "confirmed parked" stays flat.
+    # Turn the DLQ on for the sink leg. Leave false unless you have read the
+    # subject and credentials notes below — both can bite on an in-place upgrade.
+    #
+    # Credentials: the DLQ publishes with the subscriber creds, which must grant
+    # pub on <subject>.> . The committed chart/files/nats-auth/ creds were
+    # regenerated with that grant (2026-07-16), so on a FRESH install enabling
+    # the DLQ is just flipping this toggle — nothing else to do.
+    #
+    # CAUTION for releases installed with the PRE-2026-07-16 creds: that regen
+    # also rotated the operator and account identities. Redeploying these creds
+    # onto such a release orphans its existing KV_CDC stream state, so plan a
+    # fresh NATS (new install or namespace) or a migration rather than an
+    # in-place upgrade.
+    #
+    # Failure mode if the grant is ever missing (creds out of sync): the DLQ
+    # publish is permission-denied. This fails SAFE — the message is nacked and
+    # retried, so nothing is lost — but you will see it on the dashboard as
+    # "routed" climbing while "confirmed parked" stays flat. That divergence is
+    # the signal to re-check the creds grant.
     enabled: false
-    subject: "dlq.cdc"      # published per-reason as <subject>.<reason>; stream binds <subject>.>
+    # Where parked messages go. The sink publishes per-reason as
+    # <subject>.<reason> (e.g. dlq.cdc.decode_error) and the stream binds
+    # <subject>.> to capture them all.
+    #
+    # This subject MUST live OUTSIDE nats.stream.subjectPrefix (kv.cdc.*). If it
+    # overlapped, a sink consumer would re-consume its own dead letters in an
+    # endless loop — so the render fails loud when the subject is not disjoint.
+    # Keep the default unless you have a naming convention that also stays clear
+    # of the kv.cdc.* space.
+    subject: "dlq.cdc"
   source:
     # Render the forward (source) leg at all: Deployment, headless Service, and
     # its pipeline ConfigMap. Disabling stops central→NATS propagation entirely
@@ -176,15 +213,20 @@ connect:
     # only to reproduce the pre-fix message-loss baseline.
     consumerClientId: cdc_propagator_active
     # Max concurrent un-acked NATS publishes for the forward output. Unset =>
-    # the template renders its default 256 (prod value). The failover verifier
-    # lowers this (e.g. 1) so the input reads batches into its Redis PEL faster
-    # than the serialized publisher can drain them — forming a deterministic,
-    # catchable un-acked PEL to SIGKILL against. Does not change the loss
-    # mechanism, only widens the vulnerable window.
-    # MUST stay unset when connect.sharding.families is configured: sharding
-    # hard-codes max_in_flight: 1 (ordering link O-4) and the render FAILS if a
-    # leftover value is present — an explicit 256 here would otherwise silently
-    # re-parallelize publishes and reintroduce old-overwrites-new.
+    # the template renders its default 256 (the prod value). The failover
+    # verifier lowers this (e.g. 1) so the input reads batches into its Redis PEL
+    # faster than the serialized publisher can drain them — forming a
+    # deterministic, catchable un-acked PEL to SIGKILL against. That only widens
+    # the vulnerable window for the test; it does not change the loss mechanism.
+    #
+    # HARD RULE with sharding: leave this UNSET whenever connect.sharding.families
+    # is configured. Sharding hard-codes max_in_flight: 1 on the forward output
+    # (ordering link O-4 — serialized publish is what preserves per-key order in
+    # the fence-free v2 design), and the render FAILS LOUD if a leftover value is
+    # present here. That guard is deliberate: an explicit 256 would silently
+    # re-parallelize publishes and reintroduce old-overwrites-new, which NO metric
+    # can detect after the fact (docs/design/subject-sharding/design.md §3). The
+    # render guard is exercised by scripts/test-shard-mapping.sh.
     maxInFlight:
     # Redis XREADGROUP batch size (input `limit`). 50 in prod. The failover verifier
     # raises this so the reader pulls a large chunk into its PEL that the serialized
@@ -285,84 +327,128 @@ connect:
   # tg:caveat:123 publishes to kv.cdc.tg.caveat.<op>; any other key (e.g.
   # tg:new_family:1) flows to kv.cdc.others.<op> via the others group.
   #
-  #   Sharding — a group may instead claim SHARDS of a family declared under
-  #   connect.sharding (docs/design/subject-sharding/design.md):
-  #     shardsOf: "lp:m2g"       # family name; must exist in sharding.families
-  #     shards: [0,1,2,3]        # claimed shards; "x" = the isolation shard
-  #   A shard group renders the BROKER sink variant: one pipeline binding one
-  #   durable PER claimed shard (cdc_sink_lp_m2g_s0 ... filter
-  #   kv.cdc.lp.m2g.s0.>), broker copies:1 + pipeline threads:1 hard-coded,
-  #   and every shard durable is created with max_ack_pending: 1 (NOT the
-  #   consumer.* inheritance chain — ordering link O-6; overriding
-  #   consumer.maxAckPending on a shard group fails the render). The union of
-  #   shards across enabled groups must equal {0..N-1, "x"} exactly once.
-  #   shardsOf excludes prefixes/filterSubject/catchAll on the same group.
+  #   Sharding — instead of a prefix, a group may claim SHARDS of a family that
+  #   is declared under connect.sharding below (full design:
+  #   docs/design/subject-sharding/design.md; worked example:
+  #   chart/examples/values-sharding.yaml):
+  #     shardsOf: "lp:m2g"       # family name; MUST exist in sharding.families
+  #     shards: [0,1,2,3]        # claimed shard numbers; "x" = the isolation shard
+  #   A shard group renders the BROKER sink variant: a single pipeline binds one
+  #   durable PER claimed shard (cdc_sink_lp_m2g_s0, cdc_sink_lp_m2g_s1, ... each
+  #   filtering kv.cdc.lp.m2g.s0.>, kv.cdc.lp.m2g.s1.>, ...). This is how one sink
+  #   pod fans in several shard lanes at once and still applies each key in order.
+  #
+  #   Three parameters are hard-coded on this variant and MUST NOT be loosened —
+  #   together they are the per-key ordering guarantee (design §3, ordering links
+  #   O-6/O-7), and loosening any one silently reintroduces old-overwrites-new
+  #   with no metric able to catch it:
+  #     - broker copies: 1        (one puller per durable, never parallel)
+  #     - pipeline threads: 1     (apply in delivery order)
+  #     - every shard durable is created with max_ack_pending: 1 — set directly
+  #       in the helper, NOT via the consumer.* inheritance chain. Because of
+  #       that, putting consumer.maxAckPending on a shard group FAILS the render
+  #       on purpose (it would otherwise inherit 1024 and let redeliveries jump
+  #       ahead of an un-acked message).
+  #
+  #   Coverage rule: across all ENABLED shard groups for a family, the union of
+  #   claimed shards must equal {0..N-1, "x"} exactly once — every numeric shard
+  #   and the isolation shard "x" claimed, none claimed twice. The render fails
+  #   loud on a gap or an overlap, so a missing shard cannot silently strand its
+  #   traffic. shardsOf is exclusive with prefixes/filterSubject/catchAll on the
+  #   same group — a group is either a shard owner or a prefix router, not both.
   sinkGroups: []
 
   # ── Per-key sharding (subject-sharding v2: strict per-key ordering) ──────────
-  # Use this only when one Redis key family is too busy for one sink, but each
-  # individual entity still needs strict ordering. Sharding changes the NATS
-  # subject from one family-wide lane to many shard lanes. For example, with
-  # family "lp:m2g" and shards: 32, this key:
+  # Reach for this in one specific situation: a single Redis key family is too
+  # busy for one sink to keep up, yet each individual entity still needs its
+  # updates applied in strict order. Sharding splits that one family-wide NATS
+  # lane into many shard lanes, so several sinks drain it in parallel while every
+  # key stays on exactly one lane (and therefore stays ordered).
+  #
+  # How a key becomes a shard subject: the numeric id in the key (by default the
+  # employee id inside the Redis Cluster hash tag) is taken mod N. For family
+  # "lp:m2g" with shards: 32, this key:
   #   lp:m2g:active:{employee:123}
   # is published to:
-  #   kv.cdc.lp.m2g.s27.<op>   # 123 mod 32 = 27
-  # The sinkGroups below must then claim those shard subjects with shardsOf/shards.
+  #   kv.cdc.lp.m2g.s27.<op>   # because 123 mod 32 = 27
+  # The sinkGroups above must then claim those shard subjects with
+  # shardsOf/shards (see chart/examples/values-sharding.yaml for the full setup).
   #
-  # Empty families means sharding is OFF. In that mode keyPattern and
-  # pruneOrphans are ignored and the chart behaves like the normal prefix-based
-  # routing chart.
+  # Empty families means sharding is OFF (the safe default). In that mode
+  # keyPattern and pruneOrphans are ignored and the chart behaves exactly like
+  # the normal prefix-routed chart — so leaving this untouched costs nothing.
   #
-  # Important trade-off: enabling sharding makes the forward leg publish one
-  # message at a time (threads: 1, max_in_flight: 1). This protects ordering
-  # without a last-write-wins fence, but it also means total forward throughput is
-  # limited by the round trip from Connect to NATS. Remove any
-  # connect.source.maxInFlight override before enabling sharding; the chart fails
-  # rendering if both are set.
+  # Trade-off you are accepting when you turn this on: to preserve order without a
+  # last-write-wins fence, the forward leg is forced to publish one message at a
+  # time (threads: 1, max_in_flight: 1). Sink-side sharding removes the cross-
+  # region fetch bottleneck, but this serialized forward publish is a hard
+  # ceiling of roughly one message per Connect→NATS round trip (~1000 msg/s when
+  # NATS is co-located). If your whole-site throughput needs to exceed that, the
+  # only exit is the fence-based v1 design — this is a known, documented cost, not
+  # a tuning knob. Remove any connect.source.maxInFlight override before enabling
+  # sharding; the render fails loud if both are set.
+  #
+  # Verified by: scripts/test-shard-mapping.sh (the shard math and render
+  # guards), scripts/verify-sharding.sh (end-to-end apply on a kind cluster), and
+  # the failover/replay proofs scripts/verify-sharding-failover.sh and
+  # scripts/verify-sharding-replay.sh (order survives a mid-flight SIGKILL).
   sharding:
-    # Regular expression used to find the numeric id that decides the shard.
-    # It must contain a named capture group called "id": (?P<id>...). Only that
-    # captured number is used for shard math.
+    # Regular expression that finds the numeric id deciding a key's shard. It MUST
+    # contain a named capture group called "id" — written (?P<id>...) — because
+    # only that captured number is fed to the shard math (id mod N).
     #
     # The default pattern reads ids from Redis Cluster hash tags like
-    # "{employee:123}". Keeping the id inside a stable hash-tag lets related keys
-    # for the same entity, such as active/standby variants, land on the same
-    # shard and preserve per-entity ordering.
+    # "{employee:123}". Pulling the id from a STABLE hash tag is what makes
+    # sharding correct: every key variant for the same entity (active/standby,
+    # different sub-keys) contains the same tag, so they all hash to the same
+    # shard and their updates stay ordered relative to each other. Choose an id
+    # that is fixed for the life of the entity — if the captured value can change,
+    # a key can migrate between shards and lose its ordering guarantee.
     #
-    # If a key belongs to a sharded family but does not match this pattern, the
-    # forward leg sends it to the isolation shard "sx" and increments
-    # cdc_forward_unrouted{reason="unparseable_shard"}. Include shard "x" in one
-    # sinkGroup so those messages are not lost.
+    # Failure mode for a key that belongs to a sharded family but does NOT match
+    # this pattern: rather than guess a shard, the forward leg routes it to the
+    # isolation shard "sx" and increments
+    # cdc_forward_unrouted{reason="unparseable_shard"}. That is fail-safe only if
+    # some sinkGroup claims shard "x" — otherwise those messages have no consumer.
+    # Always give shard "x" an owner, and watch that counter: a rising sx rate
+    # means keys are reaching the family that this pattern cannot parse.
     keyPattern: '\{employee:(?P<id>[0-9]+)\}'
-    # Families that should be sharded. The map key is the Redis key family prefix
-    # to shard. It uses the same one- or two-segment format as sinkGroup prefixes,
-    # for example "lp" or "lp:m2g". Do not also list the same family in a
-    # sinkGroup.prefixes entry; one family can have only one owner.
+    # The families to shard. Each map key is a Redis key family prefix, in the
+    # same one- or two-segment format as sinkGroup prefixes ("lp" or "lp:m2g").
+    # A family may have only ONE owner: do not also list it under any
+    # sinkGroup.prefixes entry, or the render fails loud on the conflict.
     #
-    # shards is the number of normal numeric shards: s0 through s(N-1). Choose it
-    # once and choose enough headroom for future scale. Changing this number later
-    # moves keys to different subjects and requires the pause/drain/cutover steps
-    # in docs/design/subject-sharding/cutover.md.
+    # shards (per family) is the count of normal numeric shards, s0 through
+    # s(N-1). Pick it ONCE with generous headroom for future scale, because
+    # changing N later re-maps keys to different subjects — that is not a rolling
+    # change: it needs the deliberate pause/drain/cutover procedure in
+    # docs/design/subject-sharding/cutover.md (rehearse it with
+    # scripts/sharding-cutover-drill.sh first). Over-provisioning N up front (the
+    # design suggests 32) is cheap; re-sharding a live family is not.
     #
-    # Every enabled sharded family must be fully covered by sinkGroups:
-    #   - all numeric shards 0..N-1 must be claimed exactly once
-    #   - the isolation shard "x" must be claimed exactly once
-    # Example:
+    # Every enabled sharded family must be FULLY covered by the sinkGroups above,
+    # or the render fails:
+    #   - each numeric shard 0..N-1 claimed exactly once, and
+    #   - the isolation shard "x" claimed exactly once.
+    # Example (pair this with the shardsOf sinkGroups shown earlier):
     #   families:
     #     "lp:m2g":
     #       shards: 32
     families: {}
-    # Controls whether nats-init deletes old JetStream consumers that are no
-    # longer described by the current sinkGroups while sharding is enabled.
+    # Whether nats-init is allowed to DELETE old JetStream consumers that the
+    # current sinkGroups no longer describe (only meaningful while sharding is on).
     #
-    # Keep this false for normal installs and during most cutover steps. With
-    # false, nats-init only prints the orphan consumers it finds; it does not
-    # delete them. This prevents accidentally deleting an old consumer before it
-    # is fully drained.
+    # Safe default: false. With false, nats-init merely PRINTS the orphan
+    # consumers it finds and leaves them alone. Keep it false for normal installs
+    # and for every cutover step except the final cleanup — deleting a consumer
+    # that still has undrained messages would strand them, so this defaults to
+    # look-but-don't-touch.
     #
-    # Set true only for the deliberate cleanup upgrade after you have confirmed
-    # each old consumer is drained (num_pending==0 and num_ack_pending==0). After
-    # that cleanup upgrade, set it back to false.
+    # Set true only for the one deliberate cleanup upgrade AFTER you have
+    # confirmed each old consumer is fully drained (num_pending == 0 and
+    # num_ack_pending == 0 — check with `nats consumer info`). Flip it back to
+    # false immediately after that upgrade so a later accidental config change
+    # can never trigger a delete.
     pruneOrphans: false
 
   # Defaults every sinkGroup inherits when it omits a key (group -> sinkDefaults

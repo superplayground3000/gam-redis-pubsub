@@ -31,8 +31,11 @@
 input:
   label: sink_{{ replace "-" "_" .Group.name }}
   broker:
-    # D-4: copies MUST stay 1 — copies>1 spawns multiple pullers on the SAME
-    # durable and per-shard delivery order dies (F4).
+    # Load-bearing (INV-1 row 13, rules/05-invariants.md; design D-4): copies MUST
+    # stay 1. copies>1 spawns multiple pullers on the SAME durable, so two fetches
+    # of one shard race and per-shard delivery order dies (F4). Because v2 has no
+    # last-writer-wins fence, that reordering silently lets an older event overwrite
+    # a newer one — and no metric can see it. Keep this at 1.
     copies: 1
     inputs:
       {{- $famUs := replace ":" "_" .Group.family }}
@@ -44,8 +47,12 @@ input:
           auth:
             user_credentials_file: {{ $.Values.nats.auth.creds.subscriber | quote }}
           stream: {{ $.Values.nats.stream.name | quote }}
-          # bind:true attaches to the pre-created durable; in pull(bind) mode
-          # the server-side consumer settings rule (max_ack_pending=1 — O-6).
+          # Load-bearing (INV-1 row 6, rules/05-invariants.md): bind:true attaches to
+          # the pre-created per-shard durable so delivery state survives failover
+          # (same reason as the non-sharded sink). In pull(bind) mode the server-side
+          # consumer settings win — crucially max_ack_pending=1 (O-6, nats-init
+          # hard-codes it, INV-1 row 13): only one message per shard is unacked at a
+          # time, so a redelivery can never overtake a later message on that shard.
           durable: {{ $c.durable | quote }}
           bind: true
         processors:
@@ -53,10 +60,14 @@ input:
       {{- end }}
 
 pipeline:
-  # O-7: broker per-child FIFO would be destroyed by concurrent processing —
-  # threads MUST stay 1 (design D-4). Apply is local-region Redis (sub-ms);
-  # serialization here is not the bottleneck (the fetch path is, hence K
-  # parallel shard children).
+  # Load-bearing (INV-1 row 13, rules/05-invariants.md; design O-7/D-4): the broker
+  # above hands messages up in per-child FIFO order, but concurrent processing would
+  # immediately scramble that — so threads MUST stay 1. This serializes apply within
+  # the pod, the last link in the ordering chain that replaces the LWW fence.
+  # Raising it silently reintroduces old-overwrites-new with no metric to catch it.
+  # It is NOT a throughput bottleneck: apply is sub-millisecond local-region Redis;
+  # the fetch path is the limit, which is why parallelism lives in the K shard
+  # children, not here.
   threads: 1
   processors:
     {{- if .Values.connect.contentLog.enabled }}
@@ -249,9 +260,15 @@ pipeline:
                           shard: '${! meta("shard") }'
 
 output:
-  # Success acks JetStream; processor failure nacks -> redelivery on the SAME
-  # shard durable, which cannot reorder under max_ack_pending=1 (O-6). Ack
-  # routing follows the transaction back to the originating broker child (F3),
-  # so one shard's nack never blocks another shard.
+  # Load-bearing (INV-1 row 8, rules/05-invariants.md): apply-before-ack, same as
+  # the non-sharded sink. A success acks JetStream; a processor failure nacks and
+  # JetStream redelivers on the SAME shard durable — which cannot reorder under
+  # max_ack_pending=1 (O-6), so nack-on-error is the correct retry here.
+  #
+  # Deliberate asymmetry with the forward leg (see the file header): the forward
+  # output must NEVER nack because a Redis-PEL replay CAN reorder, but this sink's
+  # JetStream redelivery cannot, so keeping reject_errored here is safe and correct.
+  # Ack routing follows the transaction back to its originating broker child (F3),
+  # so one stuck shard never blocks another.
   reject_errored:
     drop: {}

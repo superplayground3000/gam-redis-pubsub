@@ -11,6 +11,14 @@ logger:
   add_timestamp: true
 metrics:
   prometheus:
+    # Load-bearing (INV-2, rules/05-invariants.md): use_histogram_timing makes every
+    # `timing` metric (e.g. cdc_sync_latency_seconds, and the built-in
+    # processor_latency_ns) export as a Prometheus histogram, which is what the
+    # Grafana dashboard's p50/p95/p99 panels query. Quirk of this pinned Connect
+    # build: the pipelines feed timing VALUES in nanoseconds and the metric NAMES
+    # still end in _ns, but the exporter divides by 1e9 so the recorded BUCKETS are
+    # SECONDS. Always read these values as seconds; never rename a metric to _seconds
+    # expecting a unit change, and never add an _ns suffix expecting nanoseconds.
     use_histogram_timing: true
     # Buckets are SECONDS (exporter divides timing ns by 1e9). 30/60/120 keep
     # outage/PEL-replay tails out of +Inf (DefBuckets top out at 10s). GLOBAL:

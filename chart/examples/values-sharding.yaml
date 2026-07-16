@@ -1,43 +1,80 @@
-# Example values for connect.sharding.* with sharded and non-sharded sinkGroups
-# running side by side.
+# Example values for per-key subject sharding (subject-sharding v2), with sharded
+# and non-sharded sinkGroups running side by side.
 #
-# Scenario:
-#   - Keys for the high-volume lp:m2g family look like
-#     lp:m2g:active:{employee:123}. The employee id decides the shard, so every
-#     key variant for employee 123 is delivered to the same shard and applied in
-#     order.
-#   - Keys for lower-volume families, such as lp:g2m and lp:r2g, do not need
-#     per-key sharding. They continue to use normal prefix-routed sinkGroups.
-#   - A catch-all group receives keys that do not match any configured sharded
-#     family or non-sharded prefix.
+# What sharding is for:
+#   Use it only when ONE Redis key family is too busy for a single sink to keep
+#   up, but each individual entity in that family still needs strict ordering.
+#   Sharding splits that family's NATS traffic from one family-wide lane into many
+#   shard lanes, so multiple sinks apply different entities in parallel — while
+#   every key for a given entity still lands on the same lane and applies in order.
+#
+# How a key becomes a shard:
+#   The numeric id inside the key's hash tag decides the shard. With
+#   keyPattern '\{employee:(?P<id>[0-9]+)\}' and shards: 8, this key
+#     lp:m2g:active:{employee:123}
+#   is published to
+#     kv.cdc.lp.m2g.s3.<op>          # 123 mod 8 = 3
+#   Because the id lives in a stable hash tag, every variant for employee 123
+#   (active, standby, ...) shares shard s3 and preserves per-entity ordering.
+#
+# Scenario in this file:
+#   - lp:m2g is the high-volume family, sharded into 8 lanes (s0..s7) plus the
+#     isolation lane sx, claimed across three sink groups.
+#   - lp:g2m and lp:r2g are lower-volume; they stay on normal prefix routing.
+#   - A catch-all group receives every key that matches none of the above.
 #
 # Install example:
 #   helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
 #     -f chart/examples/values-sharding.yaml
+#
+# Prove it renders and then works:
+#   L1 render:  helm template chart/ -f chart/examples/values-sharding.yaml >/dev/null
+#   L3 kind e2e: RRCS_NS=cdc-shard RRCS_RELEASE=cdcsh scripts/verify-sharding.sh
+#     (asserts every shard durable exists with max_ack_pending==1, keys route by
+#     id-mod-N, interleaved updates to one entity apply in source order, and the
+#     sx isolation lane applies unparseable keys instead of dropping them).
+#   Design + cutover reference: docs/design/subject-sharding/design.md and
+#   docs/design/subject-sharding/cutover.md.
 
 connect:
   # Required for sharding: leave maxInFlight unset. Sharding renders the forward
-  # output with max_in_flight: 1 to keep publish order strict.
+  # output with max_in_flight: 1 (and pipeline threads: 1) to keep publish order
+  # strict — this is ordering link O-4, load-bearing per INV-1 row 13. The chart
+  # FAILS to render if connect.source.maxInFlight is also set, precisely so a
+  # leftover override can never silently re-parallelize publishing and reintroduce
+  # old-overwrites-new (which no metric can detect after the fact).
   source:
     maxInFlight:
 
   sharding:
-    # Extract the numeric id from the hash-tag part of the key. For
+    # Extract the numeric id from the hash-tag part of the key. The named capture
+    # group (?P<id>...) is required; only that number feeds the shard math. For
     # lp:m2g:active:{employee:123}, the captured id is 123.
+    #
+    # If a key belongs to a sharded family but does NOT match this pattern, the
+    # forward leg routes it to the isolation shard sx and increments
+    # cdc_forward_unrouted{reason="unparseable_shard"} — it is isolated, not lost,
+    # as long as some group claims shard "x" (the m2g-isolation group below does).
     keyPattern: '\{employee:(?P<id>[0-9]+)\}'
 
     # Shard only the high-volume lp:m2g family. With shards: 8, normal shard
     # subjects are kv.cdc.lp.m2g.s0.> through kv.cdc.lp.m2g.s7.>.
     #
     # Do not also configure "lp:m2g" under any sinkGroup.prefixes entry. A family
-    # can be owned either by sharding or by prefix routing, never both.
+    # can be owned either by sharding or by prefix routing, never both — one owner
+    # per family. Picking the shard count is a one-time decision: leave headroom,
+    # because changing it later moves keys to different subjects and requires the
+    # pause/drain/cutover steps in docs/design/subject-sharding/cutover.md.
     families:
       "lp:m2g":
         shards: 8
 
-    # Safety default. nats-init reports obsolete consumers but does not delete
-    # them. Change to true only during the explicit post-drain cleanup upgrade,
-    # then change it back to false.
+    # Safety default. While true would let nats-init DELETE JetStream consumers
+    # that the current sinkGroups no longer describe, false makes it only REPORT
+    # them. Keep it false for normal installs and during most cutover steps; flip
+    # it to true only for the deliberate post-drain cleanup upgrade (after you have
+    # confirmed each old consumer has num_pending==0 and num_ack_pending==0), then
+    # set it back to false.
     pruneOrphans: false
 
   # Sharded and non-sharded sinkGroups can co-exist:
@@ -47,10 +84,19 @@ connect:
   #   - catchAll consumes the remaining kv.cdc.others.> traffic.
   #
   # Because at least one prefix/sharded group is enabled, do not add a group with
-  # no routing key. A whole-stream group would receive the same messages again.
+  # no routing key. A whole-stream group would receive the same messages again
+  # (the chart fails the render if you try).
   sinkGroups:
-    # Sharded groups for lp:m2g. The union must cover every numeric shard exactly
-    # once and also cover isolation shard "x" exactly once.
+    # Sharded groups for lp:m2g. The union of claimed shards across all enabled
+    # shardsOf groups must cover every numeric shard 0..7 exactly once AND the
+    # isolation shard "x" exactly once. The render fails loud if a shard is
+    # unclaimed (its messages would never be consumed) or double-claimed.
+    #
+    # Each shard group renders the BROKER sink variant: one pipeline binding one
+    # durable per claimed shard (cdc_sink_lp_m2g_s0, ... filter kv.cdc.lp.m2g.s0.>),
+    # with broker copies:1 + pipeline threads:1 and every shard durable created
+    # with max_ack_pending:1 (INV-1 row 13 / ordering links O-6,O-7 — do not try to
+    # override consumer.maxAckPending on a shard group; that also fails the render).
     - name: m2g-a
       shardsOf: "lp:m2g"
       shards: [0, 1, 2, 3]
@@ -60,8 +106,9 @@ connect:
       shards: [4, 5, 6, 7]
 
     # The isolation shard receives lp:m2g keys that do not match keyPattern, plus
-    # cross-shard rename events. Monitor it; it should normally stay empty or
-    # near zero.
+    # cross-shard rename events. Monitor it (Grafana panel 16,
+    # cdc_forward_unrouted{reason="unparseable_shard"}); it should normally stay
+    # empty or near zero, and cdc_forward_cross_shard_rename must stay 0.
     - name: m2g-isolation
       shardsOf: "lp:m2g"
       shards: ["x"]
@@ -76,6 +123,53 @@ connect:
 
     # Optional catch-all for all keys outside lp:m2g, lp:g2m, and lp:r2g. Without
     # this group, unmatched messages park on kv.cdc.others.<op> and trigger the
-    # unrouted alert instead of being applied.
+    # CDCForwardUnrouted alert (reason=no_match) instead of being applied.
     - name: others
       catchAll: true
+
+# ── Credentials note ─────────────────────────────────────────────────────────
+#
+# Running more than one sink group needs the subscriber (sink) NATS creds to cover
+# the per-group durable names. The committed chart/files/nats-auth/ creds already
+# grant the $JS.API.CONSUMER.*.KV_CDC.* wildcard, so the bundled-mode default here
+# works as-is. If you run external NATS, make sure your subscriber creds carry the
+# equivalent grant, or re-run scripts/gen-nats-auth.sh --force and commit the
+# result. These are lab creds — never put real production creds in this file.
+
+# ── Incompatibility: sharding + DLQ ──────────────────────────────────────────
+#
+# Per-key sharding cannot be combined with the opt-in Dead-Letter Queue
+# (connect.deadLetter.enabled=true). Setting both makes the chart fail to render
+# on purpose, because the sharded sink pipeline has no DLQ routing yet and a mixed
+# topology would be silently half-protected. Use this example OR
+# chart/examples/values-dlq.yaml, never both at once.
+
+# ── Untested areas ───────────────────────────────────────────────────────────
+#
+# - Changing shards for a live family: this example fixes shards at 8. Re-sharding
+#   an active family is NOT a hot edit — it moves keys to new subjects and must go
+#   through the pause/drain/cutover procedure in
+#   docs/design/subject-sharding/cutover.md. Do not change the number in place on a
+#   running system.
+# - Capacity: 8 shards is illustrative. The right shard count depends on the
+#   family's real throughput and the number of sinks you can run; size it against a
+#   staging workload before production. Remember the forward leg serializes
+#   publishing under sharding (one message at a time), so total forward throughput
+#   is bounded by the Connect-to-NATS round trip regardless of shard count.
+# - Multi-family sharding: only lp:m2g is sharded here. Sharding several families
+#   at once renders more groups and durables; verify the full render and re-run
+#   scripts/verify-sharding.sh before relying on it.
+
+# ── Potential improvements ───────────────────────────────────────────────────
+#
+# - A runtime preflight or canary that samples real keys against keyPattern. The
+#   render already fails loud if keyPattern lacks the named "(?P<id>...)" group
+#   (chart/templates/_helpers.tpl), so a structurally broken pattern can never
+#   deploy. What it cannot catch is a pattern that HAS the group but is too broad
+#   or mis-anchored for the actual key shapes: those keys pass the render guard yet
+#   fail to parse at runtime and route to the isolation shard sx, visible as
+#   cdc_forward_unrouted{reason="unparseable_shard"} on dashboard panel 16. A
+#   preflight that tests the pattern against a sample of live keys would surface
+#   that mismatch early, before it quietly piles onto sx.
+# - A render-time hint when a sharded family's shard count is very small relative
+#   to the number of sink groups, to catch obvious under-provisioning early.

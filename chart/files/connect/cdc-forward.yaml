@@ -31,14 +31,37 @@ input:
     kind: {{ include "rrcs.redis.central.connectKind" . }}
     streams:
       - app.events
+    # Load-bearing (INV-1 row 3, rules/05-invariants.md): the consumer group name
+    # `cdc_propagator` is the identity of the Pending Entries List (PEL) that tracks
+    # which stream entries have been read but not yet XACKed. Rename it and the new
+    # group starts from a fresh PEL, so entries the old group had in flight are never
+    # replayed — silent loss. Keep it stable across upgrades.
     consumer_group: cdc_propagator
+    # Load-bearing (INV-1 row 2, rules/05-invariants.md): this client id MUST stay
+    # stable and role-scoped (the value is `cdc_propagator_active`), never pod-scoped.
+    # Redis tracks unacked entries per (group, client_id). If the id embeds the pod
+    # name, a SIGKILL orphans that pod's PEL under a name no future pod ever claims,
+    # so its in-flight entries are never re-read. That exact bug lost 757 messages in
+    # the 2026 failover A/B test (docs/failover-report/REPORT.md). Changing this
+    # requires the L4 failover proof — see the invariants table.
     client_id: {{ .Values.connect.source.consumerClientId }}
     body_key: body
     create_streams: true
     start_from_oldest: false
+    # Load-bearing (INV-1 row 1, rules/05-invariants.md): this is the "write-then-ack"
+    # heartbeat. Connect XACKs the Redis entries it has fully processed every
+    # commit_period — and a message only counts as processed once the output stage
+    # got its NATS PubAck. So an entry is durably in JetStream BEFORE it is acked in
+    # Redis. If the pod dies in the gap, the entry stays in the PEL and is re-read.
+    # Never move the ack ahead of the publish.
     commit_period: 200ms
     timeout: 500ms
     limit: {{ .Values.connect.source.readLimit | default 50 }}
+    # Load-bearing (INV-1 row 3, rules/05-invariants.md): when the output nacks a
+    # message (publish failed), auto_replay_nacks re-reads it from the PEL instead of
+    # leaving it stuck. This is what turns a nack into an actual retry. Pair it with
+    # the output fallback's `reject` child below (non-sharded) or the blocking
+    # in-place retry of the sharded output.
     auto_replay_nacks: true
 
 pipeline:
@@ -257,10 +280,37 @@ output:
       user_credentials_file: {{ .Values.nats.auth.creds.publisher | quote }}
     subject: {{ include "rrcs.nats.stream.publishSubject" . | quote }}
     headers:
+      # Load-bearing (INV-1 row 4, rules/05-invariants.md): stamping event_id as the
+      # Nats-Msg-Id lets JetStream server-side dedup absorb a replay. If the pod
+      # crashes AFTER the publish but BEFORE the Redis XACK, the entry is re-read and
+      # re-published — same event_id, so JetStream returns PubAck{duplicate} and the
+      # sink sees it once. This is why at-least-once does not become
+      # at-least-twice-applied. Keep the dupe window (nats.stream.dupeWindow) wider
+      # than the realistic crash-replay gap (INV-1 row 5).
       Nats-Msg-Id: ${! meta("event_id") }
       Content-Type: application/json
+    # Load-bearing (INV-1 row 13, rules/05-invariants.md): max_in_flight: 1 makes the
+    # publish SERIAL — one PubAck before the next publish. In the sharded (v2) design
+    # this is a link in the ordering chain that replaces the old last-writer-wins
+    # fence: allowing >1 in flight lets a later event's PubAck land before an earlier
+    # one's, so an older value can overwrite a newer one on the same key, and NO
+    # metric can detect it. Never raise this in the sharded render.
     max_in_flight: 1
   {{- else }}
+  # Non-sharded output: a two-child `fallback`. Child 1 tries the real JetStream
+  # publish; child 2 runs ONLY if child 1 failed, to count and nack.
+  #
+  # Why this exists:
+  # - We need "publish failed" to become a retry, not a silent drop. `fallback`
+  #   gives us a place to react to the failure while keeping the entry un-acked.
+  #
+  # Important details:
+  # - Load-bearing (INV-1 row 11, rules/05-invariants.md): the failure child MUST
+  #   stay `reject` (nack -> replay). Never change it to `drop` or anything that
+  #   "succeeds" without a real PubAck — that would XACK an entry that never reached
+  #   JetStream, which is exactly the silent-loss shape INV-1 forbids.
+  # - The sharded render (the `if` branch above) deliberately has NO fallback — see
+  #   that block's comment for why a forward nack would reorder there.
   fallback:
     # Child 1 — the real publish. Every load-bearing setting (Nats-Msg-Id dedup
     # header, publish-then-XACK ordering via the input's commit_period) lives
