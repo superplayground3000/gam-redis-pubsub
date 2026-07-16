@@ -205,11 +205,10 @@ retention limits.
 
 ## 7. Testing performed
 
-The end-to-end proof below was run against this exact page's claims on
-2026-07-16 (kind cluster `cdc`, chart at the commit that introduced this doc) and
-passed. The guard-behavior script was **not** run in that session — its coverage
-is described from its own header, and the pipeline/template behavior is verified
-by the source citations throughout this page.
+Both proofs below were run against this exact page's claims on 2026-07-16
+(kind cluster `cdc` for the e2e, the pinned Connect image in docker for the
+guard test; chart at the commit that introduced this doc) and passed. The only
+path not exercised is external NATS — see §8.
 
 - **End-to-end (L3 kind, ~5 min) — RUN 2026-07-16, PASS (exit 0).**
   ```bash
@@ -226,11 +225,14 @@ by the source citations throughout this page.
   publish failures, the ack floor advanced with no redelivery loop, a normal
   message injected afterward still reached region Redis, and the §2 header
   contract held on the parked messages.
-- **Guard behavior (no cluster needed).** `scripts/test-dlq-guard.sh` extracts the
-  reverse pipeline's stash+guard mapping from the DLQ-enabled render and runs it in
-  the pinned Connect image against a case table (plain and gzip:base64 poison,
-  valid object bodies, skip paths), asserting `hash_decode_failed` / `event_id`
-  including the fallback value (`scripts/test-dlq-guard.sh` header).
+- **Guard behavior (no cluster needed) — RUN 2026-07-16, PASS (exit 0).**
+  `scripts/test-dlq-guard.sh` extracts the reverse pipeline's stash+guard mapping
+  from the DLQ-enabled render and runs it in the pinned Connect image against a
+  case table (plain and gzip:base64 poison, valid object bodies, skip paths),
+  asserting `hash_decode_failed` / `event_id` including the fallback value
+  (`scripts/test-dlq-guard.sh` header). All 8 cases matched
+  (`hash_decode_failed` and `event_id` exact-match on every row, including
+  `poison_no_event_id`, the fallback-id case); final line `[test-dlq-guard] PASS`.
 - **Render check (L1, seconds).**
   ```bash
   helm template chart/ -f chart/examples/values-dlq.yaml >/dev/null   # expect exit 0
