@@ -12,7 +12,19 @@ metadata:
   {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
   {{- $shardHash = toYaml .Values.connect.sharding }}
   {{- end }}
-  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s|%s|%s%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) (toYaml .Values.connect.sinkGroups) (toYaml (.Values.connect.sinkDefaults | default dict)) $shardHash | sha256sum | trunc 8))) }}
+  {{- /* deadLetter joins the hash ONLY when enabled (same rule as sharding above):
+       enabling the DLQ extends DESIRED_SUBJECTS (kv.cdc.> -> kv.cdc.>,dlq.cdc.>),
+       and without a new Job name an in-place enable inside the previous Job's
+       ttlSecondsAfterFinished window would try to patch the immutable completed
+       Job — failing the upgrade or silently skipping the subject reconcile, which
+       leaves the DLQ publishing to an unbound subject (fail-safe nack loop, no
+       loss, but the DLQ looks inert). Disabled keeps the hash input — and the
+       default render — byte-identical. */}}
+  {{- $dlqHash := "" }}
+  {{- if .Values.connect.deadLetter.enabled }}
+  {{- $dlqHash = toYaml .Values.connect.deadLetter }}
+  {{- end }}
+  name: {{ include "rrcs.name" (dict "root" $ "base" (printf "nats-init-%s" (printf "%s|%s|%s|%s|%s|%s%s%s" (toYaml .Values.nats.stream) (toYaml .Values.nats.auth) (.Files.Get "files/nats-auth/nats-server.conf") (include "rrcs.image" (dict "root" $ "ref" .Values.natsBox.image)) (toYaml .Values.connect.sinkGroups) (toYaml (.Values.connect.sinkDefaults | default dict)) $shardHash $dlqHash | sha256sum | trunc 8))) }}
   labels:
     app: nats-init
 spec:

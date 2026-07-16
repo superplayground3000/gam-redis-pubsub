@@ -1,5 +1,6 @@
 // generator publishes CDC envelopes to NATS JetStream subject kv.cdc.<op>.
-// MODE=healthy|poison|mixed, RATE msgs/sec, DURATION seconds (0 = forever).
+// MODE=healthy|poison|hashpoison|mixed, RATE msgs/sec, DURATION seconds (0 = forever),
+// COUNT exact number of messages then exit (0 = use DURATION instead).
 package main
 
 import (
@@ -48,6 +49,10 @@ func main() {
 	mode := env("MODE", "mixed")
 	rate, _ := strconv.Atoi(env("RATE", "20"))
 	dur, _ := strconv.Atoi(env("DURATION", "0"))
+	// COUNT (>0) publishes EXACTLY that many messages then exits — an exact, not
+	// approximate (rate*duration), batch size. The DLQ phase relies on this for its
+	// no-loss (INV-1) assertion: injected N must equal N dead-lettered + N acked.
+	count, _ := strconv.Atoi(env("COUNT", "0"))
 	url := env("NATS_URL", "nats://nats:4222")
 
 	nc, err := nats.Connect(url, nats.Timeout(5*time.Second), nats.RetryOnFailedConnect(true), nats.MaxReconnects(-1))
@@ -68,10 +73,18 @@ func main() {
 	if dur > 0 {
 		deadline = time.Now().Add(time.Duration(dur) * time.Second)
 	}
-	log.Printf("generator mode=%s rate=%d/s duration=%ds", mode, rate, dur)
+	log.Printf("generator mode=%s rate=%d/s duration=%ds count=%d", mode, rate, dur, count)
 
-	n := 0
+	n := 0         // messages attempted
+	published := 0 // messages the broker accepted (PublishMsg returned no error)
 	for range tick.C {
+		if count > 0 && n >= count {
+			log.Printf("generator done after %d msgs (published=%d, exact count=%d)", n, published, count)
+			if published != count {
+				log.Fatalf("FATAL: published %d != requested count %d — batch not exact", published, count)
+			}
+			return
+		}
 		if !deadline.IsZero() && time.Now().After(deadline) {
 			log.Printf("generator done after %d msgs", n)
 			return
@@ -82,6 +95,8 @@ func main() {
 		msg := &nats.Msg{Subject: subj, Data: payload, Header: nats.Header{"Nats-Msg-Id": []string{e.EventID}}}
 		if _, err := js.PublishMsg(msg); err != nil {
 			log.Printf("publish %s: %v", subj, err)
+		} else {
+			published++
 		}
 		n++
 	}
@@ -94,6 +109,8 @@ func next(mode string, n int) envelope {
 		return healthy(n)
 	case "poison":
 		return poison(n)
+	case "hashpoison":
+		return hashpoison(n)
 	default: // mixed: ~1 in 10 is poison
 		if n%10 == 0 {
 			return poison(n)
@@ -132,4 +149,28 @@ func poison(n int) envelope {
 		base.Body = "!!!this-is-not-base64-gzip!!!"
 	}
 	return base
+}
+
+// hashpoison builds a create/type=hash envelope whose body is well-formed JSON
+// but NOT a JSON object (a JSON array) — the HSET args_mapping downstream does
+// parse_json().key_values(), which is only valid on an object, so this fails the
+// sink's hash-guard (parse_json().type() != "object") and dead-letters to
+// dlq.cdc.hash_decode_error instead of throwing uncounted inside HSET.
+//
+// NOTE: an earlier version used a trailing-comma body ({"a":"1","b":"2",}) as the
+// "malformed" poison, but this Connect runtime's parse_json TOLERATES a trailing
+// comma (it yields a plain string rather than an error), so .type()=="object"
+// still passed and the body was NOT dead-lettered. A JSON array is a reliable
+// non-object that the guard classifies deterministically (it is also one of the
+// chart's own cited examples: `["a","b"]`). event_id is time+index unique so
+// repeated hashpoison runs are not swallowed by the stream's dedupe window.
+func hashpoison(n int) envelope {
+	return envelope{
+		EventID: fmt.Sprintf("hp-%d-%d", time.Now().UnixNano(), n),
+		Op:      "create",
+		Type:    "hash",
+		KVKey:   fmt.Sprintf("hp:%d", n),
+		TS:      strconv.FormatInt(time.Now().UnixMilli(), 10),
+		Body:    `["a","b"]`,
+	}
 }

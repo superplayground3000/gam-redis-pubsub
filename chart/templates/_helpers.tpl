@@ -239,7 +239,29 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 */}}
 {{- define "rrcs.nats.stream.subjects" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
-{{- printf "%s.>" $p -}}
+{{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- if $dl.enabled -}}
+{{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
+{{-   if gt (len $families) 0 -}}
+{{-     fail (printf "connect.deadLetter.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set) — the sharded sink pipeline (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be silently half-protected (unsharded poison parked, sharded poison still loops). Disable one of them.") -}}
+{{-   end -}}
+{{-   $sub := required "connect.deadLetter.subject is required when deadLetter.enabled" $dl.subject -}}
+{{- /* The base subject must be a LITERAL: it is used verbatim both in the stream's
+     subjects list ("<sub>.>") and in the sink's publish subject
+     ("<sub>.<reason>"). Wildcards (* / >), empty segments (".."), leading or
+     trailing dots, and whitespace all render fine here and only blow up later
+     inside NATS (bad stream config or failed publishes) — fail at render time
+     instead. Tokens are conservatively [A-Za-z0-9_-]. */}}
+{{-   if not (regexMatch "^[A-Za-z0-9_-]+(\\.[A-Za-z0-9_-]+)*$" $sub) -}}
+{{-     fail (printf "connect.deadLetter.subject %q must be a literal dot-separated NATS subject: tokens of [A-Za-z0-9_-] only — no wildcards (* or >), no empty segments, no leading/trailing dots, no whitespace. Use e.g. dlq.cdc." $sub) -}}
+{{-   end -}}
+{{-   if or (eq $sub $p) (hasPrefix (printf "%s." $p) $sub) -}}
+{{-     fail (printf "connect.deadLetter.subject %q must be OUTSIDE nats.stream.subjectPrefix %q — a subject under %s.> would be re-consumed by a whole-stream sink. Use e.g. dlq.cdc." $sub $p $p) -}}
+{{-   end -}}
+{{-   printf "%s.>,%s.>" $p $sub -}}
+{{- else -}}
+{{-   printf "%s.>" $p -}}
+{{- end -}}
 {{- end -}}
 
 {{/*

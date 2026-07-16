@@ -54,6 +54,136 @@ echo "[run-all-tests] == L1: helm lint + template + toggle renders =="
 # silently masks a real failure (bit CI on 2026-07-07, rules/50-lessons.md).
 helm lint chart/ || fail L1
 DEFAULT_OUT=$(helm template chart/) || fail L1
+# --- deadLetter (DLQ) render checks ---
+DLQ_OUT=$(helm template chart/ --set connect.deadLetter.enabled=true) || fail L1
+grep -q 'kv.cdc.>,dlq.cdc.>' <<<"$DLQ_OUT" \
+  || { echo "L1: DLQ enabled must extend stream subjects to kv.cdc.>,dlq.cdc.>"; fail L1; }
+if grep -q 'dlq.cdc' <<<"$DEFAULT_OUT"; then echo "L1: default render must not mention dlq"; fail L1; fi
+# Best-effort EXACT guard: the substring checks above only prove dlq/hash-guard
+# strings are absent, not that the default render is otherwise untouched. Diff
+# the current default render against the render at the branch's merge-base
+# with master — deadLetter must be fully gated, so with the toggle off the two
+# renders must be byte-identical. Best-effort: skipped (not failed) when no
+# merge-base is resolvable, e.g. a shallow clone.
+MB=$(git merge-base master HEAD 2>/dev/null || true)
+# Normalizer for the merge-base diff: the committed nats-auth fixtures rotate
+# legitimately (scripts/gen-nats-auth.sh --force, e.g. to add the DLQ pub grant),
+# and everything derived from them then differs in the default render — creds/JWT
+# base64 blobs, account/system_account nkeys, and the nats-init Job name hash
+# (creds content is a hash input). Strip EXACTLY that material and nothing else,
+# so the render stays byte-exact everywhere a gating leak could appear. Long
+# Bloblang/args_mapping lines are safe from the base64 pattern: quotes, parens
+# and spaces break the 60+ run.
+norm_render() {
+  sed -E \
+    -e 's/nats-init-[0-9a-f]{8}/nats-init-CREDSHASH/g' \
+    -e '/[A-Za-z0-9+\/=_.-]{60,}/d' \
+    -e '/^[[:space:]]*system_account:/d' \
+    -e '/^[[:space:]]*\/\/ Account /d' \
+    -e '/^[[:space:]]*$/d'
+}
+if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; then
+  MBDIR=$(mktemp -d)
+  if git worktree add -q "$MBDIR" "$MB" 2>/dev/null; then
+    if ! diff <(helm template "$MBDIR/chart" | norm_render) <(printf '%s\n' "$DEFAULT_OUT" | norm_render) >/dev/null; then
+      echo "[run-all-tests] L1: default render is NOT identical to merge-base $MB outside creds-derived material (deadLetter must be fully gated)"
+      git worktree remove -f "$MBDIR"
+      fail L1
+    fi
+    git worktree remove -f "$MBDIR"
+    echo "[run-all-tests] L1: default render identical to merge-base (creds-derived material normalized) ✓"
+  else
+    # A silent skip here would let the script exit 0 having never run its
+    # strongest byte-identical proof (the substring greps only prove specific
+    # strings absent). Say so loudly, and don't leak the mktemp dir.
+    rmdir "$MBDIR" 2>/dev/null || true
+    echo "[run-all-tests] L1: WARNING — merge-base byte-identical check SKIPPED (git worktree add failed; only the weaker substring checks ran)"
+  fi
+else
+  echo "[run-all-tests] L1: skipping merge-base byte-identical check (no merge-base available)"
+fi
+# fail-loud A: subject under kv.cdc must be rejected
+if helm template chart/ --set connect.deadLetter.enabled=true --set connect.deadLetter.subject=kv.cdc.dlq >/dev/null 2>&1; then
+  echo "L1: deadLetter.subject under subjectPrefix must fail-loud"; fail L1
+fi
+# fail-loud A2: malformed base subjects must be rejected at render time, not
+# deferred to NATS (wildcards, empty segments, trailing dots, whitespace all
+# template fine and only blow up as bad stream config / failed publishes later).
+for badsub in 'dlq.cdc.>' 'dlq..cdc' 'dlq.cdc.' '.dlq.cdc' 'dlq.*.cdc' 'dlq cdc'; do
+  if helm template chart/ --set connect.deadLetter.enabled=true --set "connect.deadLetter.subject=$badsub" >/dev/null 2>&1; then
+    echo "L1: malformed deadLetter.subject '$badsub' must fail-loud"; fail L1
+  fi
+done
+# fail-loud B: DLQ + subject-sharding v2 is an unsupported mix (the sharded sink
+# has no DLQ routing) — the chart must reject deadLetter.enabled=true whenever
+# connect.sharding.families is configured. Reuse the same valid sharded family
+# used by the sharding section below; it renders fine on its own (proven there),
+# so the ONLY reason this render fails is the DLQ+sharding guard.
+if helm template chart/ \
+     --set 'connect.sharding.families.lb:company.shards=4' \
+     --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' \
+     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
+     --set connect.deadLetter.enabled=true >/dev/null 2>&1; then
+  echo "L1: deadLetter.enabled=true with subject-sharding families must fail-loud"; fail L1
+fi
+grep -q 'reason: hash_decode_error' <<<"$DLQ_OUT" || { echo "L1: missing hash_decode_error counter"; fail L1; }
+grep -q 'cdc_dlq_forwarded'        <<<"$DLQ_OUT" || { echo "L1: missing cdc_dlq_forwarded counter"; fail L1; }
+grep -q 'hash_decode_failed'       <<<"$DLQ_OUT" || { echo "L1: missing hash guard"; fail L1; }
+# enabled output must route via nats_jetstream to the per-reason dlq subject.
+# (cdc-reverse.yaml is rendered embedded/indented inside a ConfigMap block, so
+# "output:" is not column-0 here -- match with leading whitespace.) Captured to
+# a variable before grep -q, same reason as the header comment above: a live
+# `awk | grep -q` pipe under pipefail lets grep -q exit at the first match and
+# SIGPIPE the upstream awk, flaking a good render to FAIL.
+DLQ_OUT_TAIL=$(awk '/^[[:space:]]*output:[[:space:]]*$/{o=1} o' <<<"$DLQ_OUT")
+grep -q 'nats_jetstream:' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must route via nats_jetstream"; fail L1; }
+# literal per-reason subject template: '<subject>.${! meta("dlq_reason") }' (default subject dlq.cdc)
+grep -qF 'dlq.cdc.${! meta("dlq_reason") }' <<<"$DLQ_OUT_TAIL" || { echo "L1: DLQ output must use per-reason subject template"; fail L1; }
+# default output must stay reject_errored: drop (byte-identical guard covers full render)
+grep -q 'reason: hash_decode_error' <<<"$DEFAULT_OUT" && { echo "L1: hash guard leaked into default"; fail L1; } || true
+# INV-2: cdc_dlq_forwarded is a new counter — it must ship with its own dashboard
+# panel in the same change (rules/05-invariants.md INV-2 load-bearing table).
+grep -q 'cdc_dlq_forwarded' chart/files/grafana/cdc-dashboard.json || { echo "L1: dashboard missing cdc_dlq_forwarded panel"; fail L1; }
+# Lint the ENABLED reverse pipeline against the real Connect binary. `helm template`
+# accepts config that `redpanda-connect lint` rejects (e.g. `processors` under a switch-
+# output case — the DLQ feature shipped that bug once, invisible because L3 runs with the
+# feature OFF; see rules/50-lessons.md 2026-07-14). These runtime checks (lint + the
+# behavioral guard test below) are the ONLY tier that validates the DLQ-ENABLED pipeline
+# (L3 runs with the feature off), so they are MANDATORY: if the pinned image is missing
+# we try `docker pull` first and FAIL L1 if it still isn't runnable. Docker-less hosts
+# can set DLQ_RUNTIME_CHECKS=optional to skip with a loud warning — never silently.
+# The `__POD__` label is the elector's runtime placeholder, not a real lint error —
+# filter it out.
+CONNECT_IMG="${CONNECT_IMG:-hpdevelop/connect:4.92.0-claudefix}"
+DLQ_RUNTIME_OK=1
+if ! command -v docker >/dev/null 2>&1; then
+  DLQ_RUNTIME_OK=0
+elif ! docker image inspect "$CONNECT_IMG" >/dev/null 2>&1; then
+  echo "[run-all-tests] L1: $CONNECT_IMG not present locally — pulling for the mandatory DLQ-enabled checks"
+  docker pull "$CONNECT_IMG" >/dev/null 2>&1 || DLQ_RUNTIME_OK=0
+fi
+if [ "$DLQ_RUNTIME_OK" != 1 ] && [ "${DLQ_RUNTIME_CHECKS:-strict}" != "optional" ]; then
+  echo "[run-all-tests] L1: the DLQ-enabled pipeline checks REQUIRE docker + $CONNECT_IMG (missing and pull failed)."
+  echo "[run-all-tests] L1: they are the only checks exercising the enabled render (rules/50-lessons.md 2026-07-14/15) — set DLQ_RUNTIME_CHECKS=optional only on hosts that cannot run docker."
+  fail L1
+fi
+if [ "$DLQ_RUNTIME_OK" = 1 ]; then
+  REV_PIPE=$(python3 -c 'import sys,yaml
+for d in yaml.safe_load_all(sys.stdin):
+  if d and d.get("kind")=="ConfigMap":
+    for k,v in (d.get("data") or {}).items():
+      if v and "reject_errored" in v and "nats_jetstream" in v and "dlq" in v:
+        print(v); sys.exit(0)' <<<"$DLQ_OUT")
+  LINT_OUT=$(printf '%s' "$REV_PIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label '__POD__'" || true)
+  if [ -n "$LINT_OUT" ]; then echo "L1: enabled DLQ reverse pipeline fails redpanda-connect lint:"; echo "$LINT_OUT"; fail L1; fi
+  echo "[run-all-tests] L1: enabled DLQ pipeline lints clean on $CONNECT_IMG"
+  # Behavioral guard test (rules/50-lessons.md 2026-07-15: templated Bloblang needs a
+  # got-vs-want run of the REAL rendered pipeline — lint proves loadability, never
+  # semantics; the meta-vs-let guard bug lints clean and silently never fires).
+  scripts/test-dlq-guard.sh || fail L1
+else
+  echo "[run-all-tests] L1: WARNING — enabled-pipeline connect-lint + guard behavioral test SKIPPED (DLQ_RUNTIME_CHECKS=optional; the DLQ-enabled render is UNVERIFIED in this run)"
+fi
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \

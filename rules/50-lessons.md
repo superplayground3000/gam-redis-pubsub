@@ -2,6 +2,24 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-16 — A "Codex" review dispatch can silently execute on Claude; verify the provider before trusting cross-model coverage
+- What happened: the DLQ-port quality review was dispatched to the `codex:codex-rescue`
+  Agent type per the provider-routing rule, but the reviewer disclosed it actually ran as
+  Claude (Sonnet) — the mandatory cross-provider review had silently not happened. The
+  reliable Codex path in this harness is the `codex:rescue` SKILL → thin forwarder →
+  background codex-companion task, polled with
+  `node .../codex-companion.mjs status|result <task-id>` (the forwarder itself cannot
+  poll; the task-id comes back in its one-line result). The real Codex pass then found
+  3 findings the two same-session Claude reviews had not (weak subject validation,
+  optional-only enabled-path checks, untested event_id fallback) — the cross-model gap
+  is real, not theoretical.
+- Rule that would have prevented it: require the reviewer to state its provider/model in
+  the report, and treat "dispatched to a Codex agent type" as unconfirmed until the
+  report says Codex ran; fall back or re-dispatch via the skill path when it didn't.
+- Applied: this session re-ran the review through `codex:rescue` (skill) and fixed all
+  3 findings (commit after 1d0f03f); the routing rule's "announce the switch" now needs
+  its converse — announce when the switch silently failed.
+
 ## 2026-07-15 — Three Bloblang/Helm value-passing traps that lint+template cannot catch
 - What happened: the subject-sharding forward mapping passed `helm lint`, `helm template`, and
   `rpk connect lint`, yet routed EVERY key to the wrong subject at runtime. Three independent
@@ -20,6 +38,23 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
 - Applied: `scripts/test-shard-mapping.sh` (wired into L2) caught all three on first run;
   fixes in `_helpers.tpl` (keyPatternLit, shardMap keying) and `cdc-forward.yaml` ("none"
   sentinel), each with a comment naming the trap.
+## 2026-07-14 — L1 renders the chart but never LINTS the enabled pipeline on the real Connect binary
+- What happened: The DLQ feature's reverse output put a per-case `processors:` block under the
+  `switch` output (to count `cdc_dlq_forwarded`). `helm lint` + `helm template` accept it (valid
+  YAML/Helm), and Task 2's L3 ran with `deadLetter.enabled=false`, so the enabled output block
+  never rendered. `redpanda-connect lint` on the RENDERED enabled pipeline
+  (`hpdevelop/connect:4.92.0-claudefix`) rejected it — `field processors not recognised` — meaning
+  the sink would fail to load whenever the feature is turned on. Caught only when the L2 lab (which
+  uses the enabled shape) was built.
+- Rule that would have prevented it: a Connect pipeline-YAML change is NOT verified by
+  `helm template` alone — render the pipeline in its ENABLED/feature-on configuration and run
+  `redpanda-connect lint` against the pinned image. `switch`-output cases take only
+  `check`/`continue`/`output`; per-message counting for a routed branch belongs in the pipeline,
+  not the output case. Expected standalone-lint noise: the `__POD__` label placeholder (the elector
+  substitutes it before POSTing) is not a real error.
+- Applied: `chart/files/connect/cdc-reverse.yaml` emits `cdc_dlq_forwarded{reason}` from the three
+  pipeline DLQ branches (commit 999b32f); enabled pipeline now lints clean. Added a best-effort
+  enabled-pipeline lint to the test suite (Task 6 of the DLQ plan).
 
 ## 2026-07-07 — `helm template | grep -q` under pipefail flakes CI once the render tops the pipe buffer
 - What happened: CI's L1 went red on master and PR #12 with "multi-group render missing
