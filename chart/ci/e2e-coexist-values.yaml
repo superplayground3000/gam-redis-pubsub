@@ -1,0 +1,49 @@
+# chart/ci/e2e-coexist-values.yaml — Install-A overlay for scripts/verify-e2e-matrix.sh
+# (design docs/superpowers/plans/2026-07-15-e2e-matrix-design.md §7, shape (H)).
+#
+# One coexisting install that mixes ALL three sink-group shapes:
+#   - a SHARDED family  lb:company  (N=4) split across two broker groups
+#       shard-a = shards {0,1}   shard-b = shards {2,3,x}   (x = isolation shard sx)
+#   - a 2-SEGMENT PREFIX group  caveat  owning tg:caveat
+#   - a CATCH-ALL group  others  (kv.cdc.others.> — everything unmatched)
+#
+# keyPattern is set to the PLURAL {employees:<id>} form ON PURPOSE (design §6b, the
+# keyPattern singular/plural trap): chart/values.yaml defaults to the SINGULAR
+# '\{employee:...}' which matches none of the writer / verify-sharding.sh keys, so a
+# default-pattern sharded install would route every key to sx. The matrix drives
+# lb:company:...:{employees:<id>}:... keys, so the plural pattern is mandatory.
+#
+# Replica pins (design §7 MAJOR-2, single-node CPU pressure): the chart default is 3
+# per connect leg (4 sink groups + source at 3 = 15 connect pods, ~9.4 CPU requested).
+# Pin low so Install-A schedules with headroom while still giving G-1/G-2 a real
+# standby to fail over to: source=2 (P3 G-1 source graceful termination needs a
+# standby), shard-a=2 (P3 G-2 sink graceful termination needs a standby), everything
+# else =1 (never terminated in P3, single active is enough).  ~7 connect pods.
+#
+# This is a pure overlay of existing connect.sharding / connect.sinkGroups values —
+# it adds NO chart component, so INV-3 owes no new toggle (design §7, critique note).
+connect:
+  source:
+    replicas: 2                    # keep ONE standby for P3 G-1 (source graceful termination)
+
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'   # PLURAL — see header (design §6b trap)
+    families:
+      "lb:company":
+        shards: 4
+
+  sinkGroups:
+    - name: shard-a
+      shardsOf: "lb:company"
+      shards: [0, 1]
+      replicas: 2                   # keep a standby for P3 G-2 (sink graceful termination)
+    - name: shard-b
+      shardsOf: "lb:company"
+      shards: [2, 3, "x"]           # owns the isolation shard sx (M-G lane)
+      replicas: 1
+    - name: caveat
+      prefixes: ["tg:caveat"]       # 2-segment prefix family
+      replicas: 1
+    - name: others
+      catchAll: true                # kv.cdc.others.> — misc:thing:* etc.
+      replicas: 1
