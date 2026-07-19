@@ -2,6 +2,28 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-16 — The exporter's ns→s division does NOT apply to `metric`-processor timing values; live-dump the semantics, not just the names
+- What happened: while building the sync-health dashboard (PR #23), a live /metrics capture
+  showed `cdc_sync_latency_seconds` records RAW NANOSECONDS into seconds-bounded buckets —
+  every sample lands in `+Inf`, so `histogram_quantile()` over it returns `+Inf` and the
+  EXISTING dashboard's sync-latency percentile panels have been silently broken. The comment
+  in `chart/files/connect/observability.yaml` (and INV-2's reading of it) claims the exporter
+  divides timing values by 1e9; the same-process dump proved that division applies only to
+  Connect's internally-timed metrics (`output_latency_ns` buckets populate in seconds),
+  never to user-supplied `metric` processor `type: timing` values. Also: every metric in
+  this build (custom and built-in) carries extra `path`/`label` labels that queries must
+  aggregate away, and built-in `output_error` series exist at DIFFERENT `path` values per
+  render (`root.output` sharded vs `root.output.fallback.*` non-sharded) — a job-only
+  matcher double-counts.
+- Rule that would have prevented it: extends 2026-07-13 ("verify a metric's actual series
+  shape") — before writing any dashboard/alert query, dump the live series from the real
+  image and verify VALUES/UNITS and label sets, not just that the name exists; treat
+  config comments about exporter behavior as unverified claims.
+- Applied: PR #23 dashboard uses latency-calculator gauges for percentiles and a
+  `_sum/_count / 1e9` mean for the histogram (quirk documented on-panel); the emission bug
+  itself is flagged in the PR for an owner decision (fix touches INV-2-guarded pipeline
+  lines and needs L3). Recorded only — no rule file change.
+
 ## 2026-07-16 — A "Codex" review dispatch can silently execute on Claude; verify the provider before trusting cross-model coverage
 - What happened: the DLQ-port quality review was dispatched to the `codex:codex-rescue`
   Agent type per the provider-routing rule, but the reviewer disclosed it actually ran as
