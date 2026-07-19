@@ -7,7 +7,10 @@ group — byte-identical to the pre-D3 chart). The verbs are exactly what client
 LeaseLock needs: get/create the Lease, then watch/update/patch it to renew.
 */}}
 {{- if .Values.rbac.enabled }}
-{{- $sas := list (dict "app" "connect-source" "base" "connect-source-elector") -}}
+{{- $sas := list -}}
+{{- if .Values.connect.source.enabled -}}
+{{- $sas = append $sas (dict "app" "connect-source" "base" "connect-source-elector") -}}
+{{- end -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) -}}
 {{- if $g.enabled -}}
 {{- $sas = append $sas (dict "app" $g.appLabel "base" $g.saBase) -}}
