@@ -411,10 +411,12 @@ pipeline:
 output:
 {{- if .Values.connect.deadLetter.enabled }}
   # DLQ enabled: applied messages -> drop (ack). Permanent poison (dlq==yes) ->
-  # publish to <deadLetter.subject>.<reason> on the same stream, THEN ack (the
-  # nats_jetstream send is the write; a send failure surfaces as an output error so
-  # reject_errored nacks -> retry = write-then-ack, INV-1 preserved). Transient apply
-  # failures still error -> reject_errored -> nack -> redelivery.
+  # publish to the computed DLQ root .<reason> on the same stream, THEN ack. The DLQ
+  # root is rrcs.nats.dlqRoot: legacy out-of-prefix <deadLetter.subject> (e.g. dlq.cdc)
+  # or, when connect.deadLetter.segment is set, in-prefix <subjectPrefix>.<segment>
+  # (e.g. kv.cdc.dlq). The nats_jetstream send is the write; a send failure surfaces
+  # as an output error so reject_errored nacks -> retry = write-then-ack, INV-1
+  # preserved. Transient apply failures still error -> reject_errored -> nack -> redelivery.
   reject_errored:
     switch:
       cases:
@@ -426,16 +428,17 @@ output:
                 - "{{ include "rrcs.nats.url" . }}"
               auth:
                 user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
-              subject: '{{ .Values.connect.deadLetter.subject }}.${! meta("dlq_reason") }'
+              subject: '{{ include "rrcs.nats.dlqRoot" . }}.${! meta("dlq_reason") }'
               headers:
                 # "dlq." prefix is LOAD-BEARING: JetStream msg-id dedup is
-                # STREAM-wide, and the original kv.cdc.* publish already used
-                # event_id as ITS Nats-Msg-Id on this same stream. Reusing it bare
-                # would dedupe the DLQ publish against the original within the
-                # dupeWindow -> PubAck{duplicate} -> ack -> NOTHING PARKED (silent
-                # INV-1 hole). The prefix keeps the id deterministic (a redelivered
-                # poison that re-publishes to the DLQ still dedupes against its own
-                # earlier DLQ publish) while staying disjoint from the original.
+                # STREAM-wide, and the original normal publish (kv.cdc.<op>, or
+                # kv.cdc.<normalSegment>.<op> in segment mode) already used event_id
+                # as ITS Nats-Msg-Id on this same stream. Reusing it bare would dedupe
+                # the DLQ publish against the original within the dupeWindow ->
+                # PubAck{duplicate} -> ack -> NOTHING PARKED (silent INV-1 hole). The
+                # prefix keeps the id deterministic (a redelivered poison that
+                # re-publishes to the DLQ still dedupes against its own earlier DLQ
+                # publish) while staying disjoint from the original.
                 Nats-Msg-Id: dlq.${! meta("event_id") }
                 dlq_reason: ${! meta("dlq_reason") }
                 dlq_error: ${! meta("dlq_error") }

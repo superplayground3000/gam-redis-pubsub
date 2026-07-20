@@ -1,0 +1,1 @@
+由於外部nats stream的subject prefix 已經固定為: "kv.cdc"，如果要讓connect的dead letter queue 與一般訊息共用stream，必須要用subject prefix把兩邊分開，尤其是allinone的情境下。以目前values.yaml裡面的的nats.stream.subjectPrefix: "kv.cdc" 為例，正常訊息必須在kv.cdc.aio.>，異常訊息必須在kv.cdc.dlq.>，"aio", "dlq"必須是customizable。

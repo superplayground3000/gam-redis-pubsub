@@ -13,7 +13,40 @@ Stream/durable/subject prefix bound into the user JWT permissions:
 - Durable:        cdc_sink
 - Subject prefix: kv.cdc  (publisher --allow-pub kv.cdc.>)
 
-To rotate or change stream/durable/prefix: rerun with --force.
+## DLQ pub grants (subscriber) — superset of BOTH layouts
+
+The sink parks permanently-unprocessable messages using the **subscriber** creds
+(there is no separate DLQ-publisher identity). There are two mutually-exclusive DLQ
+layouts, and this committed creds set is minted to serve **both** so one fixture
+works whether an install runs in legacy or in-prefix mode (kind e2e always
+fresh-installs; only the sink publishes DLQ, so the broader grant is harmless):
+
+- legacy out-of-prefix root:  `dlq.cdc.>`   (connect.deadLetter.subject)
+- in-prefix root:             `kv.cdc.dlq.>`  (<subjectPrefix>.<segment>, segment defaults to "dlq")
+
+Active DLQ root for this render: `dlq.cdc`.
+
+The **publisher** grant is `kv.cdc.>`. In in-prefix mode this wildcard
+now incidentally covers the DLQ subtree `kv.cdc.dlq.>` as well. That is
+an accepted least-privilege wart: the source (publisher) never parks DLQ messages,
+so the extra reach is unused, and narrowing it would require splitting the fixed
+external prefix that the whole design deliberately keeps as a single `kv.cdc.>`
+binding.
+
+## R3 — never swap regenerated creds onto an existing release
+
+Rerunning `scripts/gen-nats-auth.sh --force` rotates the **operator and account
+identities**, not just the grants. Redeploying the regenerated creds in-place onto a
+release that was installed with the previous identities orphans that release's
+existing `KV_CDC` stream/consumer state (the server no longer trusts the old
+account). Any regeneration therefore requires a **fresh NATS** — a new install or a
+new namespace — never an in-place swap on a live release. See the CAUTION block at
+`chart/values.yaml` connect.deadLetter (the "operator and account identities" note)
+for the same warning on the values side.
+
+To rotate or change stream/durable/prefix/DLQ segment: rerun with --force
+(subject to the R3 fresh-NATS requirement above). Use `--dry-run` to preview the
+resolved config and DLQ grants without invoking nsc.
 
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets

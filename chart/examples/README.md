@@ -71,6 +71,37 @@ carry the publish grant, and which Grafana panel confirms parking.
   note inside the example for how to read a stuck DLQ.
 - **Full operator/maintainer guide:** `docs/dlq.md` (rationale, rollout incl. the
   pre-2026-07-16 creds caution, failure modes, and per-claim source citations).
+- **In-prefix alternative:** if your stream prefix is externally fixed and the DLQ
+  cannot live outside it, see `values-shared-prefix-aio.yaml` below.
+
+### `values-shared-prefix-aio.yaml` — opt-in shared-prefix segment layout (in-prefix DLQ)
+
+The PROD-shaped alternative to `values-dlq.yaml` for the one case the default
+out-of-prefix DLQ cannot serve: a JetStream stream whose subject prefix is
+externally FIXED at `kv.cdc` (bound `kv.cdc.>`, not re-bindable), where a DLQ at
+`dlq.cdc.>` is unbindable. It separates normal and dead-letter traffic on the
+*second* subject segment instead — normal `kv.cdc.aio.<op>`, DLQ
+`kv.cdc.dlq.<reason>`, stream binding unchanged at `kv.cdc.>` — via
+`nats.stream.normalSegment` + `connect.deadLetter.segment`, composed with the
+all-in-one sink preset. The default out-of-prefix layout stays the default; this is
+opt-in. Shows the render guards (N1–N6), the two-phase zero-loss migration from a
+legacy install, and the external-NATS operator step (edit the durable filter,
+because the external init job never mutates user-owned consumers).
+
+- **Try it (bundled NATS):**
+  ```bash
+  helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
+    -f chart/examples/values-shared-prefix-aio.yaml
+  ```
+- **Render check (L1, seconds):**
+  ```bash
+  helm template chart/ -f chart/examples/values-shared-prefix-aio.yaml >/dev/null
+  ```
+- **Proven by (L3 kind e2e):** the parameterised `scripts/verify-dlq-e2e.sh` run in
+  segment mode (`normalSegment=aio` / `segment=dlq`) — poison on
+  `kv.cdc.dlq.<reason>`, normal traffic on `kv.cdc.aio.*`, sink filter `kv.cdc.aio.>`.
+- **Full guide:** `docs/dlq.md` §10 and
+  `docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md`.
 
 ## Untested / unsupported combinations
 

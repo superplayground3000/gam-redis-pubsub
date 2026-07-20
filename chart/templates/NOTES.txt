@@ -5,7 +5,7 @@ leader election on BOTH connect legs (active/standby) and a pre-created NATS
 JetStream PULL consumer.
 
 Profile           : {{ .Values.profile }}
-NATS stream       : {{ .Values.nats.stream.name }}  subjects {{ .Values.nats.stream.subjectPrefix }}.>
+NATS stream       : {{ .Values.nats.stream.name }}  normal subjects {{ .Values.nats.stream.subjectPrefix }}{{ with .Values.nats.stream.normalSegment }}.{{ . }}{{ end }}.> (stream binds {{ include "rrcs.nats.stream.subjects" . }})
 Pull consumer     : {{ .Values.nats.stream.consumer.durable }}  (bind:true; created by the nats-init Job)
 Dedup window      : {{ .Values.nats.stream.dupeWindow }}  (Nats-Msg-Id = event_id)
 

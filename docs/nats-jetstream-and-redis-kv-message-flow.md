@@ -136,6 +136,35 @@ The subject pattern is *derived in one place* from `nats.stream.subjectPrefix: "
 (Helm helper `rrcs.nats.stream.subjects` → `printf "%s.>"`), so the bound subjects, the
 publish subject, and the publisher's grant can't drift apart.
 
+### Segment mode — an optional extra subject segment (default OFF)
+
+Everything above describes the **default layout**, which is what ships unless you opt in:
+normal ops land directly under the prefix as `kv.cdc.<op>`, and the DLQ (when enabled)
+lives *outside* the prefix at `dlq.cdc.<reason>`. This is the layout every example and lab
+in this repo exercises, and it is byte-identical to the pre-change chart.
+
+An opt-in **segment mode** inserts a second, fixed subject segment under the prefix so that
+normal and DLQ traffic can share one externally-fixed prefix (e.g. a PROD stream whose
+binding is pinned at `kv.cdc.>`). It is enabled with `nats.stream.normalSegment` (and, for
+the DLQ, `connect.deadLetter.segment`); leaving both empty keeps the default layout. When
+set, the subject grammar shifts by one segment:
+
+| | Default layout (unchanged) | Segment mode (`normalSegment: aio`, `deadLetter.segment: dlq`) |
+|---|---|---|
+| Normal publish | `kv.cdc.<op>` | `kv.cdc.aio.<op>` |
+| DLQ publish | `dlq.cdc.<reason>` (outside the prefix) | `kv.cdc.dlq.<reason>` (inside the prefix) |
+| Stream binding | `kv.cdc.>` (+ `dlq.cdc.>` when DLQ on) | `kv.cdc.>` alone — the segments are already under it |
+| Sink filter | `kv.cdc.>` | `kv.cdc.aio.>` |
+
+The two segments must differ (`aio ≠ dlq`), which is what keeps the whole-stream sink filter
+from re-consuming its own dead letters — in the default layout that disjointness is
+structural (the DLQ is physically outside the filter's universe); in segment mode it is a
+render-time guard. The full opt-in schema, render guards, and the two-phase migration
+runbook are documented in `docs/dlq.md` and
+`docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md`. The rest of this
+document traces the **default** layout; read `kv.cdc.<op>` as `kv.cdc.<normalSegment>.<op>`
+wherever segment mode is in effect.
+
 ---
 
 ## 3. SOURCE: how `cdc-forward.yaml` forms the JetStream message
