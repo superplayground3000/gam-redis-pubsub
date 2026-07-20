@@ -20,9 +20,12 @@ table says, search the repo for the quoted key before concluding the table is wr
 
 ## INV-1 — At-least-once delivery, source and sink, in Kubernetes
 
-**Statement:** Every message XADDed to the central Redis stream is applied to the region Redis
-at least once, provided the Redis stream and NATS JetStream themselves are not corrupted.
-Duplicates are allowed (absorbed by idempotency); loss is not.
+**Statement:** Every *valid* message XADDed to the central Redis stream is applied to the region
+Redis at least once, provided the Redis stream and NATS JetStream themselves are not corrupted.
+Duplicates are allowed (absorbed by idempotency); loss is not. **Malformed (unprocessable)
+messages are exempt:** when `connect.deadLetter.enabled`, a malformed message is parked on the
+dead-letter subject with a confirmed PubAck instead of being applied (owner-approved 2026-07-20,
+docs/superpowers/plans/2026-07-20-all-in-one-sink-group.md).
 
 ### Load-bearing lines (do not change without running L3, and L4 where marked)
 
@@ -41,6 +44,7 @@ Duplicates are allowed (absorbed by idempotency); loss is not.
 | 11 | `chart/files/connect/cdc-forward.yaml` | The output `fallback`'s failure child stays `reject` (nack → replay). Never `drop` or any child that succeeds without a JetStream PubAck. **Sharded render exception (subject-sharding v2, owner-approved 2026-07-15):** when `connect.sharding.families` is configured the fallback is REMOVED BY DESIGN — the output is a bare `nats_jetstream` with `max_in_flight: 1` that blocks and retries in place (a forward nack would PEL-replay an older event after newer ones already published → silent reorder, which v2 cannot detect without a fence). Write-then-XACK is unchanged: no PubAck ⇒ no ack. Do NOT re-add a reject path to the sharded variant, and do NOT remove the fallback from the non-sharded render | The fallback child runs when the publish failed; anything that "succeeds" there would XACK entries that never reached JetStream — silent loss. It exists only to count (`cdc_forward_publish_failed`) and nack |
 | 13 | `chart/files/connect/cdc-forward.yaml`, `chart/files/connect/cdc-reverse-sharded.yaml`, `chart/templates/_helpers.tpl` | Sharded render (v2 ordering chain O-3..O-7): forward `pipeline.threads: 1` + `max_in_flight: 1`; sink broker `copies: 1` + `pipeline.threads: 1`; every shard durable `max_ack_pending: 1` (hard-coded in the helper's consumers list, never the values inheritance chain). **Loosening ANY of these silently reintroduces old-overwrites-new and no metric can detect it** (`docs/design/subject-sharding/design.md` §3) — L3 `RUN_SHARDING=1` + L4 sharding scripts required if touched | v2 removed the LWW fence; per-key apply order IS the correctness mechanism |
 | 12 | `chart/templates/connect-source.yaml`, `chart/templates/connect-sink.yaml` | Pod template keeps the `checksum/connect-config` annotation over the connect ConfigMaps | The elector POSTs the pipeline only when it wins the Lease; without the checksum-triggered rollout, a helm upgrade that edits a pipeline never reaches the running leg — you verify stale config (bit this repo on 2026-07-05, `rules/50-lessons.md`) |
+| 14 | `chart/files/connect/cdc-reverse.yaml` | DLQ path (when `connect.deadLetter.enabled`) stays publish-to-DLQ-then-ack: under `reject_errored`, permanent poison (`meta("dlq")=="yes"`) is published to `<deadLetter.subject>.<reason>` with header `Nats-Msg-Id: dlq.${event_id}`, and only then acked; a DLQ send failure surfaces as an output error → `reject_errored` nacks → redelivery (`cdc-reverse.yaml:418-444`) | Parking must never ack a message whose park was not durably confirmed; the `dlq.` msg-id prefix keeps a redelivered poison deduping against its own earlier DLQ publish, never against the original `kv.cdc.*` publish (which would PubAck{duplicate} → ack → nothing parked — a silent INV-1 hole) |
 
 ### How to verify
 
@@ -83,6 +87,7 @@ dashboard in the same change.
 | `chart/templates/observability/servicemonitor.yaml` | Selects connect legs + writer + latency-calculator (`http` endpoint) and the elector sidecars (`elector` endpoint, port 8090 on the connect Services) |
 | `chart/files/grafana/cdc-dashboard.json` | Panels exist for: apply throughput, unprocessable activity, unprocessable-by-reason, processor errors, forward-leg publish failures, Connect latency p50/p95/p99, end-to-end latency percentiles, sync latency p50/p95/p99 by group, sync clock-skew negatives, writer throughput/errors, elector leadership. **If you add a metric, add/extend a panel in the same change.** |
 | `chart/files/prometheus/cdc-alerts.yaml` | `CDCUnprocessableMessages` alert; its `increase[...]` window must stay ≥ 2× `nats.stream.consumer.ackWait` (redelivery cadence coupling — documented in the rule file header) |
+| `chart/files/prometheus/cdc-alerts.yaml` | `CDCDeadLetterPublishFailing` alert fires on `output_error{label="dlq_out"} > 0` (DLQ publish failing → poison nack-loops instead of parking; the same failed-attempt series behind dashboard panel 18). Sink-leg scoped (`job=~".*connect-sink.*"`); shares the same `increase[...]` window ≥ 2× `ackWait` coupling as `CDCUnprocessableMessages` |
 | `chart/templates/observability/*` | ServiceMonitor/PrometheusRule/dashboard ConfigMap render when `observability.enabled=true` |
 | `internal/writer/http.go`, `internal/elector/main.go` | Writer counters (`cdc_writer_errors_total` etc., exposed in `http.go`) and elector counters (`elector_leading`, `elector_post_total`, `elector_delete_total`) keep existing names — dashboards/reports reference them by name |
 

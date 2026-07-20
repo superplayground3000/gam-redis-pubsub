@@ -197,6 +197,56 @@ connect:
     # Keep the default unless you have a naming convention that also stays clear
     # of the kv.cdc.* space.
     subject: "dlq.cdc"
+  # ── All-in-one sink (validating preset) ──────────────────────────────────────
+  # A single named switch for the topology "ONE consumer drains the entire stream
+  # (kv.cdc.>) and any message it can never apply is parked to the DLQ
+  # (dlq.cdc.<reason>, same stream) instead of redelivering forever." That is
+  # already the DEFAULT single-sink shape — this preset just makes the intent
+  # explicit and ASSERTS it, so a later edit cannot quietly drift away from it.
+  #
+  # It adds no new pipeline, deployment, durable, stream, or DLQ code path. It is
+  # a render-time alias that REQUIRES the all-in-one topology and fails loud on
+  # any contradiction:
+  # - deadLetter.enabled MUST be true (G1). All-in-one is a single whole-stream
+  #   consumer, so it has ONE ack floor for every key family — the DLQ is what
+  #   keeps a poison message from head-of-line-blocking the whole stream forever
+  #   (see the deadLetter block above). Requiring it here (rather than forcing it
+  #   on) keeps deadLetter.enabled the sole DLQ source of truth.
+  # - connect.sinkGroups MUST be empty (G2). All-in-one OWNS the whole stream; any
+  #   explicit prefix-routed group would re-consume subjects it already drains
+  #   (double delivery).
+  # - connect.sharding.families MUST be empty (G3). Sharding is the opposite of
+  #   one-consumer-drains-all, and the sharded sink has no DLQ routing — the same
+  #   reason the DLQ itself is excluded with sharding.
+  #
+  # DLQ drain SLA: parked messages share the stream's retention (--retention
+  # limits --discard old; lab default nats.stream.maxAge = 1h, PROD external NATS
+  # = 72h). A parked message not drained within that window is discarded — this is
+  # an accepted operational bound (owner ruling 2026-07-20), not a bug. Drain
+  # dlq.cdc.> within the stream max-age.
+  #
+  # EXTERNAL NATS (the PROD case): the external nats-init variant does NOT
+  # reconcile external streams — it only ASSERTS that the stream binds the
+  # expected subjects and fails loud otherwise. So before enabling this on
+  # external NATS, the operator must add dlq.cdc.> to the external stream's
+  # subject binding; otherwise the init job fails (correctly) at install time.
+  #
+  # MIGRATION from a prefix-routed install (collapsing sinkGroups into all-in-one):
+  # the non-sharded orphan prune deletes the per-prefix cdc_sink_<name> durables
+  # UNCONDITIONALLY (no drain gate), and messages are only loss-free if every
+  # un-applied message is still retained on the stream when the fresh cdc_sink
+  # (--deliver all) re-scans — the stream max-age is that window. So: (1) quiesce
+  # the forward leg / stop the writer, (2) wait until every per-prefix durable
+  # reports num_pending=0 and num_ack_pending=0
+  # (nats consumer info KV_CDC cdc_sink_<name> --json), (3) helm upgrade to
+  # all-in-one, (4) verify cdc_sink's ack floor advances (expect an idempotent
+  # redelivery burst), (5) resume the writer. A fresh/default install needs none
+  # of this — enabling all-in-one there is rolling and byte-stable on the sink.
+  #
+  # Safe default: DISABLED — the render stays byte-identical to today.
+  # Worked example: chart/examples/values-all-in-one.yaml.
+  sinkAllInOne:
+    enabled: false
   source:
     # Render the forward (source) leg at all: Deployment, headless Service, and
     # its pipeline ConfigMap. Disabling stops central→NATS propagation entirely

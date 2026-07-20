@@ -184,6 +184,36 @@ for d in yaml.safe_load_all(sys.stdin):
 else
   echo "[run-all-tests] L1: WARNING — enabled-pipeline connect-lint + guard behavioral test SKIPPED (DLQ_RUNTIME_CHECKS=optional; the DLQ-enabled render is UNVERIFIED in this run)"
 fi
+# --- all-in-one sink preset (connect.sinkAllInOne) render checks ---
+# The preset is a validating alias, not a new pipeline: it fails the render on any
+# topology that contradicts "one consumer drains the whole stream, poison parked to
+# the DLQ" (guard rrcs.connect.validateAllInOne, _helpers.tpl). G2/G3 set
+# deadLetter.enabled=true on purpose so the failing guard is the one under test and
+# not G1 masking it.
+# G1: all-in-one alone (DLQ off) must fail-loud.
+if helm template chart/ --set connect.sinkAllInOne.enabled=true >/dev/null 2>&1; then
+  echo "L1: all-in-one without deadLetter.enabled must fail-loud (G1)"; fail L1
+fi
+# G2: all-in-one + an explicit prefixed sinkGroup double-consumes the stream — fail-loud.
+if helm template chart/ --set connect.sinkAllInOne.enabled=true --set connect.deadLetter.enabled=true \
+     --set connect.sinkGroups[0].name=a --set connect.sinkGroups[0].prefixes[0]=prefix-a >/dev/null 2>&1; then
+  echo "L1: all-in-one with an explicit sinkGroup must fail-loud (G2)"; fail L1
+fi
+# G3: all-in-one + a subject-sharding family is an unsupported mix — fail-loud.
+if helm template chart/ --set connect.sinkAllInOne.enabled=true --set connect.deadLetter.enabled=true \
+     --set 'connect.sharding.families.lp:m2g.shards=2' >/dev/null 2>&1; then
+  echo "L1: all-in-one with a sharding family must fail-loud (G3)"; fail L1
+fi
+# Happy path: all-in-one + deadLetter renders the default single-sink topology —
+# exactly one whole-stream durable cdc_sink and the DLQ-extended stream subjects.
+AIO_OUT=$(helm template chart/ --set connect.sinkAllInOne.enabled=true --set connect.deadLetter.enabled=true) || fail L1
+AIO_DURABLES=$(grep -c 'durable: "cdc_sink"' <<<"$AIO_OUT")
+[ "$AIO_DURABLES" = 1 ] \
+  || { echo "L1: all-in-one must render exactly one durable cdc_sink (got $AIO_DURABLES)"; fail L1; }
+grep -qF 'kv.cdc.>,dlq.cdc.>' <<<"$AIO_OUT" \
+  || { echo "L1: all-in-one must extend stream subjects to kv.cdc.>,dlq.cdc.>"; fail L1; }
+# The shipped example must render.
+helm template chart/ -f chart/examples/values-all-in-one.yaml >/dev/null || fail L1
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
