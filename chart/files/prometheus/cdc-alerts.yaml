@@ -45,6 +45,42 @@ groups:
             maxDeliver=-1 these redeliver until removed. Inspect the JetStream durable
             consumer and the poison message. The alert clears ~2m after the last
             redelivery once the poison is cleared.
+      # DLQ publish is failing: the sink is trying to PARK poison
+      # (output_error{label=dlq_out}, the failed-attempt counter behind dashboard
+      # panel 18) instead of confirming a PubAck. "Parked" is untrue while this
+      # fires — each failed DLQ publish nacks the ORIGINAL, so the poison keeps
+      # redelivering (nack-loop) rather than landing on dlq.cdc.<reason>. Almost
+      # always a config gap: the subscriber creds lack the pub grant on dlq.cdc.>
+      # (gen-nats-auth.sh --force, commit creds, redeploy), or on an EXTERNAL NATS
+      # the stream never bound dlq.cdc.> as a subject. Only meaningful with
+      # connect.deadLetter.enabled (the metric is 0/absent otherwise).
+      #
+      # WINDOW: [2m], same >= 2x ackWait coupling as CDCUnprocessableMessages above
+      # — a failed DLQ publish nacks the original, which redelivers once per ackWait
+      # and re-increments output_error{dlq_out}, so a sub-cadence window would flap
+      # in the redelivery gaps. Scoped to the sink leg (job=~".*connect-sink.*") to
+      # match panel 18; critical because the DLQ safety mechanism itself is broken
+      # and will not self-heal without an operator fix (fail-safe: no loss, the
+      # poison nacks rather than being dropped). METRIC NAME: output_error scrapes
+      # as output_error or _total; the full-string __name__ regex matches both.
+      - alert: CDCDeadLetterPublishFailing
+        expr: |
+          sum by (namespace, job) (
+            increase({__name__=~"output_error(_total)?", label="dlq_out", job=~".*connect-sink.*"}[2m])
+          ) > 0
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "CDC dead-letter publish is failing (poison nack-looping, not parked)"
+          description: >-
+            The CDC sink in namespace {{ $labels.namespace }} (job {{ $labels.job }})
+            is failing to publish poison messages to the dead-letter subject — each
+            failed publish nacks the original, so the poison keeps redelivering
+            instead of parking on dlq.cdc.<reason>. Most commonly the subscriber
+            creds lack the pub grant on dlq.cdc.> (gen-nats-auth.sh --force, commit
+            creds, redeploy), or on an external NATS the stream is not bound to
+            dlq.cdc.>. Fail-safe (no loss), but the DLQ is inert until fixed.
       # Forward-leg routing miss (first-two-seg routing). Fires when an event
       # ends up PARKED on kv.cdc.others.<op> with nothing consuming it:
       # reason=empty_prefix (no derivable key segment — malformed event) or

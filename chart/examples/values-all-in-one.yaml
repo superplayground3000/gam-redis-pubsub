@@ -1,0 +1,118 @@
+# Example values for the all-in-one sink preset (connect.sinkAllInOne).
+#
+# What this shows:
+#   - How to enable the all-in-one topology with the two toggles it requires.
+#   - What the preset asserts, and why each assertion exists.
+#   - The retention/drain expectation that comes with parking poison.
+#   - The extra step external-NATS operators must take first.
+#   - The exact command that proves the whole thing end-to-end.
+#
+# What "all-in-one" is:
+#   ONE sink consumer drains the ENTIRE stream (kv.cdc.>), and any message it can
+#   never apply — a "poison" message — is parked to the dead-letter subject
+#   (dlq.cdc.<reason>, same JetStream stream) and then acked, instead of nacking
+#   and redelivering forever. This is already the chart's DEFAULT single-sink
+#   shape (empty connect.sinkGroups synthesises exactly one whole-stream group
+#   "default", durable cdc_sink); this preset just names that intent and ASSERTS
+#   it at render time, so a later values edit cannot quietly drift away from it.
+#   It introduces NO new pipeline, deployment, durable, stream, or DLQ code path.
+#
+# Why the DLQ is mandatory here (not optional as in values-dlq.yaml):
+#   A single whole-stream consumer holds ONE ack floor for every key family. With
+#   maxDeliver: -1 (redeliver forever — required by at-least-once) a single poison
+#   message would sit at that floor and head-of-line-block every newer message
+#   behind it, for every key, indefinitely. The DLQ breaks that loop: poison is
+#   re-published to dlq.cdc.<reason> on the SAME stream and THEN acked
+#   (write-then-ack), so the ack floor advances and healthy traffic keeps flowing
+#   while the poison is preserved for inspection (INV-1, no loss). So enabling
+#   all-in-one REQUIRES connect.deadLetter.enabled=true — the render fails loud
+#   otherwise.
+#
+# Install example (bundled NATS, fresh namespace):
+#   helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
+#     -f chart/examples/values-all-in-one.yaml
+#
+# Prove it works end-to-end in kind (~5 min):
+#   scripts/build-images.sh --kind --kind-name=cdc
+#   RRCS_NS=cdc-dlq RRCS_RELEASE=cdc-dlq scripts/verify-dlq-e2e.sh
+#   verify-dlq-e2e.sh already exercises exactly this topology (whole-stream
+#   cdc_sink + DLQ): exit 0 = poison parked, ack floor advanced, no redelivery
+#   loop, and a normal message injected afterward still reaches region Redis.
+
+connect:
+  # The two toggles the preset requires. Both must be true together; enabling
+  # sinkAllInOne without the DLQ fails the render on purpose (see above).
+  sinkAllInOne:
+    enabled: true
+  deadLetter:
+    # Required by sinkAllInOne. Leave the subject at its default unless you have a
+    # naming convention that also stays disjoint from nats.stream.subjectPrefix
+    # (kv.cdc.*) — an overlapping DLQ subject would be re-consumed by the
+    # whole-stream sink and loop, which the render also guards against.
+    enabled: true
+    subject: "dlq.cdc"
+
+# ── What the preset asserts (all fail-loud at render) ────────────────────────
+#
+# With connect.sinkAllInOne.enabled=true the chart FAILS to render if any of
+# these is violated, each with a message pointing at the fix:
+#   - connect.deadLetter.enabled is not true (G1) — the DLQ is mandatory here.
+#   - connect.sinkGroups is non-empty (G2) — all-in-one owns the whole stream, so
+#     an explicit prefix-routed group would double-consume subjects it already
+#     drains. Use all-in-one OR chart/examples/values-dlq.yaml with sinkGroups,
+#     not both.
+#   - connect.sharding.families is set (G3) — sharding is the opposite of
+#     one-consumer-drains-all, and the sharded sink has no DLQ routing (the same
+#     reason the DLQ is already excluded with sharding). Use all-in-one OR
+#     chart/examples/values-sharding.yaml, never both.
+
+# ── Retention / drain expectation ────────────────────────────────────────────
+#
+# Parked messages share the JetStream stream's retention (--retention limits
+# --discard old). The lab default is nats.stream.maxAge = 1h; the PROD external
+# NATS is configured with 72h. A parked message not drained within that window is
+# discarded. This is an accepted operational bound (owner ruling 2026-07-20), not
+# a defect — so treat "drain dlq.cdc.> within the stream max-age" as the DLQ SLA.
+# There is no automated DLQ consumer yet; inspecting/replaying parked poison is a
+# manual operational step (see chart/examples/values-dlq.yaml and docs/dlq.md).
+
+# ── External NATS: one extra step before enabling ────────────────────────────
+#
+# If you run EXTERNAL NATS (nats.external.enabled=true), the external nats-init
+# variant does NOT reconcile the stream — it only ASSERTS that the stream binds
+# the expected subjects and fails loud otherwise. So you MUST add dlq.cdc.> to the
+# external stream's subject binding BEFORE enabling this preset, or the init job
+# will (correctly) fail at install time. The subscriber creds must also grant pub
+# on dlq.cdc.> — see the credentials notes in chart/examples/values-dlq.yaml.
+
+# ── How to confirm it is working (observability, INV-2) ──────────────────────
+#
+# Same signals as the DLQ example: Grafana panel 18 "DLQ: routed vs confirmed
+# parked". HEALTHY looks like routed == confirmed parked with publish failures at
+# 0. If "routed" climbs while "confirmed parked" stays flat, DLQ publishes are
+# failing (most often a missing dlq.cdc.> pub grant on the subscriber creds, or —
+# on external NATS — the stream not bound to dlq.cdc.>) and poison is STILL
+# looping. The CDCDeadLetterPublishFailing alert pages on output_error for the DLQ
+# output for exactly this case.
+
+# ── Migration from a prefix-routed install (topology collapse) ───────────────
+#
+# Collapsing an existing prefix-routed install (non-empty connect.sinkGroups) into
+# all-in-one deletes the per-prefix cdc_sink_<name> durables. The non-sharded
+# orphan prune does this UNCONDITIONALLY (no drain gate), and messages are only
+# loss-free if every un-applied message is still retained on the stream when the
+# fresh cdc_sink (--deliver all) re-scans — the stream max-age is that window.
+# Follow this runbook, do NOT just flip the flags on a busy install:
+#   1. Quiesce the forward leg / stop the writer.
+#   2. Wait until every per-prefix durable is fully drained:
+#        nats consumer info KV_CDC cdc_sink_<name> --json \
+#          | jq '{p:.num_pending,a:.num_ack_pending}'
+#      must read {p:0,a:0} for every group.
+#   3. helm upgrade to this file (sinkGroups removed, both flags on). The prune now
+#      removes only empty durables; the fresh cdc_sink re-scans (expect an
+#      idempotent redelivery burst — rename is EXISTS-guarded, INV-1).
+#   4. Verify cdc_sink's ack floor advances; run scripts/verify-cdc.sh on the new
+#      topology.
+#   5. Resume the writer.
+# A fresh or default install needs none of this: enabling all-in-one there is
+# rolling and byte-stable on the sink side (same durable cdc_sink, same filter).

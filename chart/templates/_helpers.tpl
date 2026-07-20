@@ -283,6 +283,47 @@ prefix groups) is byte-identical to the pre-D3 <subjectPrefix>.<op>.
 {{- end -}}
 
 {{/*
+rrcs.connect.validateAllInOne — fail-loud guard for the all-in-one sink preset.
+connect.sinkAllInOne.enabled is a validating alias for "the default single-sink
+shape, made explicit and asserted": ONE consumer drains the whole stream and
+poison is parked to the DLQ instead of head-of-line-blocking forever. It adds no
+pipeline, durable, or DLQ code path — it only requires the topology that makes
+that intent true and fails the render on any contradiction. Invoked once from
+rrcs.connect.sinkGroups so every render path that builds groups is covered.
+Emits nothing on success. Usage: {{ include "rrcs.connect.validateAllInOne" . }}
+*/}}
+{{- define "rrcs.connect.validateAllInOne" -}}
+{{- $aio := .Values.connect.sinkAllInOne | default dict -}}
+{{- if $aio.enabled -}}
+{{- /* G1 — the DLQ is mandatory, not optional, under all-in-one. A single
+     whole-stream consumer has ONE ack floor for every key family, so without a
+     dead-letter escape the first poison message head-of-line-blocks the entire
+     stream forever (maxDeliver: -1). Requiring deadLetter.enabled here keeps it
+     the sole DLQ source of truth (no compound "effective enabled" flag repointed
+     across the INV-1 ack path in cdc-reverse.yaml). */ -}}
+{{-   $dl := .Values.connect.deadLetter | default dict -}}
+{{-   if not $dl.enabled -}}
+{{-     fail "connect.sinkAllInOne.enabled=true requires the DLQ: set connect.deadLetter.enabled=true. All-in-one is one consumer draining the whole stream, so it has a single ack floor for every key family — without a dead-letter escape the first message that can never apply (poison) redelivers forever (maxDeliver: -1) and head-of-line-blocks every message behind it. The DLQ parks poison to dlq.cdc.<reason> and acks, so the floor keeps advancing." -}}
+{{-   end -}}
+{{- /* G2 — all-in-one OWNS the whole stream (the synthesised "default" group,
+     filter kv.cdc.>). Any explicit sinkGroup contradicts that: a prefix-routed
+     group re-consumes subjects the whole-stream group already drains (double
+     delivery — the same class the whole-stream+prefix guard below rejects). */ -}}
+{{-   if gt (len ($.Values.connect.sinkGroups | default list)) 0 -}}
+{{-     fail (printf "connect.sinkAllInOne.enabled=true owns the whole stream (the synthesised \"default\" group, filter %s.>) — it cannot be combined with explicit connect.sinkGroups (%d configured). Any prefix-routed group would re-consume subjects the whole-stream consumer already drains (double delivery). Remove connect.sinkGroups, or turn all-in-one off and route by prefix instead." .Values.nats.stream.subjectPrefix (len ($.Values.connect.sinkGroups | default list))) -}}
+{{-   end -}}
+{{- /* G3 — sharding is the exact opposite of one-consumer-drains-all, and the
+     sharded sink pipeline has no DLQ routing (see the DLQ+sharding exclusion at
+     the top of rrcs.nats.stream.subjects). Keep them mutually exclusive; do not
+     build the DLQ into the sharded pipeline in this change. */ -}}
+{{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
+{{-   if gt (len $families) 0 -}}
+{{-     fail (printf "connect.sinkAllInOne.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set, %d configured) — all-in-one is one consumer draining the whole stream, the opposite of per-key sharding, and the sharded sink pipeline has no DLQ routing (same reason connect.deadLetter is already excluded with sharding). Disable one of them." (len $families)) -}}
+{{-   end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.connect.sinkGroups — normalized sink-group list (multi-subject support, D3).
 Emits a YAML array; consume it with fromYamlArray:
   {{- range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}
@@ -304,6 +345,7 @@ in this pass); the 57-char name budget.
 {{- define "rrcs.connect.sinkGroups" -}}
 {{- $root := . -}}
 {{- $v := .Values -}}
+{{- include "rrcs.connect.validateAllInOne" . -}}
 {{- $prefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
 {{- $defs := $v.connect.sinkDefaults | default dict -}}
 {{- $defLease := $defs.lease | default dict -}}
