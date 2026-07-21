@@ -999,6 +999,180 @@ existing CDCForwardUnrouted alert fires, unchanged).
 {{- ternary "true" "false" $any -}}
 {{- end -}}
 
+{{/*
+rrcs.connect.topologyManifest.json — the resolved publish taxonomy as a compact,
+deterministic JSON object, the SINGLE SOURCE OF TRUTH shared by the publisher's
+manifest WRITE and every sink's drift COMPARE (design §7 / E6). Rendering it once
+here means the two sides can never disagree on how the taxonomy is spelled.
+
+  {"families":{"lp:m2g":32},"normalSegment":"aio","prefixes":["tg.caveat"],"schema":1}
+
+  - schema:        wire-format version (bump if the shape changes).
+  - normalSegment: nats.stream.normalSegment (the second subject segment ALL normal
+                   traffic — and therefore every sink filter — shifts under).
+  - families:      { rawFamily: shardCount } from connect.sharding.families, keyed by
+                   the RAW colon family (same key the shardMap/routeMap use).
+  - prefixes:      sorted, de-duped subject tokens (':' -> '.') of every ENABLED
+                   PREFIXED, non-sharded sinkGroup — the disjoint first-two-seg routes
+                   that are NOT absorbed by the catch-all (design §3.3).
+
+No updatedAt/clock field: the manifest is a pure function of the taxonomy so both
+sides render byte-identical, and the NATS KV entry already carries a server-side
+revision + timestamp (nats kv history cdc_topology) for "when". toJson sorts map
+keys and the prefixes list is sortAlpha'd => deterministic render, stable checksum.
+Usage: {{ include "rrcs.connect.topologyManifest.json" $ }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.json" -}}
+{{- $seg := .Values.nats.stream.normalSegment | default "" -}}
+{{- $families := dict -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- range $fam, $fcfg := ($s.families | default dict) -}}
+{{-   $_ := set $families $fam (int $fcfg.shards) -}}
+{{- end -}}
+{{- $prefixSet := dict -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{-   if and $g.enabled $g.prefixed (not $g.sharded) -}}
+{{-     range $p := ($g.prefixes | default list) -}}
+{{-       $_ := set $prefixSet (replace ":" "." $p) true -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- $manifest := dict "schema" 1 "normalSegment" $seg "families" $families "prefixes" (keys $prefixSet | sortAlpha) -}}
+{{- $manifest | toJson -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.topologyManifest.writeScript — publisher-side shell fragment that
+PUBLISHES the resolved taxonomy to KV bucket cdc_topology, key "current" (design
+§7 / E6). Emits NOTHING unless nats.topologyManifest.enabled AND this release is
+publisher-shaped (connect.source.enabled) — so with the toggle off the init job
+renders byte-identical. Consumes $SERVER/$CREDS already defined by both init jobs.
+The `.bundled` arg selects bucket-creation policy: bundled mode CREATES the bucket
+if absent (the chart owns that NATS); external mode FAILS LOUD if it is missing
+(the bucket + the $KV.cdc_topology.> grant are user-provisioned — the chart never
+creates buckets on an external/user-owned NATS).
+Usage: {{ include "rrcs.connect.topologyManifest.writeScript" (dict "root" $ "bundled" true) }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.writeScript" -}}
+{{- $root := .root -}}
+{{- if and $root.Values.nats.topologyManifest.enabled $root.Values.connect.source.enabled }}
+
+              # ── Topology manifest publish (drift gate, design §7 / E6) ─────────
+              # This publisher owns the resolved taxonomy. Each sink init reads it
+              # and fails closed on drift: if the publisher's N (or normalSegment /
+              # prefixes) diverges from a sink's, that sink derives durables for a
+              # different subject set than the forward publishes to, so valid events
+              # park unconsumed until the 72h stream max-age SILENTLY discards them
+              # (VF-16). The manifest is the only cross-release seam that can catch it.
+              MANIFEST='{{ include "rrcs.connect.topologyManifest.json" $root }}'
+              if ! nats --server "$SERVER" --creds "$CREDS" kv info cdc_topology >/dev/null 2>&1; then
+              {{- if .bundled }}
+                echo "topology manifest: KV bucket cdc_topology absent — creating it (bundled NATS)"
+                nats --server "$SERVER" --creds "$CREDS" kv add cdc_topology --history 5 --replicas 1
+              {{- else }}
+                echo "ERROR: nats.topologyManifest.enabled=true but KV bucket 'cdc_topology' is not present on the external NATS (or the publisher creds lack \$KV.cdc_topology.>)." >&2
+                echo "Provision it once — 'nats kv add cdc_topology --history 5' — and grant \$KV.cdc_topology.> to the publisher + subscriber creds (gen-nats-auth.sh). The chart never creates buckets on a user-owned NATS." >&2
+                exit 1
+              {{- end }}
+              fi
+              echo "topology manifest: publishing cdc_topology/current = $MANIFEST"
+              printf '%s' "$MANIFEST" | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology current
+{{- end }}
+{{- end -}}
+
+{{/*
+rrcs.connect.topologyManifest.readScript — sink-side shell fragment that READS the
+publisher manifest (cdc_topology/current) and gates this release on it (design §7 /
+E6). Emits NOTHING unless nats.topologyManifest.enabled AND this release is
+sink-shaped (any enabled sinkGroup) — toggle off => byte-identical render. Consumes
+$SERVER/$CREDS/$STREAM from the enclosing init job.
+
+Compares ONLY the fields that affect THIS release's filters:
+  - normalSegment: ALWAYS (every sink filter shifts under it)
+  - families+N:    only when this release has shardsOf groups (shardingEnabled)
+  - prefixes:      only when this release has a prefixed (non-shard) group
+MISMATCH => fail closed ALWAYS. UNREADABLE (bucket/key gone or no $KV grant) =>
+fail closed on a FIRST install, fail OPEN (+ loud marker) on a redeploy so an
+emergency rollback is never blocked on the monitoring-adjacent bucket.
+
+First-install vs redeploy discriminator: the presence of THIS release's OWN
+durables on the stream. A durable IS the per-env ack floor, created by this same
+job below; if one already exists the env has been deployed before (redeploy),
+otherwise this is its first install. Ground truth on the stream itself — no
+external clock or side marker needed. The check runs BEFORE the create loop so it
+reflects PRIOR deploys, not this run.
+Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.readScript" -}}
+{{- if and .Values.nats.topologyManifest.enabled (eq (include "rrcs.connect.anySinkEnabled" .) "true") }}
+{{- $env := include "rrcs.envId" . -}}
+{{- $markerToken := ternary $env "default" (ne $env "") -}}
+{{- $hasPrefix := false -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if and $g.enabled $g.prefixed (not $g.sharded) -}}{{- $hasPrefix = true -}}{{- end -}}
+{{- end }}
+
+              # ── Topology manifest drift gate (sink side, design §7 / E6) ───────
+              EXPECTED_MANIFEST='{{ include "rrcs.connect.topologyManifest.json" . }}'
+              TM_SHARDED='{{ include "rrcs.connect.shardingEnabled" . }}'
+              TM_HAS_PREFIX='{{ ternary "true" "false" $hasPrefix }}'
+              TM_DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s " $c.durable }}{{ end }}{{ end }}{{ end }}'
+
+              # First install vs redeploy: does any of THIS release's durables already exist?
+              TM_REDEPLOY=0
+              for d in $TM_DESIRED_DURABLES; do
+                [ -z "$d" ] && continue
+                if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$d" >/dev/null 2>&1; then
+                  TM_REDEPLOY=1; break
+                fi
+              done
+
+              if nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology current --raw >/tmp/manifest.json 2>/dev/null; then
+                # Accumulate mismatches with literal \n escapes (a real newline here
+                # would terminate the YAML block scalar); render them with printf %b.
+                TM_MISMATCH=""
+                WANT_SEG=$(printf '%s' "$EXPECTED_MANIFEST" | jq -r '.normalSegment')
+                GOT_SEG=$(jq -r '.normalSegment // ""' /tmp/manifest.json)
+                [ "$WANT_SEG" != "$GOT_SEG" ] && TM_MISMATCH="${TM_MISMATCH}  normalSegment: sink=[$WANT_SEG] manifest=[$GOT_SEG]\n"
+                if [ "$TM_SHARDED" = "true" ]; then
+                  WANT_FAM=$(printf '%s' "$EXPECTED_MANIFEST" | jq -Sc '.families')
+                  GOT_FAM=$(jq -Sc '.families // {}' /tmp/manifest.json)
+                  [ "$WANT_FAM" != "$GOT_FAM" ] && TM_MISMATCH="${TM_MISMATCH}  families: sink=[$WANT_FAM] manifest=[$GOT_FAM]\n"
+                fi
+                if [ "$TM_HAS_PREFIX" = "true" ]; then
+                  WANT_PFX=$(printf '%s' "$EXPECTED_MANIFEST" | jq -Sc '.prefixes|sort')
+                  GOT_PFX=$(jq -Sc '(.prefixes // [])|sort' /tmp/manifest.json)
+                  [ "$WANT_PFX" != "$GOT_PFX" ] && TM_MISMATCH="${TM_MISMATCH}  prefixes: sink=[$WANT_PFX] manifest=[$GOT_PFX]\n"
+                fi
+                if [ -n "$TM_MISMATCH" ]; then
+                  echo "ERROR: topology DRIFT between this sink release and the publisher manifest (cdc_topology/current) — FAIL CLOSED:" >&2
+                  printf '%b' "$TM_MISMATCH" >&2
+                  echo "The publisher emits subjects this sink does not consume (or vice-versa) => valid messages park unconsumed until the 72h stream max-age silently discards them (VF-16). Reconcile connect.sharding.families / sinkGroup prefixes / nats.stream.normalSegment against the publisher, then redeploy." >&2
+                  exit 1
+                fi
+                echo "topology manifest: verified against publisher (normalSegment/families/prefixes match); proceeding."
+              elif [ "$TM_REDEPLOY" = 1 ]; then
+                echo "WARN: ================================================================" >&2
+                echo "WARN: CDCTopologyManifestUnverified — cdc_topology/current is UNREADABLE" >&2
+                echo "WARN:   (bucket/key missing or creds lack \$KV.cdc_topology.>) and this is a" >&2
+                echo "WARN:   REDEPLOY (this env's durables already exist) => proceeding FAIL-OPEN so" >&2
+                echo "WARN:   an emergency rollback is never blocked on the manifest bucket." >&2
+                echo "WARN:   The drift gate did NOT run: if the publisher taxonomy changed, this sink" >&2
+                echo "WARN:   may now be silently mis-consuming. Restore the manifest and re-verify." >&2
+                echo "WARN: ================================================================" >&2
+                # Best-effort durable marker an operator / DLQ-drain runbook can see
+                # (needs $KV.cdc_topology.> PUT; never blocks the deploy if absent).
+                printf '%s' "unverified redeploy reason=manifest_unreadable" \
+                  | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology {{ printf "_unverified_%s" $markerToken }} 2>/dev/null \
+                  || echo "WARN:   (could not write the _unverified_{{ $markerToken }} marker — subscriber creds lack \$KV.cdc_topology.> PUT; log signal above stands)" >&2
+              else
+                echo "ERROR: cdc_topology/current is UNREADABLE and this is a FIRST install of this env (none of its durables exist yet) — FAIL CLOSED." >&2
+                echo "The manifest is a hard, ordered dependency for a NEW sink env: without it we cannot prove the publisher's N/prefixes/normalSegment match this release, and a mismatch is silent 72h loss (VF-16). Run the publisher release (nats.topologyManifest.enabled) so it populates cdc_topology/current, grant this release's creds \$KV.cdc_topology.>, then redeploy." >&2
+                exit 1
+              fi
+{{- end }}
+{{- end -}}
+
 {{- define "rrcs.nats.credsSecret.publisher" -}}
 {{- if .Values.nats.external.enabled -}}
 {{- required "nats.external.auth.publisherSecret is required when external" .Values.nats.external.auth.publisherSecret -}}

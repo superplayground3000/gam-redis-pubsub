@@ -96,6 +96,8 @@ spec:
                 echo "Create the stream first — it must bind subjects '{{ include "rrcs.nats.stream.subjects" . }}'. The chart does NOT reconcile external streams." >&2
                 exit 1
               fi
+              {{- include "rrcs.connect.topologyManifest.writeScript" (dict "root" $ "bundled" false) }}
+              {{- include "rrcs.connect.topologyManifest.readScript" $ }}
 
               sort_csv() { printf '%s' "$1" | tr ',' '\n' | sort | tr '\n' ',' | sed 's/,$//'; }
 

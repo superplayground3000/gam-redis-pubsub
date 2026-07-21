@@ -137,6 +137,41 @@ nats:
     maxBytes: "256MB"
     maxMsgSize: "1MB"
     dupeWindow: "5m"
+  # ── Topology drift manifest (multi-env drift gate, design §7 / E6) ────────────
+  # Cross-release safety net for the shared PROD stream. Each helm release renders
+  # independently, so no render-time guard can see across releases — but if the
+  # PUBLISHER's shard count N (or normalSegment / prefixes) drifts from a SINK
+  # env's, that sink derives durables for a different subject set than the forward
+  # publishes to, and the mismatched events park unconsumed until the 72h stream
+  # max-age SILENTLY discards them (a VF-16 at-least-once loss no metric catches).
+  #
+  # When enabled:
+  #   - a PUBLISHER-shaped release (connect.source.enabled) writes the resolved
+  #     taxonomy JSON {schema,normalSegment,families,prefixes} to NATS KV bucket
+  #     cdc_topology, key "current", on every nats-init run;
+  #   - a SINK-shaped release (any enabled sinkGroup) reads that key at init time
+  #     and compares the fields that affect ITS filters — normalSegment always,
+  #     families+N when it is sharded, prefixes when it has a prefixed group.
+  #     MISMATCH => the init fails closed (the release is blocked). UNREADABLE
+  #     (bucket/key missing or no grant) => fail closed on a NEW env's first
+  #     install, but fail OPEN with a loud CDCTopologyManifestUnverified log banner
+  #     + a best-effort cdc_topology/_unverified_<env> marker on a REDEPLOY, so an
+  #     emergency rollback is never blocked on the manifest bucket.
+  #
+  # Grant: needs a user-provisioned NATS KV bucket cdc_topology and the
+  # $KV.cdc_topology.> permission on the publisher (put) and subscriber (get) creds
+  # — gen-nats-auth.sh must mint it. In bundled mode the init CREATES the bucket if
+  # absent; on an EXTERNAL NATS the bucket must be pre-provisioned (the init fails
+  # loud with instructions if it is missing — the chart never creates buckets on a
+  # user-owned NATS).
+  #
+  # F2 ROLLOUT RULE (design §16): before ANY publisher-taxonomy change (P3) may
+  # roll, this manifest MUST be live and EVERY sink release already registered on
+  # it (i.e. each sink has done at least one verified deploy). Turning it off
+  # reintroduces the silent-drift risk — do NOT disable it while a taxonomy change
+  # is mid-rollout. Default false keeps the init jobs byte-identical (INV-3).
+  topologyManifest:
+    enabled: false
   persistence:
     mode: emptyDir
     size: 4Gi
