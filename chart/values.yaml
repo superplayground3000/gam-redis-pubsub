@@ -553,8 +553,9 @@ connect:
     # derives already exists as deliver_policy=by_start_sequence — the position the
     # operator precreated at F0+1 (F0 = the old AIO durable's ack_floor.stream_seq,
     # the contiguous-APPLIED prefix, read at quiesce; see runbook-aio-to-sharded-
-    # handoff.md). Any start_seq value is accepted (F0 is runtime-discovered, not
-    # known at render time); the observed start_seq is logged for audit.
+    # handoff.md). The EXACT start sequence is asserted too: pass the same F0+1
+    # via connect.sink.handoffStartSeq (required with this toggle) — a durable at
+    # any other sequence fails the init loud (Codex review F1, 2026-07-21).
     #
     # Why a whole mode instead of create-if-absent: the ordinary external init
     # create path defaults --deliver all, so a single typo'd or missing precreate
