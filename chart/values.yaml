@@ -304,6 +304,21 @@ connect:
     # Turn the DLQ on for the sink leg. Leave false unless you have read the
     # subject and credentials notes below — both can bite on an in-place upgrade.
     #
+    # SHARDED SINK (subject-sharding v2): the DLQ is now supported WITH
+    # connect.sharding.families (the old mutual-exclusion render error is gone,
+    # design §5, E2-E4). The sharded sink (cdc-reverse-sharded.yaml) carries the
+    # same park-then-ack switch output as the AIO sink: three permanent-poison
+    # classes — decode_error, hash_decode_error, unknown_op — are published to the
+    # DLQ lane and acked instead of nack-looping and head-of-line-blocking their
+    # shard forever. Transient region-Redis errors and the sx CROSSSLOT-rename
+    # fail-stop still nack (never parked). ENV-SCOPING (connect.envId, see above):
+    # each env parks on its OWN lane <dlqRoot>.<envId>.<reason> with msg-id
+    # dlq.<envId>.<event_id>, so two envs consuming one shared stream never dedup
+    # each other's parked copies away. Parked copies also carry dlq_env + dlq_shard
+    # headers (the AIO sink adds dlq_env only — it has no shard) for per-env drain
+    # correlation. The hash_decode_error counter now fires on the sharded path too,
+    # DLQ on or off (a pre-existing un-counted poison hole; INV-2).
+    #
     # Credentials: the DLQ publishes with the subscriber creds, which must grant
     # pub on <subject>.> . The committed chart/files/nats-auth/ creds were
     # regenerated with that grant (2026-07-16), so on a FRESH install enabling
@@ -370,9 +385,12 @@ connect:
   # - connect.sinkGroups MUST be empty (G2). All-in-one OWNS the whole stream; any
   #   explicit prefix-routed group would re-consume subjects it already drains
   #   (double delivery).
-  # - connect.sharding.families MUST be empty (G3). Sharding is the opposite of
-  #   one-consumer-drains-all, and the sharded sink has no DLQ routing — the same
-  #   reason the DLQ itself is excluded with sharding.
+  # - connect.sharding.families MUST be empty (G3). Sharding is the exact opposite
+  #   of one-consumer-drains-all (K per-shard durables vs one whole-stream consumer);
+  #   a whole-stream drainer would double-consume every shard subject. NOTE: this is
+  #   NOT about DLQ support any more — the sharded sink now has its own park-then-ack
+  #   DLQ (design §5); the topology conflict is what keeps all-in-one and sharding
+  #   mutually exclusive.
   #
   # DLQ drain SLA: parked messages share the stream's retention (--retention
   # limits --discard old; lab default nats.stream.maxAge = 1h, PROD external NATS

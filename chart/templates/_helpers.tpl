@@ -451,10 +451,13 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 {{- $dl := .Values.connect.deadLetter | default dict -}}
 {{- $seg := .Values.nats.stream.normalSegment | default "" -}}
 {{- if $dl.enabled -}}
-{{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
-{{-   if gt (len $families) 0 -}}
-{{-     fail (printf "connect.deadLetter.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set) — the sharded sink pipeline (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be silently half-protected (unsharded poison parked, sharded poison still loops). Disable one of them.") -}}
-{{-   end -}}
+{{- /* Sharded DLQ (design §5, E2-E4): the deadLetter x sharding.families mutual
+     exclusion was REMOVED here — cdc-reverse-sharded.yaml now carries the same
+     park-then-ack switch output as cdc-reverse.yaml (env-scoped subject + msg-id,
+     dlq_env/dlq_shard headers). The DLQ subject/msg-id guards below (segment-mode
+     N1-N6 via rrcs.nats.validateSegmentLayout, and the legacy out-of-prefix rule)
+     apply to the sharded render IDENTICALLY, because this helper feeds nats-init
+     regardless of whether the release is sharded. */ -}}
 {{-   if ne $seg "" -}}
 {{- /* In-prefix segment mode: the DLQ lives at <prefix>.<deadLetter.segment>.>,
      already under the single superset binding <prefix>.>. Bind the superset alone —
@@ -536,13 +539,15 @@ Emits nothing on success. Usage: {{ include "rrcs.connect.validateAllInOne" . }}
 {{-     if ne $wsSeg "" -}}{{- $wsRoot = printf "%s.%s" $wsRoot $wsSeg -}}{{- end -}}
 {{-     fail (printf "connect.sinkAllInOne.enabled=true owns the whole stream (the synthesised \"default\" group, filter %s.>) — it cannot be combined with explicit connect.sinkGroups (%d configured). Any prefix-routed group would re-consume subjects the whole-stream consumer already drains (double delivery). Remove connect.sinkGroups, or turn all-in-one off and route by prefix instead." $wsRoot (len ($.Values.connect.sinkGroups | default list))) -}}
 {{-   end -}}
-{{- /* G3 — sharding is the exact opposite of one-consumer-drains-all, and the
-     sharded sink pipeline has no DLQ routing (see the DLQ+sharding exclusion at
-     the top of rrcs.nats.stream.subjects). Keep them mutually exclusive; do not
-     build the DLQ into the sharded pipeline in this change. */ -}}
+{{- /* G3 — sharding is the exact opposite of one-consumer-drains-all: all-in-one is
+     ONE whole-stream consumer, sharding is K per-key durables. They remain mutually
+     exclusive on THAT ground alone (a whole-stream drainer would double-consume every
+     shard subject). NOTE: this is no longer about DLQ support — the sharded sink now
+     carries park-then-ack (design §5, E2-E4), so the old "sharded pipeline has no DLQ
+     routing" rationale is gone; the topology conflict is what remains. */ -}}
 {{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
 {{-   if gt (len $families) 0 -}}
-{{-     fail (printf "connect.sinkAllInOne.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set, %d configured) — all-in-one is one consumer draining the whole stream, the opposite of per-key sharding, and the sharded sink pipeline has no DLQ routing (same reason connect.deadLetter is already excluded with sharding). Disable one of them." (len $families)) -}}
+{{-     fail (printf "connect.sinkAllInOne.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set, %d configured) — all-in-one is one consumer draining the whole stream, the exact opposite of per-key sharding (K per-shard durables); a whole-stream drainer would double-consume every shard subject. Disable one of them." (len $families)) -}}
 {{-   end -}}
 {{- end -}}
 {{- end -}}

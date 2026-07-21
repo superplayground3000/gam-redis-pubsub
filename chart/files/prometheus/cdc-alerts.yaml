@@ -62,7 +62,12 @@ groups:
       # — a failed DLQ publish nacks the original, which redelivers once per ackWait
       # and re-increments output_error{dlq_out}, so a sub-cadence window would flap
       # in the redelivery gaps. Scoped to the sink leg (job=~".*connect-sink.*") to
-      # match panel 18; critical because the DLQ safety mechanism itself is broken
+      # match panel 18. The substring regex ALSO matches sharded per-group sink jobs
+      # (Service/job name connect-sink-<group>, e.g. connect-sink-shard-a, and the
+      # env-prefixed <envId>-connect-sink-<group>), so a sharded env's DLQ publish
+      # failures page too (design §5, E4/E10 F5) — no widening needed. The `sum by
+      # (namespace, job)` preserves per-namespace/per-env scoping so it never pages
+      # across envs. critical because the DLQ safety mechanism itself is broken
       # and will not self-heal without an operator fix (fail-safe: no loss, the
       # poison nacks rather than being dropped). METRIC NAME: output_error scrapes
       # as output_error or _total; the full-string __name__ regex matches both.

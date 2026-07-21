@@ -443,6 +443,12 @@ output:
                 dlq_reason: ${! meta("dlq_reason") }
                 dlq_error: ${! meta("dlq_error") }
                 dlq_orig_subject: ${! meta("nats_subject") }
+                # E2: env identity on the parked copy so a per-env drain tool can
+                # correlate copies of one source event across lanes (design §8.5).
+                # No dlq_shard here — the AIO/non-sharded sink has no shard meta (the
+                # sharded sink adds dlq_shard; design §5.1). Empty when connect.envId
+                # is unset (single-env legacy) — byte-identical intent, one added line.
+                dlq_env: {{ include "rrcs.envId" . | quote }}
         - output:
             drop: {}
 {{- else }}

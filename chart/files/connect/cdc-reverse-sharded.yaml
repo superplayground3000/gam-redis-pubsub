@@ -103,6 +103,32 @@ pipeline:
         } else { null }
         meta body = $decoded
         meta decode_failed = if $is_encoded && $decoded == null { "yes" } else { "no" }
+        # Hash-body guard (E3, closes VF-8) — renders UNCONDITIONALLY, DLQ on or off.
+        # A create/update hash body that decoded OK but is NOT a JSON OBJECT would
+        # throw UN-COUNTED inside the HSET args_mapping below (parse_json().key_values()
+        # rejects arrays/scalars/strings). Validate up front so it is COUNTED as
+        # cdc_unprocessable{shard,reason=hash_decode_error} instead of silently poison-
+        # looping. Identical Bloblang to cdc-reverse.yaml (proven by test-dlq-guard.sh):
+        # the decode-OK precondition is re-derived from the $is_encoded/$decoded LETS,
+        # never read via meta("decode_failed") — inside a Connect `mapping` at RUNTIME,
+        # meta("x") reads metadata as-of mapping ENTRY, so same-mapping meta reads null
+        # and the guard would silently never fire (trap A/B-verified 2026-07-16).
+        # .string() coerces the typed-BYTES $decoded so parse_json is well-defined; a
+        # null $decoded (missing body on a hash create) errors into .catch(null) whose
+        # .type() is "null" -> also (correctly) classified failed.
+        let hash_body_ok = if (this.op == "create" || this.op == "update") && this.type.or("string") == "hash" && !($is_encoded && $decoded == null) {
+          $decoded.string().parse_json().catch(null).type() == "object"
+        } else { true }
+        meta hash_decode_failed = if $hash_body_ok { "no" } else { "yes" }
+    {{- if .Values.connect.deadLetter.enabled }}
+        # DLQ dedup identity (E2) — only stashed when the DLQ is on (the park msg-id
+        # is the only consumer; INV-S1 keeps the DLQ-off render otherwise unchanged).
+        # The reverse leg never needed event_id before. `.or()` fires on null/missing
+        # but NOT on "" — an empty-string event_id must ALSO fall back to the content
+        # hash, or every such poison shares Nats-Msg-Id "dlq.<envId>." and all but the
+        # first within dupeWindow are deduped away (never parked). Mirror cdc-reverse.yaml.
+        meta event_id = if this.event_id.or("") == "" { content().hash("sha256").encode("hex") } else { this.event_id }
+    {{- end }}
         # Sync-latency stash (INV-2): envelope ts = writer mint time (epoch ms).
         # Delta is computed AFTER the apply switch so the sample includes the
         # region write. .catch(0) => a missing/garbled ts skips the sample
@@ -130,17 +156,67 @@ pipeline:
     - switch:
         - check: meta("decode_failed") == "yes"
           processors:
-            # Permanent poison: count + throw to nack. Under max_ack_pending=1
-            # a poison message BLOCKS its shard (redelivery loop) — that is the
-            # designed fail-stop: alert CDCShardStuck (A1) catches it; the
-            # other shards keep flowing (broker child isolation, F3).
+            # Permanent poison: the gzip:base64 body could not be decoded. Count it
+            {{- if .Values.connect.deadLetter.enabled }}
+            # (INV-2), then set dlq meta -> the ONE global switch output parks it on
+            # <dlqRoot>.decode_error and acks only after PubAck (park-then-ack, INV-1
+            # row 8/15). The parked poison advances THIS shard's ack floor (O-6 slot),
+            # so the shard unblocks instead of redelivery-looping forever.
+            {{- else }}
+            # then throw to nack. Under max_ack_pending=1 a poison message BLOCKS its
+            # shard (redelivery loop) — the designed DLQ-off fail-stop: alert
+            # CDCShardStuck (A1) catches it; other shards keep flowing (F3 isolation).
+            {{- end }}
             - metric:
                 type: counter
                 name: cdc_unprocessable
                 labels:
                   shard: '${! meta("shard") }'
                   reason: decode_error
+            {{- if .Values.connect.deadLetter.enabled }}
+            # per-delivery count of messages routed to the DLQ (INV-2). Emitted in
+            # the pipeline (not the switch-output case, where `processors` is not a
+            # valid field on this Connect build) alongside the dlq meta.
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: decode_error
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "decode_error"
+                meta dlq_error  = "undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?"))
+            {{- else }}
             - mapping: 'root = throw("decode_error: undecodable gzip:base64 body for kv_key %s".format(meta("kv_key").or("?")))'
+            {{- end }}
+        - check: meta("hash_decode_failed") == "yes"
+          processors:
+            # Permanent poison: create/update hash body is not a valid JSON object,
+            # so the HSET args_mapping below would throw UN-COUNTED. The counter
+            # renders UNCONDITIONALLY (E3, closes VF-8) — placed BEFORE the
+            # create/update branch so poison never reaches HSET. Only the ACTION
+            # (park vs throw) gates on deadLetter.enabled; the count always fires.
+            - metric:
+                type: counter
+                name: cdc_unprocessable
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: hash_decode_error
+            {{- if .Values.connect.deadLetter.enabled }}
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: hash_decode_error
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "hash_decode_error"
+                meta dlq_error  = "hash body is not valid JSON for kv_key %s".format(meta("kv_key").or("?"))
+            {{- else }}
+            - mapping: 'root = throw("hash_decode_error: hash body is not valid JSON for kv_key %s".format(meta("kv_key").or("?")))'
+            {{- end }}
         - check: meta("op") == "create" || meta("op") == "update"
           processors:
             # Best-effort latency telemetry, emitted BEFORE the SET. ts-bearing
@@ -227,7 +303,20 @@ pipeline:
                 labels:
                   shard: '${! meta("shard") }'
                   reason: unknown_op
+            {{- if .Values.connect.deadLetter.enabled }}
+            - metric:
+                type: counter
+                name: cdc_dlq_forwarded
+                labels:
+                  shard: '${! meta("shard") }'
+                  reason: unknown_op
+            - mapping: |
+                meta dlq        = "yes"
+                meta dlq_reason = "unknown_op"
+                meta dlq_error  = "unknown op: %s".format(meta("op").or("missing"))
+            {{- else }}
             - mapping: 'root = throw("unknown op: %s".format(meta("op").or("missing")))'
+            {{- end }}
     # ── Sync-latency recording (INV-2) ────────────────────────────────────
     # Same shape as cdc-reverse.yaml (delta computed POST-apply so the sample
     # includes the region write; !errored() so nacked messages record on their
@@ -236,7 +325,17 @@ pipeline:
     # nack an already-applied message), plus the shard label. Exported
     # histogram is SECONDS under use_histogram_timing.
     - switch:
+        {{- if .Values.connect.deadLetter.enabled }}
+        # DLQ-routed poison (decode_error/hash_decode_error/unknown_op) no longer
+        # throws — it sets meta("dlq")=="yes" and falls through here un-errored, and
+        # such envelopes still carry a ts (sync_has_ts=="yes"). Exclude them: they were
+        # never applied, so a sync-latency sample would poison the histogram with an
+        # un-applied message. (DLQ-off render keeps the original guard byte-identical —
+        # there poison throws, so !errored() already excludes it.)
+        - check: '!errored() && meta("dlq") != "yes" && meta("sync_has_ts") == "yes"'
+        {{- else }}
         - check: '!errored() && meta("sync_has_ts") == "yes"'
+        {{- end }}
           processors:
             - mapping: |
                 let ts_ms = meta("sync_ts_ms").number().catch(0)
@@ -270,5 +369,56 @@ output:
   # JetStream redelivery cannot, so keeping reject_errored here is safe and correct.
   # Ack routing follows the transaction back to its originating broker child (F3),
   # so one stuck shard never blocks another.
+  #
+  # Two shapes below (design §5, E4). deadLetter OFF: bare drop on success / nack on
+  # error — byte-identical to the pre-DLQ sharded sink. deadLetter ON: ONE GLOBAL
+  # switch over the broker fan-in (never per-child) parks permanent poison
+  # (meta("dlq")=="yes") on the env-scoped DLQ lane, THEN acks. The nats_jetstream
+  # send IS the write: a send failure surfaces as an output error so reject_errored
+  # nacks and JetStream redelivers on the same shard durable (park-then-ack, INV-1
+  # row 8/15). O-6 is preserved: the park occupies the same single-in-flight slot a
+  # normal apply would, and F3 routes the resulting ack back to the ORIGINATING shard
+  # child — so a parked poison advances only its own shard's floor and never reorders
+  # a valid change (parked messages are never applied; O-7). Keep reject_errored at
+  # the top of BOTH shapes — a plain drop would ack failed applies and lose them.
   reject_errored:
+{{- if .Values.connect.deadLetter.enabled }}
+    switch:
+      cases:
+        - check: meta("dlq") == "yes"
+          output:
+            # label dlq_out is per-pipeline (one sink Deployment/job per group), so
+            # output_sent/error{label="dlq_out"} stay per-env-routable by (namespace,
+            # job) — the CDCDeadLetterPublishFailing alert + dashboard panel 18 select
+            # job=~".*connect-sink.*", which matches the sharded per-group sink jobs
+            # (connect-sink-<group>) too.
+            label: dlq_out
+            nats_jetstream:
+              urls:
+                - "{{ include "rrcs.nats.url" . }}"
+              auth:
+                user_credentials_file: {{ .Values.nats.auth.creds.subscriber | quote }}
+              # Env-scoped subject (E2): rrcs.nats.dlqRoot already appends .<envId>
+              # when connect.envId is set (kv.cdc.dlq.<envId> segment / dlq.cdc.<envId>
+              # legacy), so each env parks on its OWN lane under the fixed stream binding.
+              subject: '{{ include "rrcs.nats.dlqRoot" . }}.${! meta("dlq_reason") }'
+              headers:
+                # "dlq.<envId>." prefix is LOAD-BEARING (INV-1 row 14/15): JetStream
+                # msg-id dedup is stream-wide and subject-independent, so reusing the
+                # original publish's bare event_id would PubAck{duplicate} -> ack ->
+                # NOTHING PARKED. The <envId> segment additionally gives two envs
+                # parking the SAME poison event DISTINCT msg-ids, so neither dedups the
+                # other away (design §5.4, E2).
+                Nats-Msg-Id: {{ include "rrcs.nats.dlqMsgIdPrefix" . }}${! meta("event_id") }
+                dlq_reason: ${! meta("dlq_reason") }
+                dlq_error: ${! meta("dlq_error") }
+                dlq_orig_subject: ${! meta("nats_subject") }
+                # E2: env + shard identity on the parked copy so a per-env drain tool
+                # can correlate copies of one source event across lanes (design §8.5).
+                dlq_env: {{ include "rrcs.envId" . | quote }}
+                dlq_shard: ${! meta("shard") }
+        - output:
+            drop: {}
+{{- else }}
     drop: {}
+{{- end }}

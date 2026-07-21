@@ -114,18 +114,34 @@ for badsub in 'dlq.cdc.>' 'dlq..cdc' 'dlq.cdc.' '.dlq.cdc' 'dlq.*.cdc' 'dlq cdc'
     echo "L1: malformed deadLetter.subject '$badsub' must fail-loud"; fail L1
   fi
 done
-# fail-loud B: DLQ + subject-sharding v2 is an unsupported mix (the sharded sink
-# has no DLQ routing) — the chart must reject deadLetter.enabled=true whenever
-# connect.sharding.families is configured. Reuse the same valid sharded family
-# used by the sharding section below; it renders fine on its own (proven there),
-# so the ONLY reason this render fails is the DLQ+sharding guard.
-if helm template chart/ \
+# B: DLQ + subject-sharding v2 is now SUPPORTED (design §5, E2-E4; P5 removed the old
+# mutual-exclusion). The sharded sink carries the same park-then-ack switch output as
+# the AIO sink, env-scoped. Render it (segment mode + envId) and assert the park lane,
+# the env-scoped subject/msg-id, and the dlq_env/dlq_shard headers appear.
+SHARDED_DLQ_OUT=$(helm template chart/ \
+     --set connect.envId=enva \
+     --set connect.deadLetter.enabled=true \
+     --set connect.deadLetter.segment=dlq \
+     --set nats.stream.normalSegment=aio \
      --set 'connect.sharding.families.lb:company.shards=4' \
      --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' \
-     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
-     --set connect.deadLetter.enabled=true >/dev/null 2>&1; then
-  echo "L1: deadLetter.enabled=true with subject-sharding families must fail-loud"; fail L1
-fi
+     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}') \
+  || { echo "L1: DLQ + sharding must RENDER now (P5 removed the exclusion)"; fail L1; }
+grep -qF 'kv.cdc.dlq.enva.${! meta("dlq_reason") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ output must park on the env-scoped subject"; fail L1; }
+grep -qF 'Nats-Msg-Id: dlq.enva.${! meta("event_id") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ msg-id must be env-scoped (dlq.<envId>.<event_id>)"; fail L1; }
+grep -q 'label: dlq_out'   <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ output missing the dlq_out park branch"; fail L1; }
+grep -qF 'dlq_env: "enva"' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded park copy missing dlq_env header"; fail L1; }
+grep -qF 'dlq_shard: ${! meta("shard") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded park copy missing dlq_shard header"; fail L1; }
+grep -q 'reason: hash_decode_error' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ render missing hash_decode_error counter (E3)"; fail L1; }
+# E3: the hash-guard counter renders UNCONDITIONALLY on the sharded path — present even
+# with the DLQ OFF (closes the pre-existing un-counted VF-8 poison hole). But the park
+# lane (dlq_out) must NOT appear when the DLQ is off.
+SHARDED_NODLQ_OUT=$(helm template chart/ \
+     --set 'connect.sharding.families.lb:company.shards=4' \
+     --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' \
+     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}') || fail L1
+grep -q 'reason: hash_decode_error' <<<"$SHARDED_NODLQ_OUT" || { echo "L1: sharded (DLQ off) must still count hash_decode_error (E3, closes VF-8)"; fail L1; }
+grep -q 'label: dlq_out' <<<"$SHARDED_NODLQ_OUT" && { echo "L1: sharded park lane leaked into the DLQ-off render"; fail L1; } || true
 grep -q 'reason: hash_decode_error' <<<"$DLQ_OUT" || { echo "L1: missing hash_decode_error counter"; fail L1; }
 grep -q 'cdc_dlq_forwarded'        <<<"$DLQ_OUT" || { echo "L1: missing cdc_dlq_forwarded counter"; fail L1; }
 grep -q 'hash_decode_failed'       <<<"$DLQ_OUT" || { echo "L1: missing hash guard"; fail L1; }
@@ -177,6 +193,25 @@ for d in yaml.safe_load_all(sys.stdin):
   LINT_OUT=$(printf '%s' "$REV_PIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label '__POD__'" || true)
   if [ -n "$LINT_OUT" ]; then echo "L1: enabled DLQ reverse pipeline fails redpanda-connect lint:"; echo "$LINT_OUT"; fail L1; fi
   echo "[run-all-tests] L1: enabled DLQ pipeline lints clean on $CONNECT_IMG"
+  # SHARDED DLQ pipeline lint (P5): the sharded park output uses the SAME switch-output-
+  # under-reject_errored construct that once shipped an invalid `processors`-under-a-case
+  # bug (rules/50-lessons.md 2026-07-14). L3 runs with the DLQ OFF and the non-sharded
+  # lint above never sees the sharded render, so this is the ONLY tier that validates the
+  # DLQ-enabled SHARDED pipeline loads in the real Connect binary. Lint every rendered
+  # sharded sink pipeline from SHARDED_DLQ_OUT.
+  while IFS= read -r SPIPE_B64; do
+    [ -z "$SPIPE_B64" ] && continue
+    SPIPE=$(printf '%s' "$SPIPE_B64" | base64 -d)
+    SLINT=$(printf '%s' "$SPIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label" || true)
+    if [ -n "$SLINT" ]; then echo "L1: enabled SHARDED DLQ pipeline fails redpanda-connect lint:"; echo "$SLINT"; fail L1; fi
+  done < <(python3 -c '
+import sys,yaml,base64
+for d in yaml.safe_load_all(sys.stdin):
+  if d and d.get("kind")=="ConfigMap":
+    for k,v in (d.get("data") or {}).items():
+      if v and "copies: 1" in v and "reject_errored" in v and "dlq_out" in v:
+        print(base64.b64encode(v.encode()).decode())' <<<"$SHARDED_DLQ_OUT")
+  echo "[run-all-tests] L1: enabled SHARDED DLQ pipeline(s) lint clean on $CONNECT_IMG"
   # Behavioral guard test (rules/50-lessons.md 2026-07-15: templated Bloblang needs a
   # got-vs-want run of the REAL rendered pipeline — lint proves loadability, never
   # semantics; the meta-vs-let guard bug lints clean and silently never fires).
