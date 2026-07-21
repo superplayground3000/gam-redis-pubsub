@@ -103,6 +103,51 @@ because the external init job never mutates user-owned consumers).
 - **Full guide:** `docs/dlq.md` §10 and
   `docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md`.
 
+### `values-publisher.yaml` — a PUBLISHER release (forward leg only)
+
+The source-only half of the multi-env mixed-sink split
+(`docs/design/multi-env-mixed-sink`): exactly ONE publisher release owns the
+forward leg (central Redis → NATS) and binds no sink consumer, applies to no region
+Redis, and parks nothing (`deadLetter.enabled=false`, explicit). One shared stream
+is fanned out server-side to many downstream sink-only envs, so a publisher never
+does N publishes — it publishes once and JetStream copies it to each env's durable.
+Includes the P0 caveat: declaring sharding families on a publisher does NOT render
+until P3 (the shard-coverage guard needs an enabled sink group), so the family
+block is left commented out with the reason.
+
+- **Try it (bundled NATS):**
+  ```bash
+  helm upgrade --install rrcs-pub ./chart -n rrcs-pub --create-namespace \
+    -f chart/examples/values-publisher.yaml
+  ```
+- **Render check (L1, seconds):**
+  ```bash
+  helm template chart/ -f chart/examples/values-publisher.yaml >/dev/null
+  ```
+- **Pairs with:** `values-sink-only.yaml` (the downstream env half).
+
+### `values-sink-only.yaml` — a SINK-ONLY release (one env, env-scoped)
+
+The sink half of the split: one downstream environment that binds an env-scoped
+durable on the shared stream and applies to its OWN region Redis, publishing
+nothing. Shows `connect.envId` — the single knob that scopes this env's durable
+base (`cdc_sink_enva`), DLQ lane and dedup msg-id (`dlq.cdc.enva.<reason>` /
+`dlq.enva.<event_id>`), the `resourcePrefix` default (`enva-`), and the Prometheus
+`env` label — so many sink envs share one stream without colliding on a single ack
+floor. Notes the DNS-1123 grammar and the immutability warning (renaming envId
+mints a fresh durable and strands the old DLQ lane).
+
+- **Try it (bundled NATS, one release per env):**
+  ```bash
+  helm upgrade --install rrcs-enva ./chart -n rrcs-enva --create-namespace \
+    -f chart/examples/values-sink-only.yaml
+  ```
+- **Render check (L1, seconds):**
+  ```bash
+  helm template chart/ -f chart/examples/values-sink-only.yaml >/dev/null
+  ```
+- **Pairs with:** `values-publisher.yaml` (the forward-leg half).
+
 ## Untested / unsupported combinations
 
 - **Sharding + DLQ together is a hard error, by design.** Setting

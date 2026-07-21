@@ -63,6 +63,90 @@ affinity:
 {{- end -}}
 
 {{/*
+rrcs.envId — the validated per-release environment id (connect.envId), or "" in
+legacy mode. This is the SOLE per-release identity in a multi-env topology: it
+feeds the durable base (rrcs.connect.durableBase), the DLQ subject/msg-id
+(rrcs.nats.dlqRoot / rrcs.nats.dlqMsgIdPrefix), the default resourcePrefix
+(rrcs.resourcePrefix), and the Prometheus `env` label. Empty => byte-identical
+legacy render in every one of those dimensions at once.
+
+Validation is fail-loud at render (design §4): DNS-1123 label
+^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (lowercase alnum + dashes; NO underscores, dots,
+or uppercase) and <=16 chars. The grammar is load-bearing twice over — envId is
+concatenated into Kubernetes names via resourcePrefix (an underscore/uppercase
+passes `helm template` but fails `kubectl apply`), and it is the token the A1/A6
+alerts label_replace out of the durable name cdc_sink_<envId>_<fam>_s<K> (an
+underscore or an _s<digits> run would make that regex ambiguous). The <=16 cap
+keeps the longest derived durable within its 64-char budget and the K8s name
+within the 57-char budget. Immutable across redeploys (design §4): renaming mints
+a fresh durable with a fresh ack floor and moves the DLQ lane, stranding parked
+poison — same hazard class as INV-1 row 2.
+Usage: {{ include "rrcs.envId" . }}
+*/}}
+{{- define "rrcs.envId" -}}
+{{- $env := .Values.connect.envId | default "" -}}
+{{- if ne $env "" -}}
+{{-   if gt (len $env) 16 -}}
+{{-     fail (printf "connect.envId=%q is %d chars — the cap is 16. envId is inserted into the durable name cdc_sink_<envId>_<fam>_s<K> (base 8 + '_' + envId + '_' + family + shard-token) which must stay <=64, and into every Kubernetes resource name via resourcePrefix (57-char budget). Shorten it." $env (len $env)) -}}
+{{-   end -}}
+{{-   if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $env) -}}
+{{-     fail (printf "connect.envId=%q is not a DNS-1123 label — it must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ : lowercase alnum and dashes only, no leading/trailing dash, no underscores, no dots, no uppercase. envId is concatenated into Kubernetes names (an underscore or uppercase renders fine but fails kubectl apply) and is the token the A1/A6 alerts label_replace out of the durable name cdc_sink_<envId>_<fam>_s<K> (an underscore or _s<digits> run would make that regex ambiguous). Use e.g. enva or eu-west." $env) -}}
+{{-   end -}}
+{{- end -}}
+{{- $env -}}
+{{- end -}}
+
+{{/*
+rrcs.resourcePrefix — the effective Kubernetes resource-name prefix. An explicit
+.Values.resourcePrefix always wins; only when it is empty AND connect.envId is set
+does it default to "<envId>-" so a sink-only env's objects are namespaced by env
+without the operator having to repeat it. Empty envId + empty resourcePrefix => ""
+(byte-identical legacy). rrcs.name and the 57-char sink-name guard both consume
+this, so the default has one source of truth.
+Usage: {{ include "rrcs.resourcePrefix" $ }}
+*/}}
+{{- define "rrcs.resourcePrefix" -}}
+{{- $rp := .Values.resourcePrefix | default "" -}}
+{{- if ne $rp "" -}}
+{{- $rp -}}
+{{- else -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s-" $env -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.durableBase — the env-scoped durable base: nats.stream.consumer.durable
+with "_<envId>" appended when connect.envId is set, else the bare base. This is the
+single seam through which envId reaches EVERY derived durable — the synthesized
+"default" durable (cdc_sink_<envId>), per-group durables (cdc_sink_<envId>_<name>),
+and per-shard durables (cdc_sink_<envId>_<fam>_s<K>) — because rrcs.connect.sinkGroups
+builds all of them from this base. Empty envId => the bare base (byte-identical).
+Usage: {{ include "rrcs.connect.durableBase" $ }}
+*/}}
+{{- define "rrcs.connect.durableBase" -}}
+{{- $base := required "nats.stream.consumer.durable is required" .Values.nats.stream.consumer.durable -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s_%s" $base $env -}}{{- else -}}{{- $base -}}{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.nats.dlqMsgIdPrefix — the Nats-Msg-Id prefix for a parked (dead-lettered)
+message: "dlq.<envId>." when connect.envId is set, else the legacy "dlq.". The
+"dlq." stem is LOAD-BEARING (INV-1 row 14): JetStream msg-id dedup is stream-wide
+and subject-independent, so the parked copy must not reuse the original publish's
+bare event_id or it PubAck{duplicate}s and nothing is stored. The "<envId>."
+segment additionally makes two envs parking the SAME poison event get DISTINCT
+msg-ids, so each stores its own copy instead of one deduping the other away
+(design §5.4, E2). Empty envId => "dlq." (byte-identical legacy render).
+Usage: {{ include "rrcs.nats.dlqMsgIdPrefix" . }}
+*/}}
+{{- define "rrcs.nats.dlqMsgIdPrefix" -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "dlq.%s." $env -}}{{- else -}}dlq.{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.nats.url — client URL. Bundled: in-cluster Service. External: user-supplied.
 Usage: {{ include "rrcs.nats.url" . }}
 */}}
@@ -243,17 +327,24 @@ script so they can never disagree. Two mutually-exclusive layouts:
     stream prefix is FIXED (external PROD NATS) so a sibling dlq.cdc.> root is
     unbindable — disjointness from normal traffic is enforced by guard N1
     (normalSegment != segment), not structurally.
+When connect.envId is set the DLQ root gains a trailing ".<envId>" segment
+(kv.cdc.dlq.<envId> in segment mode, dlq.cdc.<envId> legacy) so each env parks on
+its OWN lane under the same fixed stream binding — disjoint drains, no cross-env
+overlap (design §5, E2). Empty envId => unchanged root (byte-identical).
 Usage: {{ include "rrcs.nats.dlqRoot" . }}
 */}}
 {{- define "rrcs.nats.dlqRoot" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
 {{- $dl := .Values.connect.deadLetter | default dict -}}
 {{- $seg := $dl.segment | default "" -}}
+{{- $root := "" -}}
 {{- if ne $seg "" -}}
-{{- printf "%s.%s" $p $seg -}}
+{{- $root = printf "%s.%s" $p $seg -}}
 {{- else -}}
-{{- required "connect.deadLetter.subject is required" $dl.subject -}}
+{{- $root = required "connect.deadLetter.subject is required" $dl.subject -}}
 {{- end -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s.%s" $root $env -}}{{- else -}}{{- $root -}}{{- end -}}
 {{- end -}}
 
 {{/*
@@ -457,7 +548,11 @@ in this pass); the 57-char name budget.
 {{- $legSink := $v.connect.sink -}}
 {{- $legLease := $legSink.lease -}}
 {{- $legCons := $v.nats.stream.consumer -}}
-{{- $baseDurable := $legCons.durable -}}
+{{- /* Env-scoped durable base: cdc_sink_<envId> when connect.envId is set, else the
+     bare cdc_sink. Every derived durable below (default, per-group, per-shard) is
+     built from this one seam, so a single knob env-scopes them all; empty envId is
+     byte-identical (design §4). */ -}}
+{{- $baseDurable := include "rrcs.connect.durableBase" $root -}}
 {{- $tokenRe := "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" -}}
 {{- /* Key-prefix grammar: ONE or TWO ':'-separated segments (first-two-seg
      routing). Segment charset [a-z0-9_-], alnum first+last: '_' is legal in a
@@ -687,7 +782,7 @@ in this pass); the 57-char name budget.
 {{-     $saBase = printf "connect-sink-%s-elector" $name -}}
 {{-     $streamID = printf "reverse_leg_%s" $name -}}
 {{-   end -}}
-{{-   $fullName := printf "%s%s" $root.Values.resourcePrefix $deployBase -}}
+{{-   $fullName := printf "%s%s" (include "rrcs.resourcePrefix" $root) $deployBase -}}
 {{-   if gt (len $fullName) 57 -}}
 {{-     fail (printf "connect.sinkGroups[%s]: derived resource name %q (%d chars) exceeds the 57-char budget — shorten resourcePrefix or the group name" $name $fullName (len $fullName)) -}}
 {{-   end -}}
@@ -704,6 +799,18 @@ in this pass); the 57-char name budget.
 {{-     $durable = "" -}}
 {{-   else -}}
 {{-     $consumers = list (dict "token" "" "durable" $durable "filter" $filter "maxAckPending" $maxAckPending) -}}
+{{-   end -}}
+{{- /* Durable-name length guard (design §4): every derived durable — base
+     nats.stream.consumer.durable + "_<envId>" + group/shard suffix — must stay
+     <=64 chars (the conservative NATS durable-name budget). Distinct from the
+     57-char K8s resource-name guard above: durables are not bound by the K8s
+     limit, and a long family/shard token can blow the durable budget while the
+     Deployment name is fine. Fails loud with the offending length so the operator
+     can shorten connect.envId (<=16), the group name, or the family token. */ -}}
+{{-   range $c := $consumers -}}
+{{-     if gt (len $c.durable) 64 -}}
+{{-       fail (printf "connect.sinkGroups[%s]: derived durable name %q is %d chars, over the 64-char budget (base %q [= nats.stream.consumer.durable, env-scoped to _<envId> when connect.envId is set] + group/shard suffix; %d > 64). Shorten connect.envId (cap 16), the group name, or the sharding family token." $name $c.durable (len $c.durable) $baseDurable (len $c.durable)) -}}
+{{-     end -}}
 {{-   end -}}
 {{-   $elem := dict
              "name" $name
@@ -926,6 +1033,6 @@ Usage: {{ include "rrcs.name" (dict "root" $ "base" "writer") }}
 */}}
 {{- define "rrcs.name" -}}
 {{- if ne .base "" -}}
-{{- printf "%s%s" .root.Values.resourcePrefix .base -}}
+{{- printf "%s%s" (include "rrcs.resourcePrefix" .root) .base -}}
 {{- end -}}
 {{- end -}}

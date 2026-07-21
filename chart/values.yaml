@@ -158,6 +158,44 @@ natsBox:
 # replicas>1 gives active/standby HA: only the Lease holder POSTs the leg's
 # pipeline; standbys idle. One Lease + stream id + ServiceAccount per leg.
 connect:
+  # ── Environment id (multi-env sink scoping) ──────────────────────────────────
+  # The single per-release identity that lets MANY downstream sink environments
+  # share ONE JetStream stream without colliding. Default "" keeps the render
+  # byte-identical to the legacy single-env chart in every dimension at once, so
+  # leaving it unset changes nothing.
+  #
+  # What it feeds (all derived from this one knob):
+  #   - Durable base: cdc_sink -> cdc_sink_<envId>; per-group cdc_sink_<envId>_<name>;
+  #     per-shard cdc_sink_<envId>_<fam>_s<K>. A durable IS a per-consumer ack floor,
+  #     so two envs on the SAME durable name would SHARE one floor and split delivery
+  #     (each sees only part of the stream) instead of each getting a full copy.
+  #     env-scoping the durable is what makes native JetStream fan-out give every env
+  #     its own complete copy.
+  #   - DLQ subject: <dlqRoot>.<envId>.<reason> (kv.cdc.dlq.<envId>.<reason> in
+  #     segment mode) and DLQ msg-id: dlq.<envId>.<event_id> — so each env parks
+  #     poison on its own lane and its own dedup key (msg-id dedup is stream-wide, so
+  #     without the env segment one env's park would dedup-swallow another's).
+  #   - resourcePrefix: when resourcePrefix is left empty it defaults to "<envId>-"
+  #     (an explicit resourcePrefix always wins).
+  #   - Prometheus `env` label on the connect legs' scraped metrics (via the
+  #     ServiceMonitor), for per-env dashboards and alert routing.
+  #
+  # Grammar (validated fail-loud at render): a DNS-1123 label
+  # ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ — lowercase letters, digits and dashes only; no
+  # underscores, no dots, no uppercase, no leading/trailing dash — and at most 16
+  # chars. The grammar is not cosmetic: envId is concatenated into Kubernetes names
+  # (an underscore or uppercase renders fine but fails `kubectl apply`) and it is the
+  # token alerts extract back out of the durable name cdc_sink_<envId>_<fam>_s<K>
+  # (an underscore or an _s<digits> run would make that extraction ambiguous). The
+  # 16-char cap keeps the longest derived durable within its 64-char budget.
+  #
+  # IMMUTABLE for a release's life. Renaming envId does NOT rename the existing
+  # durable — it mints a NEW durable that starts from a fresh ack floor (a
+  # --deliver-all replay burst), orphans the old durable (which keeps accruing
+  # num_pending), AND moves the DLQ lane, stranding any poison already parked on the
+  # old one. Same hazard class as changing the source consumer id (INV-1 row 2): if
+  # you must re-identify an env, plan a durable split/re-adopt, never a live rename.
+  envId: ""
   image: hpdevelop/connect:4.92.0-claudefix
   # Wire format for the CDC body carried inside the NATS envelope. Only the FORWARD
   # (source) leg honors this; the REVERSE (sink) leg auto-detects per message via the

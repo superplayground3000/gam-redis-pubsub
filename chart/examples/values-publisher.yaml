@@ -1,0 +1,70 @@
+# Example values for a PUBLISHER release (the forward leg only).
+#
+# What this shows:
+#   - How to run a source-only release: it reads the central Redis stream and
+#     publishes every CDC event to NATS JetStream, but binds NO sink consumer and
+#     applies to NO region Redis.
+#   - Why a publisher parks nothing (deadLetter is off, on purpose).
+#   - The one-publisher-per-stream rule, and the P0 caveat about sharding.
+#
+# Where this fits (multi-env mixed-sink topology, docs/design/multi-env-mixed-sink):
+#   One shared JetStream stream is fanned out to MANY downstream sink environments
+#   at once. The split is: exactly ONE publisher release (this file) owns the
+#   forward leg, and each downstream env is its OWN sink-only release with its own
+#   region Redis and its own env-scoped durable (see values-sink-only.yaml).
+#   JetStream fans one published copy of each event out to every env's durable
+#   server-side, so "N envs each get a full copy" is native multi-consumer fan-out,
+#   not N publishes.
+#
+# Install example (bundled NATS, fresh namespace):
+#   helm upgrade --install rrcs-pub ./chart -n rrcs-pub --create-namespace \
+#     -f chart/examples/values-publisher.yaml
+#
+# Render check (L1, seconds):
+#   helm template chart/ -f chart/examples/values-publisher.yaml >/dev/null
+
+connect:
+  source:
+    # Render the forward (source) leg: central Redis -> NATS. This is the whole job
+    # of a publisher release. Keep consumerClientId at its stable role-scoped
+    # default (cdc_propagator_active) — a pod-scoped id orphans the Redis PEL on a
+    # SIGKILL failover and loses messages (INV-1 row 2). Leave it untouched here.
+    enabled: true
+
+  sink:
+    # No sink leg on a publisher release: it binds no durable consumer and writes to
+    # no region Redis. With the sink off the chart renders no sink Deployment,
+    # Service, pipeline ConfigMap, or sink elector — the release is forward-only.
+    enabled: false
+
+  # A publisher parks NOTHING, so the DLQ is explicitly OFF (design D-fwd). The DLQ
+  # park machinery lives entirely in the SINK pipeline (cdc-reverse*.yaml), gated by
+  # an enabled sink group; a source-only release renders no sink pipeline at all, so
+  # there is nothing to park with and no dead-letter subject to own. Dead-lettering
+  # is a per-env decision made on each sink-only release, not here. (This is also
+  # the chart default — stated explicitly so the publisher's intent is unmistakable
+  # and a later edit can't quietly turn parking on for a leg that has no sink.)
+  deadLetter:
+    enabled: false
+
+  # ── P0 CAVEAT: a sharded publisher does NOT render yet ────────────────────────
+  #
+  # It is tempting to declare the publish taxonomy (sharding families) here, so the
+  # forward leg emits per-shard subjects (kv.cdc.aio.lp.m2g.s<K>.<op>) that sharded
+  # sink envs filter on. That does NOT work in P0 and is deliberately left commented
+  # out below.
+  #
+  # Why: today the forward leg only emits shard/prefix subject tokens when THIS
+  # release owns an ENABLED sharded/prefixed sink group, and the shard-coverage
+  # guard (INV-S4) fails the render when a family has no enabled sink group claiming
+  # its shards. A publisher has NO sink groups, so declaring a family here fails the
+  # render ("shard 0 is not claimed by any ENABLED sinkGroup"). Decoupling the
+  # publish taxonomy from locally-enabled sink groups is a later phase (P3,
+  # docs/design/multi-env-mixed-sink §3.2). Until P3 lands, a publisher that must
+  # feed sharded envs is not expressible — run AIO envs (whole-stream filter, which
+  # already absorbs sharded subjects harmlessly) until then.
+  #
+  #  sharding:
+  #    families:
+  #      lp:m2g:
+  #        shards: 32        # <- DO NOT set on a publisher until P3; render fails today

@@ -131,7 +131,12 @@ spec:
                    consumer.* inheritance chain). */}}
               SINK_GROUPS='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s|%s|%v|%s|%v;" $c.durable $c.filter $c.maxAckPending $g.ackWait $g.maxDeliver }}{{ end }}{{ end }}{{ end }}'
               DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s " $c.durable }}{{ end }}{{ end }}{{ end }}'
-              BASE_DURABLE={{ .Values.nats.stream.consumer.durable | quote }}
+              {{- /* Env-scoped prune root: cdc_sink_<envId> when connect.envId is
+                   set, else the bare base. Scoping the "our family" match to the
+                   env-scoped base is what keeps env A's init from pruning env B's
+                   cdc_sink_<envB>_* durables on the shared stream (empty envId =>
+                   the bare base, byte-identical to before). */}}
+              BASE_DURABLE={{ include "rrcs.connect.durableBase" $ | quote }}
 
               # Normalize a desired ack_wait ("30s") to ns to diff it against the
               # consumer's .config.ack_wait (always ns). Single unit (ms/s/m/h) or
