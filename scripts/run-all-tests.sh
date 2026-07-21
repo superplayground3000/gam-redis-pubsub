@@ -98,12 +98,18 @@ MB=$(git merge-base master HEAD 2>/dev/null || true)
 # so the render stays byte-exact everywhere a gating leak could appear. Long
 # Bloblang/args_mapping lines are safe from the base64 pattern: quotes, parens
 # and spaces break the 60+ run.
+# Also stripped since 280034f: the release-scoped `release: <name>` selector/label
+# lines — a DELIBERATE default-render change (cross-release wiring fix: bare app:
+# selectors round-robined connections across same-namespace releases). The value
+# is the helm release name, deterministic and content-free, so stripping it
+# cannot mask a gating leak.
 norm_render() {
   sed -E \
     -e 's/nats-init-[0-9a-f]{8}/nats-init-CREDSHASH/g' \
     -e '/[A-Za-z0-9+\/=_.-]{60,}/d' \
     -e '/^[[:space:]]*system_account:/d' \
     -e '/^[[:space:]]*\/\/ Account /d' \
+    -e '/^[[:space:]]*release: /d' \
     -e '/^[[:space:]]*$/d'
 }
 if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; then
@@ -431,10 +437,16 @@ HANDOFF_SET=("${EXT_AUTH[@]}"
   --set 'connect.sharding.families.lb:company.shards=4'
   --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}'
   --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true)
-HANDOFF_ON_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true) || fail L1
+# handoffStartSeq is REQUIRED with the toggle since Codex review F1 (the init
+# asserts the EXACT opt_start_seq, not just the policy).
+HANDOFF_ON_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13) || fail L1
 grep -qF 'handoff assert-only' <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only render missing the [handoff assert-only] branch"; fail L1; }
 grep -qF 'by_start_sequence'   <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must assert deliver_policy by_start_sequence"; fail L1; }
 grep -qF 'does NOT exist'      <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must fail closed (exit 1) on a MISSING durable"; fail L1; }
+grep -qE 'EXPECTED_START_SEQ="?13"?' <<<"$HANDOFF_ON_OUT" || { echo "L1: F1 exact start-seq assert missing (EXPECTED_START_SEQ must carry handoffStartSeq)"; fail L1; }
+# F1 guards: toggle without the seq, and the seq without the toggle, both fail loud.
+seg_guard F1-noseq 'handoffStartSeq is REQUIRED' "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true
+seg_guard F1-seq-noassert 'is set but connect.sink.handoffAssertOnly is not true' "${HANDOFF_SET[@]}" --set connect.sink.handoffStartSeq=13
 if grep -qE 'consumer add "\$STREAM" "\$CONSUMER"' <<<"$HANDOFF_ON_OUT"; then
   echo "L1: P6 assert-only still executes 'consumer add' (create path not compiled out — would auto-create --deliver all, VF-16)"; fail L1
 fi
@@ -446,9 +458,9 @@ seg_guard P6-bundled 'only valid on an EXTERNAL-NATS release' \
   --set 'connect.sharding.families.lb:company.shards=4' \
   --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
   --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true \
-  --set connect.sink.handoffAssertOnly=true
+  --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13
 seg_guard P6-bootstrap 'mutually exclusive with connect.sink.bootstrap.deliver' \
-  "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.bootstrap.deliver=new
+  "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13 --set connect.sink.bootstrap.deliver=new
 
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
