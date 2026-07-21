@@ -158,6 +158,8 @@ other consumers, or any other env.
 
 - `design.md` §8.4 (bootstrap), R3 (decision), §8.3 (the AIO→sharded handoff, which reuses
   this start-semantics validation via the P6 assert-only mode).
+- `runbook-aio-to-sharded-handoff.md` — the §8.3 handoff operationally, driven by
+  `connect.sink.handoffAssertOnly` (the assert-only counterpart of the bootstrap start policy here).
 - `chart/examples/values-sink-only.yaml` (carries `bootstrap.deliver: new`).
 - `rules/05-invariants.md` INV-1 (at-least-once — the boundary idempotence argument above
   relies on duplicates being absorbed).

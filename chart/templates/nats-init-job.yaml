@@ -1,4 +1,9 @@
 {{- if not .Values.nats.external.enabled }}
+{{- /* Guard: connect.sink.handoffAssertOnly is an EXTERNAL-NATS-only mode (design
+     §8.3/E7). On a bundled release the external init never renders, so without this
+     call the flag would be silently inert. Invoking the helper here makes a bundled
+     release carrying it fail render loud instead. */}}
+{{- $_ := include "rrcs.connect.sink.handoffAssertOnly" . }}
 apiVersion: batch/v1
 kind: Job
 metadata:

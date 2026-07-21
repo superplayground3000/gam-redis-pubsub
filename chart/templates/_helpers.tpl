@@ -157,6 +157,45 @@ Usage: {{ include "rrcs.connect.sink.bootstrapDeliver" . }}
 {{- end -}}
 
 {{/*
+rrcs.connect.sink.handoffAssertOnly — resolves connect.sink.handoffAssertOnly to
+"true"/"false" AND runs its two render guards (design E7, §8.3 step 3, plan P6).
+
+The handoff mode makes the EXTERNAL nats-init ASSERT that every durable this release
+derives already exists as `deliver_policy=by_start_sequence` (operator-precreated at
+F0+1) and NEVER auto-create — so an AIO→sharded per-env handoff can't silently fall
+back to create `--deliver all` (a 72h replay burst, VF-16) on a typo or a missing
+precreate. It is a one-window switch: turn on for the cutover, off again afterwards.
+
+Two things make it nonsensical outside that window, so we fail render loud rather than
+let them pass as inert:
+
+  1. BUNDLED NATS. The bundled nats-init owns and freely recreates its throwaway
+     consumers (labs rebuild from scratch); the assert-only contract only means
+     something against the user-owned durables on an EXTERNAL stream. A bundled
+     release carrying this flag is an operator mistake — fail, don't ignore it.
+  2. bootstrap.deliver ALSO set. A handoff release asserts a pre-existing
+     by_start_sequence position; declaring a bootstrap START policy at the same time
+     is contradictory (which one wins?). They are mutually exclusive by construction.
+
+Note the mode deliberately does NOT honour bootstrap.allowStartMismatch — see the
+assert branch in nats-init-external-job.yaml for why an escape hatch would defeat it.
+Usage: {{ if eq (include "rrcs.connect.sink.handoffAssertOnly" .) "true" }}...
+*/}}
+{{- define "rrcs.connect.sink.handoffAssertOnly" -}}
+{{- $h := (.Values.connect.sink).handoffAssertOnly | default false -}}
+{{- if $h -}}
+{{-   if not .Values.nats.external.enabled -}}
+{{-     fail "connect.sink.handoffAssertOnly=true is only valid on an EXTERNAL-NATS release (nats.external.enabled=true). The AIO→sharded handoff runbook (design §8.3) operates on user-owned durables on an external PROD stream; the bundled nats-init owns and freely recreates its throwaway consumers, so assert-only has nothing to assert against and bundled labs rebuild from scratch. Unset connect.sink.handoffAssertOnly on a bundled release." -}}
+{{-   end -}}
+{{-   $bDeliver := ((.Values.connect.sink).bootstrap | default dict).deliver | default "" -}}
+{{-   if ne $bDeliver "" -}}
+{{-     fail (printf "connect.sink.handoffAssertOnly=true is mutually exclusive with connect.sink.bootstrap.deliver=%q. A handoff release ASSERTS a pre-existing by_start_sequence durable (operator-precreated at F0+1, design §8.3); it must not ALSO declare a bootstrap start policy — the two contradict each other. Clear bootstrap.deliver for the handoff window, or turn handoffAssertOnly off." $bDeliver) -}}
+{{-   end -}}
+{{- end -}}
+{{- $h -}}
+{{- end -}}
+
+{{/*
 rrcs.connect.durableBase — the env-scoped durable base: nats.stream.consumer.durable
 with "_<envId>" appended when connect.envId is set, else the bare base. This is the
 single seam through which envId reaches EVERY derived durable — the synthesized

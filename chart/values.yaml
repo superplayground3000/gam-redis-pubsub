@@ -527,6 +527,29 @@ connect:
       # position (this is also the machinery the P6 assert-only handoff builds on).
       allowStartMismatch: false
 
+    # ── Assert-only handoff mode (AIO→sharded per-env cutover; design §8.3, E7) ──
+    # Set true ONLY during the §8.3 AIO→sharded handoff window, then turn it back
+    # OFF once the handoff completes. It makes the EXTERNAL nats-init REFUSE to
+    # auto-create any durable and instead ASSERT that every durable this release
+    # derives already exists as deliver_policy=by_start_sequence — the position the
+    # operator precreated at F0+1 (F0 = the old AIO durable's ack_floor.stream_seq,
+    # the contiguous-APPLIED prefix, read at quiesce; see runbook-aio-to-sharded-
+    # handoff.md). Any start_seq value is accepted (F0 is runtime-discovered, not
+    # known at render time); the observed start_seq is logged for audit.
+    #
+    # Why a whole mode instead of create-if-absent: the ordinary external init
+    # create path defaults --deliver all, so a single typo'd or missing precreate
+    # would silently build a durable that replays the entire 72h backlog (VF-16)
+    # the instant the old AIO durable is deleted. Assert-only exists precisely to
+    # catch that mistake BEFORE traffic moves — so it fails the release loud
+    # (missing durable => exit 1; wrong deliver_policy => exit 1) rather than
+    # papering over it. For the same reason it does NOT honour
+    # bootstrap.allowStartMismatch (an escape hatch would defeat the guard) and is
+    # mutually exclusive with bootstrap.deliver (a handoff release must not also
+    # declare a bootstrap start policy). It is EXTERNAL-NATS only — a bundled
+    # release carrying it fails render (bundled labs recreate from scratch).
+    handoffAssertOnly: false
+
   # ── Multi-subject sink groups (design D3) ──────────────────────────────────
   # Split the sink leg into N groups, each = (durable pull consumer × filter
   # subject × sink Deployment × Lease/elector), so key-prefix-routed messages

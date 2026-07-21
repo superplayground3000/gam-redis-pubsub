@@ -28,6 +28,12 @@
 {{- $expectedPolicy := "all" }}
 {{- if eq $bDeliver "new" }}{{- $deliverArg = "new" }}{{- $expectedPolicy = "new" }}{{- end }}
 {{- if eq $bDeliver "by-time" }}{{- $deliverArg = ($bTs | quote) }}{{- $expectedPolicy = "by_start_time" }}{{- end }}
+{{- /* Assert-only handoff mode (design §8.3/E7, P6). When true, the SINK_GROUPS loop
+     REFUSES to create any durable and instead asserts each already exists as
+     deliver_policy=by_start_sequence (operator-precreated at F0+1). The helper also
+     runs its render guards: fail on a bundled release, and fail if bootstrap.deliver
+     is also set (mutually exclusive — enforced here so both entry points share it). */}}
+{{- $handoffAssertOnly := eq (include "rrcs.connect.sink.handoffAssertOnly" .) "true" }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -175,7 +181,26 @@ spec:
                     echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values $DESIRED_MAXPENDING (throughput only; still usable, not changing a user-owned consumer)." >&2
                   fi
                   {{- end }}
-                  {{- if ne $bDeliver "" }}
+                  {{- if $handoffAssertOnly }}
+                  # ── Assert-only handoff: deliver_policy MUST be by_start_sequence (design §8.3/E7) ──
+                  # The operator precreated each shard durable with
+                  # `--deliver by_start_sequence --start-sequence <F0+1>` (F0 = the old
+                  # AIO durable's ack_floor.stream_seq, the contiguous-APPLIED prefix).
+                  # We assert the POLICY only; the start_seq itself is F0+1, discovered at
+                  # runtime by the operator, so we accept any value and just LOG it for
+                  # audit. A wrong policy (e.g. a leftover --deliver all durable squatting
+                  # on the name) would replay the whole 72h backlog (VF-16) the moment the
+                  # old AIO durable is deleted — so we fail closed and never auto-fix.
+                  CUR_DELIVER_POLICY=$(jq -r '.config.deliver_policy // "all"' /tmp/cons.json)
+                  CUR_START_SEQ=$(jq -r '.config.opt_start_seq // ""' /tmp/cons.json)
+                  echo "note: [handoff assert-only] consumer '$CONSUMER' deliver_policy=$CUR_DELIVER_POLICY start_seq=[${CUR_START_SEQ:-none}] — asserting by_start_sequence (operator precreated at F0+1; any start_seq accepted, logged for audit)." >&2
+                  if [ "$CUR_DELIVER_POLICY" != "by_start_sequence" ]; then
+                    echo "ERROR: [handoff assert-only] consumer '$CONSUMER' on '$STREAM' has deliver_policy=[$CUR_DELIVER_POLICY], but the §8.3 AIO→sharded handoff requires by_start_sequence — the operator must precreate every shard durable with '--deliver by_start_sequence --start-sequence <F0+1>' before deleting the old AIO durable. connect.sink.handoffAssertOnly=true will NOT auto-create or bless a wrong-policy durable: a --deliver all durable here replays the whole 72h backlog (VF-16) the instant the old AIO durable is gone. Precreate '$CONSUMER' correctly and re-run this Job." >&2
+                    echo "note: connect.sink.bootstrap.allowStartMismatch does NOT override this assertion — the handoff mode exists precisely to catch precreate mistakes, so an escape hatch would defeat it." >&2
+                    exit 1
+                  fi
+                  echo "note: [handoff assert-only] consumer '$CONSUMER' start_seq observed = [${CUR_START_SEQ:-none}] — audit this equals the F0+1 you precreated against the recorded ack_floor.stream_seq." >&2
+                  {{- else if ne $bDeliver "" }}
                   # ── Start-semantics validation (design §8.4, R3/F3) ────────────────
                   # Without this, a durable created by a PRIOR `--deliver all` (or any
                   # other policy) is accepted as "usable" below without ever inspecting
@@ -211,6 +236,15 @@ spec:
                   {{- end }}
                   echo "pull consumer '$CONSUMER' already exists on '$STREAM' with desired filter [$FILTER_SORTED], ack_policy=explicit, max_deliver=$CUR_MAXDELIVER; usable"
                 else
+                  {{- if $handoffAssertOnly }}
+                  # Assert-only handoff (design §8.3/E7): the durable is MISSING. We
+                  # never auto-create in this mode — the operator must PRECREATE every
+                  # shard durable (--deliver by_start_sequence --start-sequence F0+1)
+                  # before deleting the old AIO durable. Auto-creating here would
+                  # default --deliver all (VF-16) → a 72h replay burst. Fail closed.
+                  echo "ERROR: [handoff assert-only] consumer '$CONSUMER' does NOT exist on '$STREAM'. connect.sink.handoffAssertOnly=true REFUSES to auto-create durables: the §8.3 AIO→sharded handoff requires the operator to PRECREATE every shard durable with '--deliver by_start_sequence --start-sequence <F0+1>' before deleting the old AIO durable. Auto-creating here would default --deliver all (VF-16) and replay the whole 72h backlog. Precreate '$CONSUMER' and re-run this Job." >&2
+                  exit 1
+                  {{- else }}
                   {{- if ne $bDeliver "" }}
                   # bootstrap.deliver={{ $bDeliver }} => create with deliver_policy={{ $expectedPolicy }}{{ if eq $bDeliver "by-time" }} (opt_start_time={{ $bTs }}; natscli reads the RFC3339 --deliver value as by_start_time){{ end }} (design §8.4, R3). Legacy ("") keeps --deliver all.
                   {{- end }}
@@ -229,6 +263,7 @@ spec:
                     {{- end }}
                     --max-deliver="$DESIRED_MAXDELIVER" \
                     --defaults
+                  {{- end }}
                 fi
                 nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$CONSUMER"
               done
