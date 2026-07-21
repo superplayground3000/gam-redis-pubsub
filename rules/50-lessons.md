@@ -2,6 +2,25 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-20 — Containment guards need an exact-equality branch; prefix checks alone pass the degenerate case
+- What happened: the shared-prefix subject-layout change (PR #33) added guard N5 requiring
+  explicit `sinkGroups[*].filterSubject` to sit under `kv.cdc.<normalSegment>.`. The first
+  implementation used `hasPrefix` only, so the degenerate value exactly equal to the root
+  wildcard (`kv.cdc.aio.>`) passed — and because the whole-stream-vs-prefix double-delivery
+  guard only marks synthesized groups (`filterSubject==""`), an explicit root-wildcard group
+  plus a prefix group rendered successfully and would double-consume that prefix's traffic.
+  Same-model implementation, L1 renders, and the full test ladder all missed it; the Codex
+  cross-model review found and REPRODUCED it (render emitting both `cdc_sink_whole|kv.cdc.aio.>`
+  and `cdc_sink_pfx|kv.cdc.aio.prefix-a.>`).
+- Rule that would have prevented it: when writing any "must be under X" containment guard,
+  always enumerate the boundary set explicitly — exact equality with X, X with/without the
+  trailing separator, and the bare root — and add a fail-case test for each boundary form,
+  not just one in-range and one out-of-range sample. Second confirmation this cycle that
+  the cross-provider review stage catches guard-boundary classes same-model passes miss.
+- Applied: N5 now rejects `kv.cdc.aio.>` / `kv.cdc.aio.` / `kv.cdc.aio`; L1 gained
+  seg_guard cases N5-equality + N5-rootdot (message-matched, non-zero-exit asserted);
+  Codex re-review verdict approve. Recorded only — no rule file change.
+
 ## 2026-07-16 — The exporter's ns→s division does NOT apply to `metric`-processor timing values; live-dump the semantics, not just the names
 - What happened: while building the sync-health dashboard (PR #23), a live /metrics capture
   showed `cdc_sync_latency_seconds` records RAW NANOSECONDS into seconds-bounded buckets —

@@ -49,6 +49,13 @@ connect:
     # naming convention that also stays disjoint from nats.stream.subjectPrefix
     # (kv.cdc.*) — an overlapping DLQ subject would be re-consumed by the
     # whole-stream sink and loop, which the render also guards against.
+    #
+    # IN-PREFIX ALTERNATIVE: if your stream prefix is externally FIXED and the DLQ
+    # cannot live outside it, an opt-in layout moves both normal and DLQ traffic
+    # under kv.cdc.> on a second segment (normal kv.cdc.aio.<op>, DLQ
+    # kv.cdc.dlq.<reason>) and composes with this same all-in-one preset — see
+    # chart/examples/values-shared-prefix-aio.yaml and docs/dlq.md §10. This file
+    # keeps the default out-of-prefix DLQ behaviour.
     enabled: true
     subject: "dlq.cdc"
 

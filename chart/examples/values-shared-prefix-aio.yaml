@@ -1,0 +1,196 @@
+# Example values for the OPT-IN shared-prefix segment layout (in-prefix DLQ).
+#
+# This is the PROD-shaped example: one all-in-one sink drains the whole stream and
+# parks poison to a dead-letter subject that lives INSIDE the fixed stream prefix.
+#
+# What this shows:
+#   - How to move normal AND dead-letter traffic under a single, externally-fixed
+#     subject prefix by separating them on the SECOND subject segment.
+#   - The two segment keys (nats.stream.normalSegment, connect.deadLetter.segment)
+#     and the render guards that keep them disjoint.
+#   - How this composes with the all-in-one sink preset (connect.sinkAllInOne).
+#   - The extra step external-NATS operators must take (edit the durable filter).
+#   - The two-phase, zero-loss migration from an existing legacy-layout install.
+#
+# Full operator/maintainer guide (both layouts, guards, migration, citations):
+#   docs/dlq.md §10.
+# Design and rationale (owner-approved 2026-07-20):
+#   docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md
+#
+# ── Why this layout exists (read this first) ─────────────────────────────────
+#
+# The DEFAULT layout publishes normal traffic to kv.cdc.<op> and parks poison to
+# dlq.cdc.<reason> — OUTSIDE the stream prefix, so a whole-stream sink physically
+# cannot re-consume its own dead letters. That default is unchanged and is what
+# every other example and lab uses. Prefer it unless you hit the one case it
+# cannot serve:
+#
+#   A JetStream stream whose subject prefix is FIXED at kv.cdc (bound kv.cdc.> by
+#   an operator who cannot re-bind it — e.g. the PROD external NATS). There a DLQ
+#   at dlq.cdc.> is UNBINDABLE, so normal and DLQ traffic must both live under
+#   kv.cdc.> and be separated by their SECOND segment instead:
+#     normal -> kv.cdc.aio.<op>        (normalSegment: "aio")
+#     DLQ    -> kv.cdc.dlq.<reason>    (deadLetter.segment: "dlq")
+#     stream binding stays kv.cdc.>    (covers both segments; no re-bind needed)
+#
+# The trade: the default layout's disjointness is STRUCTURAL (DLQ physically
+# outside the sink filter). This layout makes it GUARD-ENFORCED — the render fails
+# loud unless normalSegment != deadLetter.segment (guard N1). That guard is
+# load-bearing; it is the only thing keeping the whole-stream sink from consuming
+# its own dead letters here.
+#
+# ── Install example (bundled NATS, fresh namespace) ──────────────────────────
+#   helm upgrade --install rrcs ./chart -n rrcs-k8s --create-namespace \
+#     -f chart/examples/values-shared-prefix-aio.yaml
+#
+# ── Render check (L1, seconds) ───────────────────────────────────────────────
+#   helm template chart/ -f chart/examples/values-shared-prefix-aio.yaml >/dev/null
+#   Expect (verify with helm template after the helper change lands): normal
+#   publish subject kv.cdc.aio.${!meta("op")}, whole-stream sink filter
+#   kv.cdc.aio.>, DLQ output subject kv.cdc.dlq.${!meta("dlq_reason")}, and stream
+#   subjects exactly kv.cdc.> (no dlq.cdc, no second root).
+
+nats:
+  stream:
+    # The stream prefix is UNCHANGED. Everything moves under it, not beside it.
+    subjectPrefix: "kv.cdc"
+
+    # NEW — segment mode. When set, ALL normal publishes and ALL sink filters move
+    # under <subjectPrefix>.<normalSegment>. Empty (the default) keeps the legacy
+    # kv.cdc.<op> layout. Must be a single literal token ([A-Za-z0-9_-]+, no dots
+    # or wildcards — guard N3) and must differ from deadLetter.segment (guard N1).
+    normalSegment: "aio"
+
+    consumer:
+      # NEW — used ONLY during a migration from an existing legacy install; leave
+      # EMPTY on a fresh install and in steady state. See the migration note at
+      # the bottom of this file. On a fresh/greenfield install it stays "" so the
+      # sink filter is the narrow kv.cdc.aio.> from the start.
+      migrationFilter: ""
+
+connect:
+  # This example uses the all-in-one preset: ONE sink consumer drains the whole
+  # stream (here kv.cdc.aio.>) and poison is parked to the in-prefix DLQ. The
+  # preset just asserts that single-whole-stream + mandatory-DLQ intent at render
+  # time; it adds no new pipeline or durable. See chart/examples/values-all-in-one.yaml
+  # for the preset's own assertions (G1: DLQ mandatory; G2: sinkGroups must be
+  # empty; G3: no sharding) — all of which hold here.
+  sinkAllInOne:
+    enabled: true
+
+  deadLetter:
+    # Mandatory under sinkAllInOne (one whole-stream ack floor would otherwise be
+    # head-of-line-blocked forever by a single poison message).
+    enabled: true
+
+    # NEW — segment mode for the DLQ. When set, the DLQ root becomes
+    # <subjectPrefix>.<segment> (here kv.cdc.dlq), so poison is published to
+    # kv.cdc.dlq.<reason> and the stream binding stays kv.cdc.> — no dlq.cdc.>
+    # subject is added. Requires normalSegment to be set (guard N2), must differ
+    # from it (guard N1), and must be a single literal token (guard N3).
+    segment: "dlq"
+
+    # LEAVE THIS AT ITS DEFAULT in segment mode. When deadLetter.segment is set,
+    # the legacy out-of-prefix subject is ignored, and setting it to anything other
+    # than its default "dlq.cdc" is a render error (guard N4) — the two modes are
+    # mutually exclusive, and silently ignoring a customised subject would be a
+    # trap. The DLQ root here is kv.cdc.dlq, derived from the prefix + segment.
+    subject: "dlq.cdc"
+
+# ── Credentials the in-prefix DLQ needs ──────────────────────────────────────
+#
+# In segment mode the DLQ publishes to kv.cdc.dlq.> — which is already inside the
+# subscriber creds' kv.cdc.> pub grant, so on a FRESH bundled-NATS install there
+# is nothing extra to grant. The committed chart/files/nats-auth/ creds are
+# regenerated once with BOTH the legacy dlq.cdc.> grant AND kv.cdc.> so the same
+# committed creds serve legacy and segment-mode installs (a superset grant is
+# harmless — only the sink ever publishes DLQ).
+#
+# CAUTION (the R3 in-place-swap trap): regenerating committed creds also rotates
+# the operator/account identities, so redeploying them onto a release installed
+# with older creds ORPHANS its KV_CDC stream state. Plan a fresh NATS (new install
+# or namespace) rather than an in-place creds swap on an existing release.
+#
+# ── EXTERNAL NATS (the PROD shape) ───────────────────────────────────────────
+#
+# The PROD target runs EXTERNAL NATS with the stream prefix fixed at kv.cdc. Two
+# things differ from the bundled example above; both are operator responsibilities
+# BEFORE the helm upgrade:
+#
+#   1. Stream binding: NONE needed. The external stream is already bound kv.cdc.>,
+#      which covers kv.cdc.aio.> and kv.cdc.dlq.> automatically. This is the whole
+#      point of the layout — the operator never has to touch the stream binding.
+#
+#   2. Consumer filter: the external nats-init job NEVER edits user-owned durables
+#      (it creates-if-absent or fails loud on a stale filter). So on external NATS
+#      the OPERATOR must edit the durable's filter first, then run the upgrade whose
+#      external job ASSERTS that same filter:
+#        nats consumer edit KV_CDC cdc_sink --filter 'kv.cdc.aio.>'
+#      (During a migration this desired filter is the superset — see the migration
+#      note below.) The subscriber creds must grant pub on kv.cdc.dlq.> (covered by
+#      a kv.cdc.> grant).
+#
+# Uncomment and point these at your own pre-created Secrets. These are placeholders:
+#
+# nats:
+#   external:
+#     enabled: true
+#     url: "nats://nats.your-cluster.example.com:4222"        # replace this
+#     monitorUrl: "http://nats.your-cluster.example.com:8222" # optional
+#     auth:
+#       publisherSecret: "your-publisher-creds-secret"    # replace this
+#       subscriberSecret: "your-subscriber-creds-secret"  # replace — MUST grant pub on kv.cdc.dlq.>
+#       adminSecret: "your-admin-creds-secret"            # optional
+
+# ── Two-phase migration from an existing LEGACY-layout install ────────────────
+#
+# Do NOT flip normalSegment + deadLetter.segment on a busy legacy install in one
+# step: narrowing the sink filter from kv.cdc.> to kv.cdc.aio.> at once would stop
+# matching any retained/pending message still on the bare kv.cdc.<op> subjects and
+# silently skip it — an at-least-once loss window. The op space is OPEN (the
+# forward leg publishes whatever meta("op") carries), so an enumerated transitional
+# filter would drop unknown ops, and JetStream forbids overlapping filter_subjects
+# so [kv.cdc.aio.>, kv.cdc.>] is not a valid union. Use the wildcard REPLACEMENT
+# filter in two phases (guard N6 keeps the superset filter from ever coexisting
+# with the in-prefix DLQ). The stream binding is never narrowed, so nothing is
+# rejected at publish time.
+#
+#   Phase A — move normal traffic. Upgrade with normalSegment: "aio" and
+#     nats.stream.consumer.migrationFilter: "kv.cdc.>". Leave the DLQ in its
+#     previous mode (off, or legacy dlq.cdc). The sink filter stays the superset
+#     kv.cdc.>, matching BOTH old kv.cdc.<op> and new kv.cdc.aio.<op> — nothing is
+#     skipped, whatever the op token.
+#       External NATS: operator first runs
+#         nats consumer edit KV_CDC cdc_sink --filter 'kv.cdc.>'
+#   Drain. Wait until nats consumer info KV_CDC cdc_sink shows num_ack_pending==0
+#     and num_pending only advances on kv.cdc.aio.* traffic (forward leg has rolled
+#     to the new publish subject).
+#   Phase B — narrow + move DLQ in-prefix. Upgrade with migrationFilter: "" and
+#     deadLetter.segment: "dlq" (+ enabled: true) — i.e. the steady-state values in
+#     this file. The filter narrows to kv.cdc.aio.>; every old-subject message was
+#     already acked in Phase A, so the narrow skips nothing, and the in-prefix DLQ
+#     activates only now, when no superset filter can see it.
+#       External NATS: operator first runs
+#         nats consumer edit KV_CDC cdc_sink --filter 'kv.cdc.aio.>'
+#
+# A fresh/greenfield install needs NONE of this — this file (migrationFilter: "")
+# is already the correct steady state.
+
+# ── How to confirm it is working (observability, INV-2) ──────────────────────
+#
+# Same signals as the DLQ example: Grafana panel 18 "DLQ: routed vs confirmed
+# parked" (routed == confirmed parked, publish failures at 0 is healthy). The only
+# difference in segment mode is the subject: parked poison lands on
+# kv.cdc.dlq.<reason> instead of dlq.cdc.<reason>. The CDCDeadLetterPublishFailing
+# alert pages on output_error for the DLQ output regardless of layout.
+#
+# ── What is proven, and what is not ──────────────────────────────────────────
+#
+# - Segment-mode end-to-end is proven by the parameterised L3 e2e
+#   (scripts/verify-dlq-e2e.sh run with normalSegment=aio / segment=dlq): poison on
+#   kv.cdc.dlq.<reason>, normal traffic on kv.cdc.aio.*, sink filter kv.cdc.aio.>.
+# - The behavioural labs (labs/redis-cdc-error-alerting, labs/by-key-prefix-split-topic)
+#   exercise the LEGACY default layout only and are intentionally unchanged — they
+#   remain the legacy-mode proof, not a segment-mode one.
+# - External NATS end-to-end (the operator consumer-edit step) is an operational
+#   procedure; validate it in staging before PROD.

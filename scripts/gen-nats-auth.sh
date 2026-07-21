@@ -6,9 +6,22 @@
 # Env overrides (defaults match chart/values.yaml):
 #   STREAM_NAME=APP_EVENTS        DURABLE_NAME=region-writer
 #   SUBJECT_PREFIX=app.events     (publisher --allow-pub is "<prefix>.>")
-#   DLQ_SUBJECT (default: connect.deadLetter.subject in values.yaml, else
-#                dlq.cdc)         (subscriber --allow-pub is "<DLQ_SUBJECT>.>")
+#   DLQ_SEGMENT (default: connect.deadLetter.segment in values.yaml, else empty)
+#                                 In-prefix DLQ mode: when non-empty the ACTIVE DLQ
+#                                 root becomes "<SUBJECT_PREFIX>.<DLQ_SEGMENT>"
+#                                 (mirrors the rrcs.nats.dlqRoot chart helper).
+#   DLQ_SUBJECT (default: mode-aware — <SUBJECT_PREFIX>.<DLQ_SEGMENT> when DLQ_SEGMENT
+#                is set, else connect.deadLetter.subject in values.yaml, else dlq.cdc)
 #   OPERATOR_NAME=RRCS-OP         ACCOUNT_NAME=APP
+#
+# The subscriber is granted DLQ pub on a SUPERSET of BOTH layouts — the legacy
+# out-of-prefix root (dlq.cdc.>) AND the in-prefix root (<SUBJECT_PREFIX>.dlq.>) —
+# so ONE committed creds set serves legacy and segment-mode installs alike. Only the
+# sink ever publishes DLQ, so the extra grant is harmless (design §5).
+#
+# --dry-run: print the resolved stream/subject/DLQ config (including the computed
+#            DLQ_SUBJECT and the superset DLQ pub grants) and exit WITHOUT invoking
+#            nsc — use it to confirm mode resolution before minting creds.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -16,9 +29,11 @@ LAB_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${LAB_DIR}"
 
 FORCE=0
+DRY_RUN=0
 for arg in "$@"; do
   case "$arg" in
     --force) FORCE=1;;
+    --dry-run) DRY_RUN=1;;
     -h|--help)
       grep '^#' "$0" | sed 's/^# \{0,1\}//'
       exit 0;;
@@ -107,6 +122,27 @@ parse_values() {
           }
         ' chart/values.yaml)"
         ;;
+      connect.deadLetter.segment)
+        # In-prefix DLQ segment (opt-in; default empty = legacy out-of-prefix mode).
+        # Mirrors the rrcs.nats.dlqRoot helper's segment lookup so the creds this
+        # script mints stay in sync with the chart's computed DLQ root.
+        # shellcheck disable=SC2016
+        # SC2016: awk program is single-quoted intentionally — $0/etc are awk
+        # field refs, not shell variables.
+        val="$(awk '
+          /^connect:/{in_connect=1; next}
+          /^[a-zA-Z]/{in_connect=0}
+          in_connect && /^  deadLetter:/{in_dlq=1; next}
+          in_connect && /^  [a-zA-Z]/{in_dlq=0}
+          in_dlq && /^    segment:/{
+            gsub(/^    segment:[[:space:]]*/,"")
+            gsub(/[[:space:]]*#.*$/,"")
+            gsub(/^"|"$/,"")
+            print
+            exit
+          }
+        ' chart/values.yaml)"
+        ;;
     esac
     [[ -n "$val" ]] && { echo "$val"; return; }
   fi
@@ -116,15 +152,60 @@ parse_values() {
 STREAM_NAME="${STREAM_NAME:-$(parse_values nats.stream.name APP_EVENTS)}"
 SUBJECT_PREFIX="${SUBJECT_PREFIX:-$(parse_values nats.stream.subjectPrefix app.events)}"
 DURABLE_NAME="${DURABLE_NAME:-$(parse_values nats.stream.consumer.durable region-writer)}"
-# DLQ base subject, resolved from chart's connect.deadLetter.subject (same
-# precedence as the other values: env override > values.yaml > built-in
-# default) so that a customized subject in values.yaml stays in sync with the
-# creds this script mints. The sink publishes permanently-unprocessable
-# messages to "<DLQ_SUBJECT>.<reason>" using the subscriber creds, so the
-# subscriber user needs pub on the subtree.
-DLQ_SUBJECT="${DLQ_SUBJECT:-$(parse_values connect.deadLetter.subject dlq.cdc)}"
+# DLQ root subject, mode-aware — mirrors the rrcs.nats.dlqRoot chart helper so the
+# creds this script mints can never disagree with the pipeline's park subject:
+#   - LEGACY  (connect.deadLetter.segment empty):  connect.deadLetter.subject (dlq.cdc)
+#   - IN-PREFIX (segment set):  <SUBJECT_PREFIX>.<segment>  (e.g. kv.cdc.dlq)
+# Precedence for each input stays env override > values.yaml > built-in default.
+DLQ_LEGACY_SUBJECT="${DLQ_LEGACY_SUBJECT:-$(parse_values connect.deadLetter.subject dlq.cdc)}"
+DLQ_SEGMENT="${DLQ_SEGMENT:-$(parse_values connect.deadLetter.segment "")}"
+if [[ -n "${DLQ_SEGMENT}" ]]; then
+  DLQ_SUBJECT="${DLQ_SUBJECT:-${SUBJECT_PREFIX}.${DLQ_SEGMENT}}"
+else
+  DLQ_SUBJECT="${DLQ_SUBJECT:-${DLQ_LEGACY_SUBJECT}}"
+fi
+
+# Superset DLQ pub grants for the subscriber. The sink publishes permanently-
+# unprocessable messages to "<root>.<reason>" using these SAME subscriber creds
+# (there is no separate DLQ-publisher identity). To let ONE committed creds set
+# serve BOTH layouts (kind e2e always fresh-installs), grant pub on the union of:
+#   - the legacy out-of-prefix root   (dlq.cdc.>)
+#   - the in-prefix root              (<SUBJECT_PREFIX>.<segment>.> — segment defaults
+#                                      to "dlq" for grant purposes even when the chart
+#                                      default leaves it empty)
+#   - the ACTIVE root                 (covers a custom DLQ_SUBJECT/DLQ_SEGMENT override)
+# Only the sink publishes DLQ, so the broader-than-active grant is harmless (design §5).
+DLQ_INPREFIX_SUBJECT="${SUBJECT_PREFIX}.${DLQ_SEGMENT:-dlq}"
+declare -a DLQ_PUB_SUBTREES=()
+add_dlq_subtree() {
+  local subtree="$1.>" existing
+  for existing in ${DLQ_PUB_SUBTREES[@]+"${DLQ_PUB_SUBTREES[@]}"}; do
+    [[ "$existing" == "$subtree" ]] && return 0
+  done
+  DLQ_PUB_SUBTREES+=("$subtree")
+}
+add_dlq_subtree "${DLQ_LEGACY_SUBJECT}"
+add_dlq_subtree "${DLQ_INPREFIX_SUBJECT}"
+add_dlq_subtree "${DLQ_SUBJECT}"
+
 OPERATOR_NAME="${OPERATOR_NAME:-RRCS-OP}"
 ACCOUNT_NAME="${ACCOUNT_NAME:-APP}"
+
+if (( DRY_RUN )); then
+  echo "[dry-run] resolved config (no nsc invoked):"
+  echo "  STREAM_NAME          = ${STREAM_NAME}"
+  echo "  SUBJECT_PREFIX       = ${SUBJECT_PREFIX}   (publisher --allow-pub ${SUBJECT_PREFIX}.>)"
+  echo "  DURABLE_NAME         = ${DURABLE_NAME}"
+  echo "  DLQ_SEGMENT          = ${DLQ_SEGMENT:-<empty> (legacy out-of-prefix mode)}"
+  echo "  DLQ_LEGACY_SUBJECT   = ${DLQ_LEGACY_SUBJECT}"
+  echo "  DLQ_INPREFIX_SUBJECT = ${DLQ_INPREFIX_SUBJECT}"
+  echo "  DLQ_SUBJECT (active) = ${DLQ_SUBJECT}"
+  echo "  subscriber DLQ pub grants (superset):"
+  for subtree in "${DLQ_PUB_SUBTREES[@]}"; do
+    echo "    --allow-pub ${subtree}"
+  done
+  exit 0
+fi
 
 if [[ -f "${OUT}/operator.jwt" && "${FORCE}" -ne 1 ]]; then
   echo "error: ${OUT}/ already populated. Pass --force to regenerate." >&2
@@ -187,16 +268,21 @@ echo "[gen] user subscriber"
 # consumer — the nats-init Job (admin creds) provisions them. bind:true only
 # attaches. (Re-add them here if you ever run a non-bind/push sink.)
 #
-# DLQ (design §4.4): the sink also publishes permanently-unprocessable
-# messages to "${DLQ_SUBJECT}.<reason>" using these SAME subscriber creds
-# (there is no separate DLQ-publisher identity), so grant pub on the DLQ
-# subtree here too.
+# DLQ (design §4.4, §5): the sink also publishes permanently-unprocessable
+# messages to "<root>.<reason>" using these SAME subscriber creds (there is no
+# separate DLQ-publisher identity). The grant is the SUPERSET of both DLQ layouts
+# (${DLQ_PUB_SUBTREES[*]}) so one committed creds set serves legacy AND segment-mode
+# installs — see the DLQ_PUB_SUBTREES derivation above and the header note.
+DLQ_PUB_ARGS=()
+for subtree in "${DLQ_PUB_SUBTREES[@]}"; do
+  DLQ_PUB_ARGS+=(--allow-pub "${subtree}")
+done
 nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
   --allow-pub '$JS.ACK.'"${STREAM_NAME}"'.>' \
   --allow-pub '$JS.API.STREAM.INFO.'"${STREAM_NAME}" \
   --allow-pub '$JS.API.CONSUMER.INFO.'"${STREAM_NAME}"'.*' \
   --allow-pub '$JS.API.CONSUMER.MSG.NEXT.'"${STREAM_NAME}"'.*' \
-  --allow-pub "${DLQ_SUBJECT}.>" \
+  "${DLQ_PUB_ARGS[@]}" \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user admin"
@@ -233,7 +319,40 @@ Stream/durable/subject prefix bound into the user JWT permissions:
 - Durable:        ${DURABLE_NAME}
 - Subject prefix: ${SUBJECT_PREFIX}  (publisher --allow-pub ${SUBJECT_PREFIX}.>)
 
-To rotate or change stream/durable/prefix: rerun with --force.
+## DLQ pub grants (subscriber) — superset of BOTH layouts
+
+The sink parks permanently-unprocessable messages using the **subscriber** creds
+(there is no separate DLQ-publisher identity). There are two mutually-exclusive DLQ
+layouts, and this committed creds set is minted to serve **both** so one fixture
+works whether an install runs in legacy or in-prefix mode (kind e2e always
+fresh-installs; only the sink publishes DLQ, so the broader grant is harmless):
+
+- legacy out-of-prefix root:  \`${DLQ_LEGACY_SUBJECT}.>\`   (connect.deadLetter.subject)
+- in-prefix root:             \`${DLQ_INPREFIX_SUBJECT}.>\`  (<subjectPrefix>.<segment>, segment defaults to "dlq")
+
+Active DLQ root for this render: \`${DLQ_SUBJECT}\`.
+
+The **publisher** grant is \`${SUBJECT_PREFIX}.>\`. In in-prefix mode this wildcard
+now incidentally covers the DLQ subtree \`${DLQ_INPREFIX_SUBJECT}.>\` as well. That is
+an accepted least-privilege wart: the source (publisher) never parks DLQ messages,
+so the extra reach is unused, and narrowing it would require splitting the fixed
+external prefix that the whole design deliberately keeps as a single \`${SUBJECT_PREFIX}.>\`
+binding.
+
+## R3 — never swap regenerated creds onto an existing release
+
+Rerunning \`scripts/gen-nats-auth.sh --force\` rotates the **operator and account
+identities**, not just the grants. Redeploying the regenerated creds in-place onto a
+release that was installed with the previous identities orphans that release's
+existing \`${STREAM_NAME}\` stream/consumer state (the server no longer trusts the old
+account). Any regeneration therefore requires a **fresh NATS** — a new install or a
+new namespace — never an in-place swap on a live release. See the CAUTION block at
+\`chart/values.yaml\` connect.deadLetter (the "operator and account identities" note)
+for the same warning on the values side.
+
+To rotate or change stream/durable/prefix/DLQ segment: rerun with --force
+(subject to the R3 fresh-NATS requirement above). Use \`--dry-run\` to preview the
+resolved config and DLQ grants without invoking nsc.
 
 In production, signing keys live in a secret manager (Vault / External
 Secrets / SealedSecrets) and user creds are provisioned into K8s Secrets

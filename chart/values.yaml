@@ -76,6 +76,31 @@ nats:
   stream:
     name: KV_CDC
     subjectPrefix: "kv.cdc"
+    # Second subject segment that ALL normal CDC traffic moves under when set.
+    # Empty (default) = today's layout, byte-identical render.
+    #
+    # Why it exists: on external PROD NATS the stream's subject prefix is FIXED at
+    # kv.cdc and cannot be widened, so a shared-stream DLQ cannot live at a sibling
+    # root like dlq.cdc.> (that subject is unbindable on the fixed stream). Instead,
+    # normal and DLQ traffic are separated by the SECOND segment under the fixed
+    # prefix: normal at <subjectPrefix>.<normalSegment>.>, DLQ at
+    # <subjectPrefix>.<connect.deadLetter.segment>.> (see connect.deadLetter.segment).
+    # The stream keeps binding the superset <subjectPrefix>.> so the external stream
+    # binding never has to change.
+    #
+    # When set, publishes become <subjectPrefix>.<normalSegment>.<op> (or
+    # <subjectPrefix>.<normalSegment>.<kv_prefix>.<op> under prefix-routing / sharding)
+    # and every derived sink filter shifts under the segment too — one global rule,
+    # no per-mode taxonomy fork.
+    #
+    # Migration from an existing install is TWO-PHASE and zero-loss: set this together
+    # with nats.stream.consumer.migrationFilter first (phase A), then move the DLQ
+    # in-prefix in a second upgrade (phase B). See
+    # docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md §6.
+    #
+    # Grammar: a single subject token [A-Za-z0-9_-]+ (no dots, no wildcards). Must
+    # differ from connect.deadLetter.segment (the render fails otherwise — guard N1).
+    normalSegment: ""
     consumer:
       durable: "cdc_sink"
       # Server-side pull-consumer settings. In pull(bind) mode Redpanda
@@ -89,6 +114,25 @@ nats:
                             # If you raise ackWait, raise that window too.
       maxAckPending: 1024    # max un-acked msgs in flight (sink throughput knob)
       maxDeliver: -1         # -1 = redeliver forever until acked
+      # Migration-only override: when set (e.g. "kv.cdc.>") it REPLACES the
+      # synthesized whole-stream/default group's consumer filter for the duration of a
+      # segment-layout migration (nats.stream.normalSegment). Empty (default) = no
+      # override.
+      #
+      # Why a replacement and not a union: narrowing the durable's filter from kv.cdc.>
+      # straight to kv.cdc.<normalSegment>.> would silently skip any message still
+      # retained on an old bare kv.cdc.<op> subject = at-least-once loss. The op space
+      # is OPEN, so an enumerated filter list cannot cover it, and JetStream forbids
+      # overlapping filter_subjects (so [kv.cdc.aio.>, kv.cdc.>] is not a valid union).
+      # A single superset wildcard held across phase A keeps matching BOTH old and new
+      # subjects; phase B clears it and the filter narrows once the backlog is drained.
+      #
+      # EXTERNAL NATS: the bundled init job never edits user-owned durables — it only
+      # ASSERTS the desired filter (which incorporates this value). The operator edits
+      # the durable's filter first (nats consumer edit KV_CDC cdc_sink --filter ...),
+      # then runs the helm upgrade. See the plan §6. Must NOT be combined with an
+      # in-prefix DLQ (connect.deadLetter.segment + enabled) — the render fails (N6).
+      migrationFilter: ""
     maxAge: "1h"
     maxBytes: "256MB"
     maxMsgSize: "1MB"
@@ -187,22 +231,43 @@ connect:
     # "routed" climbing while "confirmed parked" stays flat. That divergence is
     # the signal to re-check the creds grant.
     enabled: false
-    # Where parked messages go. The sink publishes per-reason as
-    # <subject>.<reason> (e.g. dlq.cdc.decode_error) and the stream binds
-    # <subject>.> to capture them all.
+    # Where parked messages go. There are TWO mutually-exclusive DLQ layouts:
     #
-    # This subject MUST live OUTSIDE nats.stream.subjectPrefix (kv.cdc.*). If it
-    # overlapped, a sink consumer would re-consume its own dead letters in an
-    # endless loop — so the render fails loud when the subject is not disjoint.
-    # Keep the default unless you have a naming convention that also stays clear
-    # of the kv.cdc.* space.
+    # LEGACY out-of-prefix (this `subject` key, the default): the sink publishes
+    # per-reason as <subject>.<reason> (e.g. dlq.cdc.decode_error) and the stream
+    # binds <subject>.> alongside <subjectPrefix>.> to capture them all. This subject
+    # MUST live OUTSIDE nats.stream.subjectPrefix (kv.cdc.*): if it overlapped, a
+    # whole-stream sink consumer would re-consume its own dead letters in an endless
+    # loop — so the render fails loud when the subject is not disjoint. Keep the
+    # default unless you have a naming convention that also stays clear of kv.cdc.*.
+    #
+    # IN-PREFIX (set connect.deadLetter.segment below instead): when the stream prefix
+    # is FIXED and cannot be widened (external PROD NATS), an out-of-prefix dlq.cdc.>
+    # root is unbindable. In that mode you set nats.stream.normalSegment +
+    # connect.deadLetter.segment so normal traffic lives at
+    # <subjectPrefix>.<normalSegment>.> and the DLQ at <subjectPrefix>.<segment>.>,
+    # both under the single superset binding <subjectPrefix>.>. Disjointness is then
+    # enforced by the normalSegment != segment render guard (N1) rather than
+    # structurally. In segment mode this `subject` key MUST stay at its default —
+    # setting both layouts is a render error (guard N4), since one would be ignored.
     subject: "dlq.cdc"
+    # In-prefix DLQ segment (opt-in; requires nats.stream.normalSegment). When set
+    # (e.g. "dlq") the DLQ root becomes <nats.stream.subjectPrefix>.<segment> — e.g.
+    # kv.cdc.dlq — so the per-reason park subject is kv.cdc.dlq.<reason> and the stream
+    # binds the superset kv.cdc.> alone (no separate dlq.cdc.> root, no external stream
+    # binding change). Empty (default) = legacy out-of-prefix mode using `subject`
+    # above. Grammar: a single token [A-Za-z0-9_-]+; must differ from
+    # nats.stream.normalSegment (guard N1). See
+    # docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md.
+    segment: ""
   # ── All-in-one sink (validating preset) ──────────────────────────────────────
   # A single named switch for the topology "ONE consumer drains the entire stream
-  # (kv.cdc.>) and any message it can never apply is parked to the DLQ
-  # (dlq.cdc.<reason>, same stream) instead of redelivering forever." That is
-  # already the DEFAULT single-sink shape — this preset just makes the intent
-  # explicit and ASSERTS it, so a later edit cannot quietly drift away from it.
+  # (kv.cdc.>, or kv.cdc.<normalSegment>.> in segment mode) and any message it can
+  # never apply is parked to the DLQ (dlq.cdc.<reason> legacy, or
+  # kv.cdc.<deadLetter.segment>.<reason> in segment mode, same stream) instead of
+  # redelivering forever." That is already the DEFAULT single-sink shape — this preset
+  # just makes the intent explicit and ASSERTS it, so a later edit cannot quietly
+  # drift away from it.
   #
   # It adds no new pipeline, deployment, durable, stream, or DLQ code path. It is
   # a render-time alias that REQUIRES the all-in-one topology and fails loud on
@@ -223,13 +288,17 @@ connect:
   # limits --discard old; lab default nats.stream.maxAge = 1h, PROD external NATS
   # = 72h). A parked message not drained within that window is discarded — this is
   # an accepted operational bound (owner ruling 2026-07-20), not a bug. Drain
-  # dlq.cdc.> within the stream max-age.
+  # dlq.cdc.> (or kv.cdc.<deadLetter.segment>.> in segment mode) within the stream
+  # max-age.
   #
   # EXTERNAL NATS (the PROD case): the external nats-init variant does NOT
   # reconcile external streams — it only ASSERTS that the stream binds the
-  # expected subjects and fails loud otherwise. So before enabling this on
-  # external NATS, the operator must add dlq.cdc.> to the external stream's
-  # subject binding; otherwise the init job fails (correctly) at install time.
+  # expected subjects and fails loud otherwise. In LEGACY out-of-prefix mode the
+  # operator must add dlq.cdc.> to the external stream's subject binding before
+  # enabling this, otherwise the init job fails (correctly) at install time. In
+  # SEGMENT mode (nats.stream.normalSegment + connect.deadLetter.segment) the DLQ
+  # lives under the already-bound superset kv.cdc.>, so NO external binding change is
+  # needed — that is the whole point of the fixed-prefix layout.
   #
   # MIGRATION from a prefix-routed install (collapsing sinkGroups into all-in-one):
   # the non-sharded orphan prune deletes the per-prefix cdc_sink_<name> durables

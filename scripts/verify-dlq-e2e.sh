@@ -36,7 +36,36 @@ CTX="${RRCS_CONTEXT:-kind-cdc}"
 VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
 N="${DLQ_N:-5}"
 REASON="hash_decode_error"
-DLQ_SUBJECT="dlq.cdc.${REASON}"
+# ── DLQ layout mode ───────────────────────────────────────────────────────────
+# Default (RRCS_DLQ_MODE unset or "legacy"): the shipped legacy layout — normal
+# traffic on kv.cdc.<op>, DLQ parked OUT of the stream prefix at dlq.cdc.<reason>,
+# stream bound to BOTH kv.cdc.> and dlq.cdc.>. This path is byte-for-byte the
+# original proof; nothing below its guards changes.
+#
+# RRCS_DLQ_MODE=segment: the opt-in shared-prefix layout
+# (docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md). Normal
+# traffic moves under kv.cdc.aio.<op>, the DLQ moves IN-prefix to kv.cdc.dlq.<reason>,
+# and the stream binding stays the single superset kv.cdc.> (no dlq.cdc.> subject).
+# We install with the segment values and flip the two mode-dependent assertions
+# (the DLQ subject and the stream-binding check) accordingly.
+DLQ_MODE="${RRCS_DLQ_MODE:-legacy}"
+case "$DLQ_MODE" in
+  legacy)
+    DLQ_SUBJECT="dlq.cdc.${REASON}"
+    # Extra helm --set for step-0's verify-cdc install (empty = pure default).
+    MODE_SET=""
+    ;;
+  segment)
+    DLQ_SUBJECT="kv.cdc.dlq.${REASON}"
+    # Space-separated pairs — verify-cdc.sh's RRCS_SET splits on whitespace into
+    # one --set each (scripts/verify-cdc.sh:11,16).
+    MODE_SET="nats.stream.normalSegment=aio connect.deadLetter.segment=dlq"
+    ;;
+  *)
+    echo "[dlq-e2e] FAIL: unknown RRCS_DLQ_MODE='${DLQ_MODE}' (expected 'legacy' or 'segment')" >&2
+    exit 1
+    ;;
+esac
 STREAM="KV_CDC"
 DURABLE="cdc_sink"
 CENTRAL_STREAM="app.events"
@@ -72,11 +101,15 @@ if kubectl --context "$CTX" get ns "$NS" >/dev/null 2>&1; then
   kubectl --context "$CTX" delete ns "$NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
 fi
 
-log "=== step 0: verify-cdc.sh with connect.deadLetter.enabled=true (fresh ns ${NS}) ==="
+log "=== step 0: verify-cdc.sh with connect.deadLetter.enabled=true (mode=${DLQ_MODE}, fresh ns ${NS}) ==="
+# RRCS_SET stays exactly "connect.deadLetter.enabled=true" in legacy mode (MODE_SET
+# empty); segment mode appends the two segment keys so the install renders the
+# in-prefix layout under test.
+DLQ_RRCS_SET="connect.deadLetter.enabled=true${MODE_SET:+ $MODE_SET}"
 VERIFY_LOG="$(mktemp)"
 set +e
 RRCS_NS="$NS" RRCS_RELEASE="$RELEASE" RRCS_VALUES="$VALUES_FILE" \
-  RRCS_SET="connect.deadLetter.enabled=true" \
+  RRCS_SET="$DLQ_RRCS_SET" \
   scripts/verify-cdc.sh 2>&1 | tee "$VERIFY_LOG"
 VC_RC="${PIPESTATUS[0]}"
 set -e
@@ -100,12 +133,26 @@ kubectl --context "$CTX" run "$PROBE" -n "$NS" --image=natsio/nats-box:0.14.5 --
 k wait --for=condition=Ready "pod/${PROBE}" --timeout=60s >/dev/null 2>&1 || die "nats-box probe not Ready"
 na() { k exec "$PROBE" -- nats --server "$NATS_URL" --creds /creds/user.creds "$@"; }
 
-# ── 1. stream bound to BOTH subjects ─────────────────────────────────────────
-log "=== step 1: KV_CDC subject binding ==="
+# ── 1. stream binding (mode-dependent) ───────────────────────────────────────
+# legacy: KV_CDC bound to BOTH kv.cdc.> and out-of-prefix dlq.cdc.>.
+# segment: KV_CDC bound to the single superset kv.cdc.> ONLY (the in-prefix DLQ
+#          kv.cdc.dlq.> is already covered by kv.cdc.>, so no dlq.cdc.> is added).
+log "=== step 1: KV_CDC subject binding (mode=${DLQ_MODE}) ==="
 STREAM_SUBJECTS="$(na stream info "$STREAM" --json 2>/dev/null | jq -r '.config.subjects | join(",")')"
 log "KV_CDC subjects: [${STREAM_SUBJECTS}]"
 echo "$STREAM_SUBJECTS" | grep -q 'kv.cdc.>'  || die "KV_CDC not bound to kv.cdc.> (got [${STREAM_SUBJECTS}])"
-echo "$STREAM_SUBJECTS" | grep -q 'dlq.cdc.>' || die "KV_CDC not bound to dlq.cdc.> — enabled render did not extend subjects (got [${STREAM_SUBJECTS}]); check the nats-init Job log"
+if [ "$DLQ_MODE" = "segment" ]; then
+  echo "$STREAM_SUBJECTS" | grep -q 'dlq.cdc.>' \
+    && die "segment mode: KV_CDC must NOT add an out-of-prefix dlq.cdc.> subject — the in-prefix DLQ lives under kv.cdc.> (got [${STREAM_SUBJECTS}])"
+  # Also assert the sink consumer filter narrowed to the segment (kv.cdc.aio.>),
+  # not the bare superset kv.cdc.> (which would re-consume its own dead letters).
+  SINK_FILTER="$(na consumer info "$STREAM" "$DURABLE" --json 2>/dev/null | jq -r 'if ((.config.filter_subjects // []) | length) > 0 then (.config.filter_subjects | join(",")) else (.config.filter_subject // "") end')"
+  log "segment mode: cdc_sink filter=[${SINK_FILTER}]"
+  echo "$SINK_FILTER" | grep -q 'kv.cdc.aio.>' \
+    || die "segment mode: cdc_sink filter must be kv.cdc.aio.> (got [${SINK_FILTER}])"
+else
+  echo "$STREAM_SUBJECTS" | grep -q 'dlq.cdc.>' || die "KV_CDC not bound to dlq.cdc.> — enabled render did not extend subjects (got [${STREAM_SUBJECTS}]); check the nats-init Job log"
+fi
 
 # ── metrics helpers ──────────────────────────────────────────────────────────
 # Only the leader sink pod has the pipeline (elector); standbys return an empty
@@ -196,6 +243,15 @@ FIN_ACKPEND="$(consumer_field '.num_ack_pending')"; FIN_ACKPEND="${FIN_ACKPEND:-
 (( FIN_ACKPEND == 0 )) && acked_zero_seen=1
 cur_dlq="$(dlq_count)"
 
+# segment mode: confirm normal traffic actually transited kv.cdc.aio.* (the whole
+# point of the layout) — not the bare legacy kv.cdc.<op> subjects. Sum the retained
+# message counts under kv.cdc.aio.> (`nats stream subjects` returns {subject:count}).
+AIO_MSGS=-1
+if [ "$DLQ_MODE" = "segment" ]; then
+  AIO_MSGS="$(na stream subjects "$STREAM" 'kv.cdc.aio.>' --json 2>/dev/null | jq -r 'add // 0' 2>/dev/null || echo 0)"
+  log "segment mode: messages retained under kv.cdc.aio.* = ${AIO_MSGS}"
+fi
+
 # ── 5. sink metrics after ────────────────────────────────────────────────────
 FIN_DUMP="$(mktemp)"; sink_metrics_dump "$FIN_DUMP"
 FIN_UNPROC="$(metric_val "$FIN_DUMP" cdc_unprocessable "reason=\"${REASON}\"")"
@@ -235,6 +291,9 @@ add_fail() { PASS=false; REASONS="${REASONS}${REASONS:+; }$1"; }
 (( D_ERR    == 0 )) || add_fail "output_error{dlq_out} delta ${D_ERR} != 0 (DLQ publish errors)"
 (( normal_present == 1 )) || add_fail "normal create ${NORMAL_KEY} absent from region (pipeline blocked)"
 (( hdr_ok == 1 )) || add_fail "parked-message header contract mismatch"
+if [ "$DLQ_MODE" = "segment" ]; then
+  (( AIO_MSGS >= 1 )) || add_fail "segment mode: no normal traffic observed under kv.cdc.aio.* (got ${AIO_MSGS})"
+fi
 
 RESULT="$(printf '{"runid":"%s","ns":"%s","n":%d,"reason":"%s","stream_subjects":"%s","dlq_delta":%d,"unproc_delta":%d,"forwarded_delta":%d,"output_sent_dlq_out_delta":%d,"output_error_dlq_out_delta":%d,"num_ack_pending_final":%d,"num_ack_pending_reached_zero":%s,"num_redelivered_delta":%d,"ack_floor_delta":%d,"normal_present":%d,"header_contract_ok":%d,"pass":%s}' \
   "$RUNID" "$NS" "$N" "$REASON" "$STREAM_SUBJECTS" "$D_DLQ" "$D_UNPROC" "$D_FWD" "$D_SENT" "$D_ERR" \

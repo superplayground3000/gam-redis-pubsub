@@ -214,6 +214,133 @@ grep -qF 'kv.cdc.>,dlq.cdc.>' <<<"$AIO_OUT" \
   || { echo "L1: all-in-one must extend stream subjects to kv.cdc.>,dlq.cdc.>"; fail L1; }
 # The shipped example must render.
 helm template chart/ -f chart/examples/values-all-in-one.yaml >/dev/null || fail L1
+
+# ── Shared-prefix segment layout (docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md) ──
+# OPT-IN in-prefix DLQ: normal traffic -> kv.cdc.<normalSegment>.<op>, DLQ -> kv.cdc.<segment>.<reason>,
+# stream binding stays the superset kv.cdc.> (no out-of-prefix dlq.cdc.>). The default layout is
+# unchanged (proven by the merge-base byte-identical check above + the (e) default-clean grep below).
+# Capture-then-grep throughout (never `helm | grep -q` under pipefail — file header + rules/50-lessons.md).
+#
+# (a) Segment-mode happy path: normalSegment=aio + in-prefix DLQ segment=dlq.
+SEG_OUT=$(helm template chart/ --set nats.stream.normalSegment=aio \
+            --set connect.deadLetter.segment=dlq --set connect.deadLetter.enabled=true) || fail L1
+grep -qF 'kv.cdc.aio.${!' <<<"$SEG_OUT" \
+  || { echo "L1: segment mode must publish normal traffic under kv.cdc.aio.<op>"; fail L1; }
+grep -qF 'cdc_sink|kv.cdc.aio.>|' <<<"$SEG_OUT" \
+  || { echo "L1: segment mode whole-stream sink filter must be kv.cdc.aio.>"; fail L1; }
+# The sink filter must NOT be the bare superset kv.cdc.> — that re-consumes the in-prefix DLQ subtree.
+if grep -qF 'cdc_sink|kv.cdc.>|' <<<"$SEG_OUT"; then
+  echo "L1: segment-mode sink filter is the bare kv.cdc.> superset (self-consumes the in-prefix DLQ)"; fail L1
+fi
+grep -qF 'kv.cdc.dlq.${! meta("dlq_reason") }' <<<"$SEG_OUT" \
+  || { echo "L1: segment mode DLQ output subject must be kv.cdc.dlq.<reason>"; fail L1; }
+# Stream binding stays EXACTLY kv.cdc.> — no out-of-prefix dlq.cdc.>, no second root.
+grep -qF "DESIRED_SUBJECTS='kv.cdc.>'" <<<"$SEG_OUT" \
+  || { echo "L1: segment mode stream subjects must stay exactly kv.cdc.>"; fail L1; }
+if grep -oE "DESIRED_SUBJECTS='[^']*'" <<<"$SEG_OUT" | grep -q 'dlq.cdc'; then
+  echo "L1: segment-mode stream binding must not add an out-of-prefix dlq.cdc subject"; fail L1
+fi
+# The shipped PROD-shaped example (all-in-one + in-prefix DLQ) must render.
+helm template chart/ -f chart/examples/values-shared-prefix-aio.yaml >/dev/null || fail L1
+
+# (b) Render guards N1-N6 — each MUST fail the render AND emit its own identifying message
+# (not merely error for some other reason). seg_guard asserts both: non-zero helm exit and
+# the guard's distinctive text.
+seg_guard() {  # <label> <expected-message-substring> <helm --set args...>
+  local label="$1" want="$2"; shift 2
+  local out rc
+  out=$(helm template chart/ "$@" 2>&1); rc=$?
+  if [ "$rc" = 0 ]; then echo "L1: guard $label must fail-loud but the render succeeded"; fail L1; fi
+  grep -qF "$want" <<<"$out" \
+    || { echo "L1: guard $label failed for the WRONG reason (missing '$want'). helm said:"; grep -i error <<<"$out" | head -1; fail L1; }
+}
+seg_guard N1 'must differ from nats.stream.normalSegment' \
+  --set nats.stream.normalSegment=aio --set connect.deadLetter.segment=aio --set connect.deadLetter.enabled=true
+seg_guard N2 'nats.stream.normalSegment is empty' \
+  --set connect.deadLetter.segment=dlq --set connect.deadLetter.enabled=true
+seg_guard N3-normal 'must be a single subject token' \
+  --set nats.stream.normalSegment=a.b
+seg_guard N3-segment 'must be a single subject token' \
+  --set nats.stream.normalSegment=aio --set connect.deadLetter.segment='a>' --set connect.deadLetter.enabled=true
+seg_guard N4 'are mutually exclusive' \
+  --set nats.stream.normalSegment=aio --set connect.deadLetter.segment=dlq --set connect.deadLetter.enabled=true \
+  --set connect.deadLetter.subject=other.sub
+seg_guard N5-whole 'must be strictly under kv.cdc.aio.' \
+  --set nats.stream.normalSegment=aio --set connect.sinkGroups[0].name=g --set 'connect.sinkGroups[0].filterSubject=kv.cdc.>'
+seg_guard N5-dlq 'must be strictly under kv.cdc.aio.' \
+  --set nats.stream.normalSegment=aio --set connect.sinkGroups[0].name=g --set 'connect.sinkGroups[0].filterSubject=kv.cdc.dlq.>'
+# N5 exact segment-root wildcard: an explicit filterSubject equal to the segment root
+# (kv.cdc.aio.>) — or its degenerate bare-root form (kv.cdc.aio.) — duplicates the
+# synthesized whole-stream group's filter and would double-consume; it must fail loud.
+seg_guard N5-equality 'exact segment-root wildcard' \
+  --set nats.stream.normalSegment=aio --set connect.sinkGroups[0].name=g --set 'connect.sinkGroups[0].filterSubject=kv.cdc.aio.>'
+seg_guard N5-rootdot 'exact segment-root wildcard' \
+  --set nats.stream.normalSegment=aio --set connect.sinkGroups[0].name=g --set 'connect.sinkGroups[0].filterSubject=kv.cdc.aio.'
+seg_guard N6 'Run the migration in two phases' \
+  --set nats.stream.normalSegment=aio --set connect.deadLetter.segment=dlq --set connect.deadLetter.enabled=true \
+  --set nats.stream.consumer.migrationFilter='kv.cdc.>'
+# N5 positive: an explicit filterSubject strictly UNDER the segment renders and is honored verbatim.
+N5OK_OUT=$(helm template chart/ --set nats.stream.normalSegment=aio \
+             --set connect.sinkGroups[0].name=g --set 'connect.sinkGroups[0].filterSubject=kv.cdc.aio.foo.>') \
+  || { echo "L1: N5 in-segment filterSubject kv.cdc.aio.foo.> must render"; fail L1; }
+grep -qF 'kv.cdc.aio.foo.>' <<<"$N5OK_OUT" \
+  || { echo "L1: explicit in-segment filterSubject kv.cdc.aio.foo.> not honored in the render"; fail L1; }
+
+# (c) migrationFilter replaces the whole-stream sink filter with the superset for a two-phase
+# migration. DLQ stays legacy/off (N6 forbids pairing it with an in-prefix DLQ).
+MIG_OUT=$(helm template chart/ --set nats.stream.normalSegment=aio \
+            --set nats.stream.consumer.migrationFilter='kv.cdc.>') || fail L1
+grep -qF 'cdc_sink|kv.cdc.>|' <<<"$MIG_OUT" \
+  || { echo "L1: migrationFilter must replace the default group filter with the exact override kv.cdc.>"; fail L1; }
+if grep -qF 'cdc_sink|kv.cdc.aio.>|' <<<"$MIG_OUT"; then
+  echo "L1: migrationFilter set but the sink filter narrowed to kv.cdc.aio.> (override ignored)"; fail L1
+fi
+# The EXTERNAL nats-init job asserts the SAME desired filter (else it fails loud mid-migration).
+MIG_EXT_OUT=$(helm template chart/ --set nats.external.enabled=true --set nats.external.url=nats://x:4222 \
+                --set nats.external.auth.subscriberSecret=s --set nats.external.auth.publisherSecret=p \
+                --set nats.stream.normalSegment=aio --set nats.stream.consumer.migrationFilter='kv.cdc.>') || fail L1
+grep -qF 'cdc_sink|kv.cdc.>|' <<<"$MIG_EXT_OUT" \
+  || { echo "L1: external nats-init job must assert the migrationFilter override kv.cdc.>"; fail L1; }
+
+# (d) prefix-routing + segment: every derived group filter shifts under the segment.
+PRSEG_OUT=$(helm template chart/ --set nats.stream.normalSegment=aio \
+              --set connect.sinkGroups[0].name=a --set connect.sinkGroups[0].prefixes[0]=prefix-a \
+              --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true) || fail L1
+for want in 'kv.cdc.aio.prefix-a.>' 'kv.cdc.aio.others.>'; do
+  grep -qF "$want" <<<"$PRSEG_OUT" \
+    || { echo "L1: prefix-routing+segment render missing group filter $want"; fail L1; }
+done
+# sharding + segment: every shard durable filter shifts under kv.cdc.<segment>. (DLQ⊕sharding
+# exclusion is unchanged — proven by the DLQ+sharding fail-loud case above.)
+SHSEG_VALUES=$(mktemp)
+cat > "$SHSEG_VALUES" <<'EOF'
+nats:
+  stream:
+    normalSegment: aio
+connect:
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'
+    families:
+      "lb:company":
+        shards: 4
+  sinkGroups:
+    - { name: shard-a, shardsOf: "lb:company", shards: [0, 1] }
+    - { name: shard-b, shardsOf: "lb:company", shards: [2, 3, "x"] }
+    - { name: others,  catchAll: true }
+EOF
+SHSEG_OUT=$(helm template chart/ -f "$SHSEG_VALUES") || { rm -f "$SHSEG_VALUES"; echo "L1: sharding+segment must render"; fail L1; }
+rm -f "$SHSEG_VALUES"
+for d in s0 s1 s2 s3 sx; do
+  grep -qF "cdc_sink_lb_company_${d}|kv.cdc.aio.lb.company.${d}.>" <<<"$SHSEG_OUT" \
+    || { echo "L1: sharding+segment shard durable ${d} filter not under kv.cdc.aio."; fail L1; }
+done
+
+# (e) Default render stays clean of ALL segment-layout machinery (opt-in promise; the
+# merge-base byte-identical check above is the stronger proof, this is the cheap leak grep).
+if grep -q 'kv.cdc.aio' <<<"$DEFAULT_OUT"; then
+  echo "[run-all-tests] default render leaked shared-prefix segment layout (kv.cdc.aio)"; fail L1
+fi
+
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \

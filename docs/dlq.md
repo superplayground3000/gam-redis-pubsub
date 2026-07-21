@@ -41,16 +41,23 @@ decisions were revised during the port, recorded in that file's own
 
 ## 2. Operator-facing behavior
 
-When `connect.deadLetter.enabled=true`:
+This section describes the **default (legacy) out-of-prefix layout**, which is what
+ships unless you opt into the in-prefix segment layout described in §10. When
+`connect.deadLetter.enabled=true`:
 
 - **Where poison goes.** Messages are published per-reason to
   `<subject>.<reason>` — for example `dlq.cdc.decode_error`,
   `dlq.cdc.hash_decode_error`, `dlq.cdc.unknown_op`
-  (`chart/files/connect/cdc-reverse.yaml:429`, subject built from
-  `connect.deadLetter.subject` + the `dlq_reason` meta).
-- **Stream binding.** The JetStream stream binds `<subject>.>` so all reasons land
-  on it. Enabling the DLQ extends the reconciled subject list from `kv.cdc.>` to
-  `kv.cdc.>,dlq.cdc.>` (`chart/templates/nats-init-job.yaml:15-25,75`).
+  (`chart/files/connect/cdc-reverse.yaml:429`, subject built from the computed DLQ
+  root + the `dlq_reason` meta; in legacy mode the root is
+  `connect.deadLetter.subject`). In the opt-in segment layout the root instead
+  becomes `<nats.stream.subjectPrefix>.<connect.deadLetter.segment>` (e.g.
+  `kv.cdc.dlq.<reason>`) — see §10.
+- **Stream binding.** In legacy mode the JetStream stream binds `<subject>.>` so all
+  reasons land on it, and enabling the DLQ extends the reconciled subject list from
+  `kv.cdc.>` to `kv.cdc.>,dlq.cdc.>` (`chart/templates/nats-init-job.yaml:15-25,75`).
+  In segment mode the DLQ already lives under `kv.cdc.>`, so the binding stays
+  `kv.cdc.>` alone and never needs a second subject added (§10).
 - **Write-then-ack is preserved.** The DLQ publish *is* the write; a publish
   failure surfaces as an output error, so `reject_errored` nacks and the original
   message retries — nothing is acked until it is safely parked
@@ -74,21 +81,29 @@ the pre-DLQ chart and poison redelivers forever exactly as before
 
 ## 3. Configuration reference
 
-Two keys, both under `connect.deadLetter` in `chart/values.yaml:169-199`:
+The two core keys are under `connect.deadLetter` in `chart/values.yaml:169-199`; the
+opt-in segment layout (§10) adds one more here plus two under `nats.stream`:
 
 | Key | Default | Meaning |
 |---|---|---|
 | `connect.deadLetter.enabled` | `false` | Turn the DLQ on for the sink leg. |
-| `connect.deadLetter.subject` | `"dlq.cdc"` | Base subject; poison is published as `<subject>.<reason>`, stream binds `<subject>.>`. |
+| `connect.deadLetter.subject` | `"dlq.cdc"` | **Legacy mode** base subject; poison is published as `<subject>.<reason>`, stream binds `<subject>.>`. Ignored when `segment` is set (guard N4). |
+| `connect.deadLetter.segment` | `""` | **Segment mode** (§10). When set (e.g. `"dlq"`), the DLQ root becomes `<nats.stream.subjectPrefix>.<segment>` (`kv.cdc.dlq.<reason>`); requires `nats.stream.normalSegment`. Empty = legacy mode. |
+| `nats.stream.normalSegment` | `""` | **Segment mode** (§10). When set (e.g. `"aio"`), ALL normal publishes and ALL sink filters move under `<subjectPrefix>.<segment>.`. Empty = default layout. |
+| `nats.stream.consumer.migrationFilter` | `""` | **Migration only** (§10). A superset wildcard (e.g. `"kv.cdc.>"`) that temporarily replaces the whole-stream sink filter during the two-phase migration. Empty except mid-migration. |
 
-Render-time guards (all in `chart/templates/_helpers.tpl`):
+Render-time guards for **legacy mode** (all in `chart/templates/_helpers.tpl`):
 
 - The subject must be a literal dot-separated NATS subject — tokens of
   `[A-Za-z0-9_-]` only, no wildcards, no empty segments
   (`chart/templates/_helpers.tpl:256`).
-- The subject **must live outside** `nats.stream.subjectPrefix` (`kv.cdc.*`),
-  otherwise a whole-stream sink would re-consume its own dead letters; the render
-  fails loud if it is not disjoint (`chart/templates/_helpers.tpl:259`).
+- **Legacy mode only:** the subject **must live outside**
+  `nats.stream.subjectPrefix` (`kv.cdc.*`), otherwise a whole-stream sink would
+  re-consume its own dead letters; the render fails loud if it is not disjoint
+  (`chart/templates/_helpers.tpl:259`). This out-of-prefix rule is *the* structural
+  disjointness guarantee of the default layout. Segment mode deliberately puts the
+  DLQ *inside* the prefix and replaces this structural rule with the render-time
+  guards N1–N6 in §10 (chiefly `normalSegment ≠ deadLetter.segment`).
 - `connect.deadLetter.enabled=true` together with `connect.sharding.families`
   fails the render (`chart/templates/_helpers.tpl:246` — see §5).
 
@@ -264,8 +279,115 @@ path not exercised is external NATS — see §8.
   counter cannot count post-write on this Connect build —
   `chart/files/connect/cdc-reverse.yaml:188-190`).
 
+## 10. In-prefix segment mode (shared fixed-prefix layout)
+
+Everything above §10 describes the **default, out-of-prefix DLQ layout** — normal
+traffic on `kv.cdc.<op>`, poison on `dlq.cdc.<reason>` — which is unchanged and stays
+the default. This section documents the **opt-in** alternative for the one case the
+default cannot serve: a JetStream stream whose subject prefix is externally FIXED at
+`kv.cdc` (a PROD stream bound `kv.cdc.>` that operators cannot re-bind). There, a DLQ
+at `dlq.cdc.>` is unbindable, so both normal and DLQ traffic must be separated by the
+SECOND subject segment under the shared prefix. Full design and rationale:
+`docs/superpowers/plans/2026-07-20-shared-prefix-subject-layout.md` (owner-approved
+2026-07-20).
+
+### What changes
+
+Setting `nats.stream.normalSegment` (e.g. `"aio"`) inserts that segment after the
+prefix for ALL normal publishes and ALL sink filters; setting
+`connect.deadLetter.segment` (e.g. `"dlq"`) moves the DLQ root in-prefix. The result:
+
+| | Default (legacy, unchanged) | Segment mode |
+|---|---|---|
+| Normal publish subject | `kv.cdc.<op>` | `kv.cdc.aio.<op>` |
+| DLQ publish subject | `dlq.cdc.<reason>` (outside prefix) | `kv.cdc.dlq.<reason>` (inside prefix) |
+| Stream binding | `kv.cdc.>` (+ `dlq.cdc.>` when DLQ on) | `kv.cdc.>` alone |
+| Whole-stream sink filter | `kv.cdc.>` | `kv.cdc.aio.>` |
+| Subscriber DLQ pub grant | `dlq.cdc.>` | `kv.cdc.dlq.>` (covered by the `kv.cdc.>` grant) |
+
+The `Nats-Msg-Id` dedup contract is unchanged: the DLQ copy still carries
+`Nats-Msg-Id: dlq.<event_id>`, disjoint from the original publish's `event_id`, so
+relocating the subject does not touch the §2 header semantics (INV-1 row 14, amended
+to reference the *computed DLQ root* rather than a literal subject).
+
+**The trade being made.** In the default layout the DLQ is *physically* outside the
+sink filter's universe, so it can never be re-consumed — the disjointness is
+structural and unconditional. Segment mode puts the DLQ inside the prefix and replaces
+that structural guarantee with a render-time guard (`normalSegment ≠ deadLetter.segment`).
+That guard is therefore load-bearing and ships in the same change as the layout.
+
+### Render guards N1–N6 (all fail-loud; opt-in only)
+
+These fire only when the segment keys are set; legacy mode keeps its existing guards
+(§3) untouched. (Exact `_helpers.tpl` locations land with the helper change — verify
+with `helm template` after W1 lands.)
+
+| # | Fails the render when… | Why |
+|---|---|---|
+| N1 | `deadLetter.segment` == `normalSegment` | THE disjointness guard — replaces the structural out-of-prefix guarantee; equal segments would let the whole-stream sink re-consume its own dead letters |
+| N2 | `deadLetter.segment` set AND `deadLetter.enabled` AND `normalSegment` empty | the sink filter would stay `kv.cdc.>` and re-consume `kv.cdc.<dlq>.>` — a self-consumption loop |
+| N3 | `normalSegment` or `deadLetter.segment` is not a single literal token (`[A-Za-z0-9_-]+`, no dots or wildcards) | same grammar rule as the legacy DLQ-subject token guard |
+| N4 | `deadLetter.segment` set AND `deadLetter.subject` != its default `"dlq.cdc"` | the two modes are mutually exclusive; silently ignoring a customised `subject` would be a trap |
+| N5 | Segment mode AND any explicit `connect.sinkGroups[*].filterSubject` not strictly under `<prefix>.<normalSegment>.` | `filterSubject` is passed through verbatim; a value like `kv.cdc.>` or `kv.cdc.<dlq>.>` would bind the sink to its own DLQ/output space — self-consumption. Legacy mode keeps current behaviour (structural disjointness protects it) |
+| N6 | `migrationFilter` set AND `deadLetter.segment` set with the DLQ enabled | the migration superset (`kv.cdc.>`) would match the in-prefix DLQ subtree — the two must never be active together (see the phase ordering below) |
+
+### Two-phase migration runbook (existing install → segment mode)
+
+The hazard is consumer-side: narrowing the durable `cdc_sink` filter from `kv.cdc.>`
+to `kv.cdc.aio.>` in one step would stop matching any retained/pending messages still
+on the bare `kv.cdc.<op>` subjects, silently skipping them — an at-least-once loss
+window. The op space is OPEN (the forward leg publishes whatever `meta("op")` carries),
+so an enumerated transitional filter (`create|update|delete|rename`) would silently
+drop any `kv.cdc.<other-op>` message, and JetStream forbids overlapping
+`filter_subjects` so `[kv.cdc.aio.>, kv.cdc.>]` is not expressible as a union. The
+migration therefore uses a **wildcard replacement filter in two phases** that never let
+the superset filter coexist with an in-prefix DLQ (guard N6). The stream binding is
+NEVER narrowed (it stays `kv.cdc.>`), so nothing is rejected at publish time.
+
+1. **Phase A — move normal traffic.** Upgrade with `nats.stream.normalSegment: aio`
+   and `nats.stream.consumer.migrationFilter: "kv.cdc.>"`. Leave the DLQ in its
+   previous mode (off, or legacy `dlq.cdc` — both outside the superset's overlap).
+   The sink filter stays the superset `kv.cdc.>`, matching BOTH the old bare
+   `kv.cdc.<op>` retained/pending messages AND the new `kv.cdc.aio.<op>` publishes —
+   nothing is skipped, regardless of op token. (Migrating from prefix-routed
+   `sinkGroups`? Drain those groups first, per the topology-collapse runbook in
+   `chart/examples/values-all-in-one.yaml`.)
+2. **Drain.** Wait until the old-subject backlog is gone: the forward leg has rolled
+   to the new `kv.cdc.aio.*` publish subject AND
+   `nats consumer info KV_CDC cdc_sink` shows `num_ack_pending==0` with `num_pending`
+   only advancing on `kv.cdc.aio.*` traffic.
+3. **Phase B — narrow and move the DLQ in-prefix.** Upgrade with
+   `migrationFilter: ""` and `connect.deadLetter.segment: "dlq"` (+ `enabled: true`).
+   The filter narrows to `kv.cdc.aio.>`; every old-subject message was already acked
+   in phase A, so the narrow skips nothing. The in-prefix DLQ activates only now,
+   when no superset filter can see it.
+
+Greenfield/fresh installs skip all of this — set the segment keys from the start and
+the layout is correct on first render.
+
+**External NATS branch.** The bundled nats-init applies filter drift via in-place
+`nats consumer edit` (`chart/templates/nats-init-job.yaml:181-201`), but the EXTERNAL
+init job never mutates user-owned consumers — it creates-if-absent or fails loud on a
+stale filter (`chart/templates/nats-init-external-job.yaml:102,123`). So on external
+NATS each phase is: the operator edits the durable's filter FIRST
+(`nats consumer edit KV_CDC cdc_sink --filter <desired>`), then runs the helm upgrade
+whose external job ASSERTS that same desired filter (which must incorporate
+`migrationFilter`). The stream binding needs no operator action at any point — the
+wildcard `kv.cdc.>` already covers the new segments (owner-confirmed).
+
+### Labs are legacy-layout and intentionally unchanged
+
+The behavioural labs exercise only the default (legacy) layout and stay correct as-is:
+`labs/redis-cdc-error-alerting` hardcodes `dlq.cdc.*` in its alert proof
+(`labs/redis-cdc-error-alerting/scripts/verify-alert.sh`), and
+`labs/by-key-prefix-split-topic` demos the default `kv.cdc.<op>` split. Both are the
+legacy-mode proof and are deliberately NOT updated for segment mode — the segment-mode
+end-to-end proof lives in the parameterised L3 e2e (`scripts/verify-dlq-e2e.sh`, made
+mode-aware), not in the labs.
+
 ## See also
 
+- `chart/examples/values-shared-prefix-aio.yaml` — the runnable segment-mode (in-prefix DLQ) example.
 - `chart/examples/values-dlq.yaml` — the runnable, commented enablement example.
 - `chart/examples/README.md` — index of chart examples and the tests that prove them.
 - `chart/values.yaml:169-199` — the `connect.deadLetter` keys with inline notes.

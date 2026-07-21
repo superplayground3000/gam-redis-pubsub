@@ -231,6 +231,82 @@ rrcs.nats.credsSecret.{publisher,subscriber,admin} — Secret name to mount.
 Bundled: the chart-rendered Secret name from values. External: user-supplied
 Secret name (may be empty for admin, in which case purge is skipped).
 */}}
+
+{{/*
+rrcs.nats.dlqRoot — the DLQ root subject (WITHOUT the per-reason suffix), the
+single source of truth shared by cdc-reverse.yaml's park output and the creds
+script so they can never disagree. Two mutually-exclusive layouts:
+  - legacy (connect.deadLetter.segment empty): the out-of-prefix subject
+    connect.deadLetter.subject (default "dlq.cdc"); park subject <subject>.<reason>.
+  - in-prefix (connect.deadLetter.segment set): <subjectPrefix>.<segment> (e.g.
+    kv.cdc.dlq); park subject <subjectPrefix>.<segment>.<reason>. Used when the
+    stream prefix is FIXED (external PROD NATS) so a sibling dlq.cdc.> root is
+    unbindable — disjointness from normal traffic is enforced by guard N1
+    (normalSegment != segment), not structurally.
+Usage: {{ include "rrcs.nats.dlqRoot" . }}
+*/}}
+{{- define "rrcs.nats.dlqRoot" -}}
+{{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
+{{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- $seg := $dl.segment | default "" -}}
+{{- if ne $seg "" -}}
+{{- printf "%s.%s" $p $seg -}}
+{{- else -}}
+{{- required "connect.deadLetter.subject is required" $dl.subject -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.nats.validateSegmentLayout — fail-loud guards for the shared-prefix subject
+layout (nats.stream.normalSegment / connect.deadLetter.segment / migrationFilter).
+Emits nothing; invoked from rrcs.connect.sinkGroups and rrcs.nats.stream.subjects
+so every render path (sink legs + nats-init) evaluates it. All guards are inert in
+legacy mode (normalSegment + deadLetter.segment both empty), so the default render
+stays byte-identical. Guard numbering follows the design plan §3 (N1-N6; N5 lives
+in rrcs.connect.sinkGroups where the explicit filterSubject values are read).
+*/}}
+{{- define "rrcs.nats.validateSegmentLayout" -}}
+{{- $seg := .Values.nats.stream.normalSegment | default "" -}}
+{{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- $dlqSeg := $dl.segment | default "" -}}
+{{- $mig := ((.Values.nats.stream.consumer | default dict).migrationFilter | default "") -}}
+{{- $tokenRe := "^[A-Za-z0-9_-]+$" -}}
+{{- /* N3 — each segment must be a SINGLE literal subject token (same grammar as
+     the legacy DLQ token guard). Dots/wildcards/empty segments render fine here and
+     only blow up later inside NATS (bad stream/filter config), so fail at render. */ -}}
+{{- if and (ne $seg "") (not (regexMatch $tokenRe $seg)) -}}
+{{-   fail (printf "nats.stream.normalSegment %q must be a single subject token of [A-Za-z0-9_-] — no dots, wildcards (* or >), or empty. It is inserted as one segment under nats.stream.subjectPrefix (e.g. normalSegment=aio -> kv.cdc.aio.<op>)." $seg) -}}
+{{- end -}}
+{{- if and (ne $dlqSeg "") (not (regexMatch $tokenRe $dlqSeg)) -}}
+{{-   fail (printf "connect.deadLetter.segment %q must be a single subject token of [A-Za-z0-9_-] — no dots, wildcards (* or >), or empty. It is inserted as one segment under nats.stream.subjectPrefix (e.g. segment=dlq -> kv.cdc.dlq.<reason>)." $dlqSeg) -}}
+{{- end -}}
+{{- /* N1 — THE disjointness guard. In-prefix normal and DLQ traffic share the fixed
+     prefix, so the ONLY thing keeping the whole-stream sink filter from re-consuming
+     its own dead letters is that the two second segments differ. This replaces the
+     legacy structural out-of-prefix guarantee. */ -}}
+{{- if and (ne $dlqSeg "") (eq $dlqSeg $seg) -}}
+{{-   fail (printf "connect.deadLetter.segment %q must differ from nats.stream.normalSegment %q — they are the SECOND subject segment for DLQ vs normal traffic under the shared prefix %q, and if equal the sink filter %s.%s.> would re-consume its own dead letters (self-consumption loop). This guard replaces the legacy out-of-prefix disjointness." $dlqSeg $seg .Values.nats.stream.subjectPrefix $seg $seg) -}}
+{{- end -}}
+{{- /* N4 — the two DLQ layouts are mutually exclusive; a segment set alongside a
+     non-default legacy subject would silently ignore one of them (a trap). */ -}}
+{{- if and (ne $dlqSeg "") (ne ($dl.subject | default "dlq.cdc") "dlq.cdc") -}}
+{{-   fail (printf "connect.deadLetter.segment %q (in-prefix DLQ at %s.%s) and a customized connect.deadLetter.subject %q (legacy out-of-prefix DLQ) are mutually exclusive — set ONLY ONE. Leave connect.deadLetter.subject at its default \"dlq.cdc\" when using segment mode." $dlqSeg .Values.nats.stream.subjectPrefix $dlqSeg $dl.subject) -}}
+{{- end -}}
+{{- /* N2 — an in-prefix DLQ with no normalSegment leaves normal traffic (and the
+     whole-stream filter) at kv.cdc.>, which would re-consume the DLQ subtree
+     kv.cdc.<segment>.>. The DLQ can only move in-prefix once normal traffic has too. */ -}}
+{{- if and (ne $dlqSeg "") $dl.enabled (eq $seg "") -}}
+{{-   fail (printf "connect.deadLetter.segment %q is set with connect.deadLetter.enabled=true but nats.stream.normalSegment is empty — normal traffic and the whole-stream sink filter would stay %s.> and re-consume the in-prefix DLQ subtree %s.%s.> (self-consumption loop). Set nats.stream.normalSegment (e.g. aio) so normal traffic moves under its own segment first." $dlqSeg .Values.nats.stream.subjectPrefix .Values.nats.stream.subjectPrefix $dlqSeg) -}}
+{{- end -}}
+{{- /* N6 — the migration superset filter (e.g. kv.cdc.>) matches EVERYTHING under
+     the prefix, including an in-prefix DLQ subtree, so the two must never be active
+     together. Phase A carries migrationFilter with the DLQ off/legacy; phase B moves
+     the DLQ in-prefix only after migrationFilter is cleared (plan §6). */ -}}
+{{- if and (ne $mig "") (ne $dlqSeg "") $dl.enabled -}}
+{{-   fail (printf "nats.stream.consumer.migrationFilter %q is set together with an in-prefix DLQ (connect.deadLetter.segment=%q + enabled) — the migration superset filter matches the in-prefix DLQ subtree %s.%s.> and would re-consume it. Run the migration in two phases: migrationFilter in phase A (DLQ off or legacy out-of-prefix), then clear migrationFilter and move the DLQ in-prefix in phase B (see docs plan 2026-07-20-shared-prefix-subject-layout.md §6)." $mig $dlqSeg .Values.nats.stream.subjectPrefix $dlqSeg) -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 rrcs.nats.stream.subjects — wildcard pattern the JetStream stream binds to.
 Derived from .Values.nats.stream.subjectPrefix so the bound subjects, the
@@ -238,13 +314,22 @@ publish subject, and the publisher's --allow-pub grant cannot drift.
 Usage: {{ include "rrcs.nats.stream.subjects" . }}
 */}}
 {{- define "rrcs.nats.stream.subjects" -}}
+{{- include "rrcs.nats.validateSegmentLayout" . -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
 {{- $dl := .Values.connect.deadLetter | default dict -}}
+{{- $seg := .Values.nats.stream.normalSegment | default "" -}}
 {{- if $dl.enabled -}}
 {{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
 {{-   if gt (len $families) 0 -}}
 {{-     fail (printf "connect.deadLetter.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set) — the sharded sink pipeline (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be silently half-protected (unsharded poison parked, sharded poison still loops). Disable one of them.") -}}
 {{-   end -}}
+{{-   if ne $seg "" -}}
+{{- /* In-prefix segment mode: the DLQ lives at <prefix>.<deadLetter.segment>.>,
+     already under the single superset binding <prefix>.>. Bind the superset alone —
+     no second root, and the (possibly external, fixed-prefix) stream binding never
+     needs to change (guard N1 keeps the DLQ segment disjoint from normalSegment). */ -}}
+{{-     printf "%s.>" $p -}}
+{{-   else -}}
 {{-   $sub := required "connect.deadLetter.subject is required when deadLetter.enabled" $dl.subject -}}
 {{- /* The base subject must be a LITERAL: it is used verbatim both in the stream's
      subjects list ("<sub>.>") and in the sink's publish subject
@@ -259,6 +344,7 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 {{-     fail (printf "connect.deadLetter.subject %q must be OUTSIDE nats.stream.subjectPrefix %q — a subject under %s.> would be re-consumed by a whole-stream sink. Use e.g. dlq.cdc." $sub $p $p) -}}
 {{-   end -}}
 {{-   printf "%s.>,%s.>" $p $sub -}}
+{{-   end -}}
 {{- else -}}
 {{-   printf "%s.>" $p -}}
 {{- end -}}
@@ -275,6 +361,8 @@ prefix groups) is byte-identical to the pre-D3 <subjectPrefix>.<op>.
 */}}
 {{- define "rrcs.nats.stream.publishSubject" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
+{{- $seg := .Values.nats.stream.normalSegment | default "" -}}
+{{- if ne $seg "" -}}{{- $p = printf "%s.%s" $p $seg -}}{{- end -}}
 {{- if eq (include "rrcs.connect.prefixRouting" .) "true" -}}
 {{- printf "%s.${! meta(\"kv_prefix\") }.${! meta(\"op\") }" $p -}}
 {{- else -}}
@@ -303,14 +391,18 @@ Emits nothing on success. Usage: {{ include "rrcs.connect.validateAllInOne" . }}
      across the INV-1 ack path in cdc-reverse.yaml). */ -}}
 {{-   $dl := .Values.connect.deadLetter | default dict -}}
 {{-   if not $dl.enabled -}}
-{{-     fail "connect.sinkAllInOne.enabled=true requires the DLQ: set connect.deadLetter.enabled=true. All-in-one is one consumer draining the whole stream, so it has a single ack floor for every key family — without a dead-letter escape the first message that can never apply (poison) redelivers forever (maxDeliver: -1) and head-of-line-blocks every message behind it. The DLQ parks poison to dlq.cdc.<reason> and acks, so the floor keeps advancing." -}}
+{{-     fail "connect.sinkAllInOne.enabled=true requires the DLQ: set connect.deadLetter.enabled=true. All-in-one is one consumer draining the whole stream, so it has a single ack floor for every key family — without a dead-letter escape the first message that can never apply (poison) redelivers forever (maxDeliver: -1) and head-of-line-blocks every message behind it. The DLQ parks poison to the computed DLQ root per reason (legacy out-of-prefix <deadLetter.subject>.<reason>, e.g. dlq.cdc.<reason>; or in-prefix <subjectPrefix>.<deadLetter.segment>.<reason>, e.g. kv.cdc.dlq.<reason>) and acks, so the floor keeps advancing." -}}
 {{-   end -}}
 {{- /* G2 — all-in-one OWNS the whole stream (the synthesised "default" group,
-     filter kv.cdc.>). Any explicit sinkGroup contradicts that: a prefix-routed
-     group re-consumes subjects the whole-stream group already drains (double
-     delivery — the same class the whole-stream+prefix guard below rejects). */ -}}
+     filter <subjectPrefix>.> — or <subjectPrefix>.<normalSegment>.> in segment mode).
+     Any explicit sinkGroup contradicts that: a prefix-routed group re-consumes
+     subjects the whole-stream group already drains (double delivery — the same class
+     the whole-stream+prefix guard below rejects). */ -}}
 {{-   if gt (len ($.Values.connect.sinkGroups | default list)) 0 -}}
-{{-     fail (printf "connect.sinkAllInOne.enabled=true owns the whole stream (the synthesised \"default\" group, filter %s.>) — it cannot be combined with explicit connect.sinkGroups (%d configured). Any prefix-routed group would re-consume subjects the whole-stream consumer already drains (double delivery). Remove connect.sinkGroups, or turn all-in-one off and route by prefix instead." .Values.nats.stream.subjectPrefix (len ($.Values.connect.sinkGroups | default list))) -}}
+{{-     $wsRoot := .Values.nats.stream.subjectPrefix -}}
+{{-     $wsSeg := .Values.nats.stream.normalSegment | default "" -}}
+{{-     if ne $wsSeg "" -}}{{- $wsRoot = printf "%s.%s" $wsRoot $wsSeg -}}{{- end -}}
+{{-     fail (printf "connect.sinkAllInOne.enabled=true owns the whole stream (the synthesised \"default\" group, filter %s.>) — it cannot be combined with explicit connect.sinkGroups (%d configured). Any prefix-routed group would re-consume subjects the whole-stream consumer already drains (double delivery). Remove connect.sinkGroups, or turn all-in-one off and route by prefix instead." $wsRoot (len ($.Values.connect.sinkGroups | default list))) -}}
 {{-   end -}}
 {{- /* G3 — sharding is the exact opposite of one-consumer-drains-all, and the
      sharded sink pipeline has no DLQ routing (see the DLQ+sharding exclusion at
@@ -346,7 +438,19 @@ in this pass); the 57-char name budget.
 {{- $root := . -}}
 {{- $v := .Values -}}
 {{- include "rrcs.connect.validateAllInOne" . -}}
-{{- $prefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
+{{- include "rrcs.nats.validateSegmentLayout" . -}}
+{{- $subjectPrefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
+{{- /* Shared-prefix subject layout: when nats.stream.normalSegment is set, ALL
+     normal traffic (and therefore every derived sink filter) moves under
+     <subjectPrefix>.<normalSegment>. $prefix is the ROOT every filter below is built
+     from, so shifting it here shifts the whole-stream, prefix-routed, catch-all and
+     shard filters at once. Empty segment => $prefix == subjectPrefix (byte-identical
+     legacy render). migrationFilter, when set, replaces the synthesized whole-stream
+     group's filter (guard N6 keeps it exclusive with an in-prefix DLQ). */ -}}
+{{- $normalSegment := $v.nats.stream.normalSegment | default "" -}}
+{{- $migrationFilter := (($v.nats.stream.consumer | default dict).migrationFilter | default "") -}}
+{{- $prefix := $subjectPrefix -}}
+{{- if ne $normalSegment "" -}}{{- $prefix = printf "%s.%s" $subjectPrefix $normalSegment -}}{{- end -}}
 {{- $defs := $v.connect.sinkDefaults | default dict -}}
 {{- $defLease := $defs.lease | default dict -}}
 {{- $defCons := $defs.consumer | default dict -}}
@@ -465,6 +569,28 @@ in this pass); the 57-char name budget.
 {{-   if and (gt (len $prefixes) 0) (ne $filterSubject "") -}}
 {{-     fail (printf "connect.sinkGroups[%s]: set only ONE of prefixes or filterSubject, not both" $name) -}}
 {{-   end -}}
+{{- /* N5 (plan §3): an explicit filterSubject is passed through verbatim. In
+     segment mode it must be STRICTLY under <subjectPrefix>.<normalSegment>. with at
+     least one more token before the wildcard (<prefix>.<token>.>). Two rejection
+     classes: (a) not under the segment at all (e.g. kv.cdc.> or the in-prefix DLQ
+     subtree kv.cdc.<dlq>.>) — self-consumption of the sink's own output/dead-letter
+     space; (b) the EXACT segment-root wildcard <prefix>.> (or the degenerate
+     <prefix> / <prefix>.) — that re-derives the synthesized whole-stream/default
+     group's filter, but as an EXPLICIT filterSubject it slips past the whole-stream-
+     vs-prefix double-delivery guard (which only inspects synthesized groups,
+     filterSubject==""), so pairing it with a prefix-routed group double-consumes that
+     prefix's traffic (Codex review, 2026-07-21). Legacy mode keeps today's
+     pass-through — structural out-of-prefix disjointness protects it there. */ -}}
+{{-   if and (ne $normalSegment "") (ne $filterSubject "") -}}
+{{-     $under := printf "%s." $prefix -}}
+{{-     $rootWild := printf "%s.>" $prefix -}}
+{{-     if not (hasPrefix $under $filterSubject) -}}
+{{-       fail (printf "connect.sinkGroups[%s].filterSubject %q must be strictly under %s. — nats.stream.normalSegment=%q is set, so every sink filter lives under the normal segment. A filter outside it (e.g. %s.> or the in-prefix DLQ subtree) would re-consume the sink's own output/dead-letter space (self-consumption loop). Use e.g. %s.<token>.>." $name $filterSubject $prefix $normalSegment $subjectPrefix $prefix) -}}
+{{-     end -}}
+{{-     if or (eq $filterSubject $rootWild) (eq $filterSubject $under) (eq $filterSubject $prefix) -}}
+{{-       fail (printf "connect.sinkGroups[%s].filterSubject %q is the exact segment-root wildcard %s.> — it must have at least one more token before the wildcard (%s.<token>.>). The bare root duplicates the synthesized whole-stream/default group's filter, so paired with a prefix-routed group it would double-consume that prefix's traffic. To tap the WHOLE segment, omit filterSubject and let the synthesized whole-stream (\"default\") group own it instead." $name $filterSubject $prefix $prefix) -}}
+{{-     end -}}
+{{-   end -}}
 {{-   $prefixed := gt (len $prefixes) 0 -}}
 {{-   $filter := printf "%s.>" $prefix -}}
 {{-   $consumers := list -}}
@@ -536,6 +662,15 @@ in this pass); the 57-char name budget.
 {{-   else if $catchAll -}}
 {{-     if $enabled -}}{{- $catchAllCount = add1 $catchAllCount -}}{{- end -}}
 {{-     $filter = printf "%s.others.>" $prefix -}}
+{{-   end -}}
+{{- /* migrationFilter REPLACES the synthesized whole-stream/default group's filter
+     — a superset wildcard held across a segment-layout migration (phase A) so the
+     durable keeps matching BOTH old bare <subjectPrefix>.<op> and new
+     <subjectPrefix>.<normalSegment>.<op> subjects (plan §6). Only the whole-stream
+     shape is eligible; prefix/shard/catchAll/explicit-filter groups are untouched.
+     Guard N6 keeps it mutually exclusive with an in-prefix DLQ. */ -}}
+{{-   if and (ne $migrationFilter "") (not $prefixed) (not $sharded) (eq $filterSubject "") (not $catchAll) -}}
+{{-     $filter = $migrationFilter -}}
 {{-   end -}}
 {{-   if and $enabled (not $prefixed) (not $sharded) (eq $filterSubject "") (not $catchAll) -}}
 {{-     $wholeStream = append $wholeStream $name -}}

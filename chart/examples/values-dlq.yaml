@@ -53,6 +53,13 @@ connect:
     # "kv.cdc" by default). If it overlapped, a sink consumer would re-consume its
     # own dead letters and loop. The default "dlq.cdc" is safely disjoint from
     # "kv.cdc"; keep that separation if you customise it.
+    #
+    # IN-PREFIX ALTERNATIVE: if your stream prefix is externally FIXED (a PROD
+    # stream bound kv.cdc.> that you cannot re-bind), a DLQ outside the prefix is
+    # unbindable. For that case there is an opt-in layout that puts the DLQ INSIDE
+    # the prefix on a second segment (kv.cdc.dlq.<reason>) — see
+    # chart/examples/values-shared-prefix-aio.yaml and docs/dlq.md §10. This file
+    # keeps the default out-of-prefix behaviour.
     subject: "dlq.cdc"
 
 # ── Credentials the DLQ needs ────────────────────────────────────────────────
