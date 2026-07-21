@@ -195,8 +195,29 @@ DUR_A_S0="cdc_sink_enva_lb_company_s0"   # the poison lands on s0 (id mod 4 == 0
 
 # ── 1. baselines ─────────────────────────────────────────────────────────────
 log "=== step 1: baselines (durable ls, lanes, floors) ==="
-rrA FLUSHDB >/dev/null; rrB FLUSHDB >/dev/null
 rc XGROUP CREATE "$CENTRAL_STREAM" "$GROUP" 0 MKSTREAM >/dev/null 2>&1 || true
+# Warm-up readiness PROOF before the measured run (2026-07-21 lesson): a sleep
+# after rollout is not evidence the apply path works — a startup-window race once
+# made the first per-lane deliveries vanish (delivered+acked+apply-counted, key
+# absent in region; root-caused as startup exposure, not pipeline semantics).
+# Inject one disposable family event + one non-family event, WAIT until BOTH
+# regions actually applied both, then flush and start the measured test from a
+# proven-hot pipeline.
+log "warm-up: proving both sinks' apply paths end-to-end before the measured run"
+rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-f" op create type string \
+  kv_key "lb:company:active:{employees:1}:warmup${RUNID}" ts "$(now_ms)" body warm >/dev/null
+rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-o" op create type string \
+  kv_key "misc:warmup:1:${RUNID}" ts "$(now_ms)" body warm >/dev/null
+WU_DEADLINE=$(( $(date +%s) + 120 )); WARM_OK=0; wa=0; wb=0
+while (( $(date +%s) < WU_DEADLINE )); do
+  wa=$(( $(cntA "*warmup${RUNID}") + $(cntA "misc:warmup:*:${RUNID}") ))
+  wb=$(( $(cntB "*warmup${RUNID}") + $(cntB "misc:warmup:*:${RUNID}") ))
+  if (( wa >= 2 && wb >= 2 )); then WARM_OK=1; break; fi
+  sleep 3
+done
+(( WARM_OK == 1 )) || die "warm-up: sinks did not apply the readiness probes within 120s (env A ${wa}/2, env B ${wb}/2) — apply path not proven, refusing to start the measured run"
+log "warm-up OK: both envs applied the readiness probes (A=${wa}/2 B=${wb}/2)"
+rrA FLUSHDB >/dev/null; rrB FLUSHDB >/dev/null
 TS="$(now_ms)"
 
 # (B) durable disjointness + env-prefixing, up front.
@@ -355,8 +376,12 @@ if [ "$MANIFEST_GATE" != "skip" ]; then
     HOOKLOG="$(k logs -l "job-name" --tail=-1 2>/dev/null | grep -i 'topology DRIFT' || true)"
     if (( BAD_RC != 0 )) || [ -n "$HOOKLOG" ]; then
       log "mismatched sink failed closed (helm rc=${BAD_RC}); DRIFT signal: ${HOOKLOG:-<see nats-init hook log>}"
-      # Correct the mismatch (N=4) → init passes.
+      # Correct the mismatch (N=4) → init passes. Uninstall the FAILED release
+      # first: helm leaves it in FAILED state and the sinks' wait-consumer
+      # initContainers from the bad revision keep their pods (and CPU requests)
+      # around, which made the corrected --wait time out on a busy kind node.
       log "correcting envc to N=4 → init must pass"
+      helm --kube-context "$CTX" uninstall menvc -n "$NS" --wait >/dev/null 2>&1 || true
       if helm --kube-context "$CTX" upgrade --install menvc ./chart -n "$NS" \
           --set profile=cdc -f "$VALUES_FILE" --set resourcePrefix=envc- \
           --set connect.envId=envc --set connect.source.enabled=false --set writer.enabled=false \

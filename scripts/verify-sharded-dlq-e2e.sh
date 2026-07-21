@@ -161,7 +161,13 @@ TS="$(now_ms)"
 # Employee ids chosen so id mod 4 pins the shard: {4,8,12}->s0 {1,5,9}->s1 {6,10,14}->s2 {3,7,11}->s3
 ids_for_shard() { # $1=shard-index $2=count -> echo space-separated ids
   local sh="$1" cnt="$2" i out="" id
-  for (( i=0; i<cnt; i++ )); do id=$(( sh + i*4 )); [ "$id" -eq 0 ] && id=4; out="$out $id"; done
+  # shard 0 walks 4,8,12,... — the old "id 0 -> 4" clamp collided with i=1's id=4,
+  # producing DUPLICATE event ids whose second forward publish JetStream dedup
+  # (correctly) swallowed — the suite then blamed the pipeline for the short lane.
+  for (( i=0; i<cnt; i++ )); do
+    if [ "$sh" -eq 0 ]; then id=$(( (i+1)*4 )); else id=$(( sh + i*4 )); fi
+    out="$out $id"
+  done
   echo "$out"
 }
 S0_IDS="$(ids_for_shard 0 "$NPER")"   # hash_decode_error
@@ -188,20 +194,24 @@ log "baseline lanes: hash=${BASE_LANE[hash_decode_error]} unknown=${BASE_LANE[un
 
 # ── 2. inject poison at specific shards ──────────────────────────────────────
 log "=== step 2: inject ${NPER}/class poison (s0=hash, s1=unknown, s2=decode) + normals ==="
-# hash_decode_error @ s0 — honest forward path (parseable JSON array, not an object)
-cmds="$(mktemp)"
+# hash_decode_error @ s0 — honest forward path (parseable JSON array, not an object).
+# Per-XADD argv mode: redis-cli's stdin inline lexer silently DROPS lines whose
+# body token carries embedded quotes (["a","b"]) — first run proved it (0 hash
+# entries reached the central stream), so every XADD goes through exec argv where
+# the shell, not the inline lexer, owns tokenization.
 for id in $S0_IDS; do
-  echo "XADD $CENTRAL_STREAM * event_id sdlq-${RUNID}-h${id} op create type hash kv_key lb:company:active:{employees:${id}}:h${RUNID} ts ${TS} body [\"a\",\"b\"]"
-done > "$cmds"
+  k exec -i "$CENTRAL" -- redis-cli XADD "$CENTRAL_STREAM" '*' \
+    event_id "sdlq-${RUNID}-h${id}" op create type hash \
+    kv_key "lb:company:active:{employees:${id}}:h${RUNID}" ts "$TS" \
+    body '["a","b"]' >/dev/null || die "hash poison XADD failed (id=$id)"
+done
 # unknown_op @ s1 — honest forward path (op the sink does not know)
 for id in $S1_IDS; do
-  echo "XADD $CENTRAL_STREAM * event_id sdlq-${RUNID}-u${id} op frobnicate type string kv_key lb:company:active:{employees:${id}}:u${RUNID} ts ${TS} body zzz"
-done >> "$cmds"
-# NOTE poison body ["a","b"] contains quotes — feed via redis-cli stdin is fine here
-# because each XADD line is parsed by redis-cli's inline lexer which keeps the quotes
-# as part of the token when unbalanced-safe; if a future edit hits "Invalid argument(s)"
-# switch these two loops to per-XADD argv mode like verify-dlq-e2e.sh does.
-k exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null; rm -f "$cmds"
+  k exec -i "$CENTRAL" -- redis-cli XADD "$CENTRAL_STREAM" '*' \
+    event_id "sdlq-${RUNID}-u${id}" op frobnicate type string \
+    kv_key "lb:company:active:{employees:${id}}:u${RUNID}" ts "$TS" \
+    body zzz >/dev/null || die "unknown_op poison XADD failed (id=$id)"
+done
 
 # decode_error @ s2 — DIRECT publish onto the shard subject (forward can't emit it).
 # enc=gzip:base64 with an undecodable body => the sink's decode .catch(null) fires.
