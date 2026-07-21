@@ -859,7 +859,24 @@ in this pass); the 57-char name budget.
 {{- /* INV-S4: every configured family must have {0..N-1} plus the isolation
      shard "x" claimed EXACTLY once by enabled shardsOf groups. An unclaimed
      shard means a subject nobody consumes — its messages would park in the
-     stream until maxAge silently discards them. */ -}}
+     stream until maxAge silently discards them.
+
+     SCOPED to SINK-CARRYING releases (design §3.2 / E5). The coverage check
+     answers "does THIS release's set of sink durables cover every shard the
+     forward publishes?" — a question that only exists when this release carries
+     the sink side. A source-only PUBLISHER declares families to drive the
+     PUBLISH taxonomy (it owns the forward leg, not the consumers), so it has no
+     shard groups to claim with and must render EXIT 0; the cross-release
+     coverage guarantee for a publisher is the topology manifest (§7), not this
+     render-time check. Predicate: connect.sink.enabled (the legacy/co-located
+     single-sink is on) OR an explicit connect.sinkGroups list is present (a
+     sink release routes by group). This is deliberately NOT weakened for the
+     co-located case — a combined release keeps sink.enabled=true so the check
+     fires exactly as before; only a sink-less publisher (sink.enabled=false AND
+     no sinkGroups) is exempted. A sharded SINK release still carries sinkGroups,
+     so an incomplete shard claim there fails EXIT 1 unchanged. */ -}}
+{{- $sinkCarrying := or $legSink.enabled (gt (len ($v.connect.sinkGroups | default list)) 0) -}}
+{{- if $sinkCarrying -}}
 {{- range $fam, $fcfg := $families -}}
 {{-   $claims := get $famClaims $fam | default dict -}}
 {{-   $n := int $fcfg.shards -}}
@@ -872,19 +889,33 @@ in this pass); the 57-char name budget.
 {{-     fail (printf "connect.sharding.families[%s]: the isolation shard \"x\" is not claimed by any ENABLED sinkGroup — add \"x\" to one group's shards list (it receives unparseable-key and cross-shard-rename events; INV-S4)" $fam) -}}
 {{-   end -}}
 {{- end -}}
+{{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
 
 {{/*
-rrcs.connect.prefixRouting — "true" iff any ENABLED sinkGroup routes by key-prefix.
-Gates the forward leg's kv_prefix subject segment (design §3): a pure default /
-non-prefix install stays on the legacy <subjectPrefix>.<op> subject and grant.
+rrcs.connect.prefixRouting — "true" iff the forward leg must carry the kv_prefix
+subject segment. TWO independent triggers, OR'd (design §3.2 / E5):
+  (a) any ENABLED sinkGroup in THIS release routes by key-prefix (prefixed or
+      sharded) — the co-located source+sink case; OR
+  (b) connect.sharding.families is declared (shardingEnabled) — the PUBLISHER-SIDE
+      taxonomy declaration, REGARDLESS of local sink groups.
+Trigger (b) is what makes the publish taxonomy a publisher property: a source-only
+publisher release declaring families now emits per-shard subjects
+(kv.cdc.<seg>.<fam>.s<K>.<op>) that downstream sharded sink releases filter on, even
+though the publisher owns no sink group. Without it a sink-less publisher would be
+serialized (shardingEnabled) yet publish bare kv.cdc.<seg>.<op> that matches no
+shard filter and no catch-all — the VF-5 "family black-hole" (silent 72h loss).
+The two predicates are bound by rrcs.connect.forward.assertShardingConsistency so
+they can never re-drift. A pure default / non-prefix, non-sharded install keeps the
+legacy <subjectPrefix>.<op> subject and grant (byte-identical).
 */}}
 {{- define "rrcs.connect.prefixRouting" -}}
 {{- $any := false -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
 {{- if and $g.enabled (or $g.prefixed $g.sharded) -}}{{- $any = true -}}{{- end -}}
 {{- end -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}{{- $any = true -}}{{- end -}}
 {{- ternary "true" "false" $any -}}
 {{- end -}}
 
@@ -898,6 +929,75 @@ in rrcs.connect.sinkGroups (invoked by every consumer of this helper's result).
 {{- define "rrcs.connect.shardingEnabled" -}}
 {{- $s := .Values.connect.sharding | default dict -}}
 {{- ternary "true" "false" (gt (len ($s.families | default dict)) 0) -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.threads — the forward pipeline's thread count. 1 under
+sharding (ordering link O-3: read order == process order; a parallel pipeline
+reorders publishes), else 2. SINGLE SOURCE for cdc-forward.yaml's `pipeline.threads`
+AND the anti-drift assertion below, so the value the template renders and the value
+the assertion checks can never disagree — a future edit that changes this mapping
+is caught by the assertion pinning the constant "1" under sharding.
+*/}}
+{{- define "rrcs.connect.forward.threads" -}}
+{{- ternary "1" "2" (eq (include "rrcs.connect.shardingEnabled" .) "true") -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.maxInFlight — the forward JetStream output's max_in_flight. 1
+under sharding (ordering link O-4: serialized publish — one PubAck before the next,
+so a later event's ack can never land before an earlier one's and overwrite a newer
+value with an older one), else connect.source.maxInFlight (default 256). SINGLE
+SOURCE for the sharded output branch AND the assertion below (same rationale as
+rrcs.connect.forward.threads). connect.source.maxInFlight is render-guarded to be
+unset under sharding, so the else branch is only reached when NOT sharding.
+*/}}
+{{- define "rrcs.connect.forward.maxInFlight" -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}1{{- else -}}{{ .Values.connect.source.maxInFlight | default 256 }}{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.assertShardingConsistency — anti-drift render assertion
+(design §3.2 / E5). Emits nothing on success; FAILS the render when
+shardingEnabled is true but any of the three ordering/routing predicates the
+sharded forward depends on has drifted:
+
+  shardingEnabled=="true" ⇒ publishSubject contains "kv_prefix"   (VF-5 routing)
+                          ∧ forward threads == 1                  (O-3)
+                          ∧ forward max_in_flight == 1            (O-4)
+
+This is a REAL check on the RESOLVED values that feed cdc-forward.yaml, not a
+re-statement of the branch that renders them:
+  - the subject predicate reads the actual rrcs.nats.stream.publishSubject output,
+    which is gated on rrcs.connect.prefixRouting — a DIFFERENT helper than
+    shardingEnabled. If a future edit decouples prefixRouting from shardingEnabled
+    again (the VF-5 black-hole), publishSubject stops carrying kv_prefix and this
+    fires — that is precisely the drift E5 binds shut.
+  - threads / max_in_flight are read from the single-source helpers above (which
+    the template also renders from) and compared against the CONSTANT "1"; if the
+    helper mapping is ever changed to emit a non-1 value under sharding, the
+    constant assertion catches it.
+
+Invoked from the TOP of cdc-forward.yaml so every render path that emits the
+forward pipeline evaluates it. Naming O-3/O-4 in the failure text so the operator
+lands on the ordering-chain rule (INV-1 row 13) that the loosened value breaks.
+Usage: {{ include "rrcs.connect.forward.assertShardingConsistency" . }}
+*/}}
+{{- define "rrcs.connect.forward.assertShardingConsistency" -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}
+{{-   $subject := include "rrcs.nats.stream.publishSubject" . -}}
+{{-   if not (contains "kv_prefix" $subject) -}}
+{{-     fail (printf "forward anti-drift (design E5, closes VF-5): connect.sharding.families is set (shardingEnabled) but the forward publish subject %q does NOT carry the kv_prefix shard token. rrcs.connect.prefixRouting has drifted away from shardingEnabled, so every family event would publish to a bare subject matching NO shard filter and NO catch-all — the family black-hole: valid messages park unconsumed until the 72h stream max-age silently discards them (INV-1 loss). rrcs.connect.prefixRouting MUST return \"true\" whenever shardingEnabled is \"true\"; do not decouple them." $subject) -}}
+{{-   end -}}
+{{-   $threads := include "rrcs.connect.forward.threads" . -}}
+{{-   if ne $threads "1" -}}
+{{-     fail (printf "forward anti-drift (INV-1 row 13, ordering link O-3): shardingEnabled is \"true\" but the forward pipeline would render threads=%s (must be 1). A parallel forward pipeline processes out of read order and reorders publishes, silently reintroducing old-overwrites-new with no metric able to detect it (the v2 design removed the LWW fence). Keep rrcs.connect.forward.threads at 1 under sharding." $threads) -}}
+{{-   end -}}
+{{-   $mif := include "rrcs.connect.forward.maxInFlight" . -}}
+{{-   if ne $mif "1" -}}
+{{-     fail (printf "forward anti-drift (INV-1 row 13, ordering link O-4): shardingEnabled is \"true\" but the forward output would render max_in_flight=%s (must be 1). With >1 in flight a later event's PubAck can land before an earlier one's, overwriting a newer value with an older one on the same key — silent, no metric detects it. Keep rrcs.connect.forward.maxInFlight at 1 under sharding (and leave connect.source.maxInFlight unset)." $mif) -}}
+{{-   end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -1074,6 +1174,41 @@ Usage: {{ include "rrcs.connect.topologyManifest.writeScript" (dict "root" $ "bu
                 echo "Provision it once — 'nats kv add cdc_topology --history 5' — and grant \$KV.cdc_topology.> to the publisher + subscriber creds (gen-nats-auth.sh). The chart never creates buckets on a user-owned NATS." >&2
                 exit 1
               {{- end }}
+              fi
+              # ── F2 taxonomy-change rollout guard (design §16 / F2) ─────────────
+              # A publisher owns the PUBLISH taxonomy — families+N AND normalSegment
+              # AND sinkGroup prefixes. Shifting ANY of these re-points the published
+              # subjects: a normalSegment or prefixes change moves subjects for every
+              # sink exactly the same way a family/N change does, sharded or not. Any
+              # sink release still filtering the OLD subjects then silently loses every
+              # event on a changed subject until the 72h stream max-age (VF-16) — the
+              # exact window F2 exists to close. The P2 sink-side gate only catches
+              # this at the sink's NEXT init, which may be 72h of drift-loss away, so
+              # the guard runs here for EVERY manifest-enabled publisher, NOT only
+              # sharded ones. Before OVERWRITING an existing manifest, compare it to
+              # what this release would publish and BLOCK on a difference, unless the
+              # operator has asserted (allowTaxonomyChange=true) that every sink
+              # release already consumes the new subjects. No manifest yet (first
+              # publisher deploy) => nothing to break, the write proceeds. Inert when
+              # the manifest is disabled (this whole block renders only when enabled),
+              # in which case the F2 rule rests on the operator (see values.yaml).
+              if nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology current --raw >/tmp/prev_manifest.json 2>/dev/null; then
+                TM_PREV=$(jq -Sc . /tmp/prev_manifest.json 2>/dev/null || cat /tmp/prev_manifest.json)
+                TM_NEXT=$(printf '%s' "$MANIFEST" | jq -Sc .)
+                if [ "$TM_PREV" != "$TM_NEXT" ]; then
+                {{- if $root.Values.nats.topologyManifest.allowTaxonomyChange }}
+                  echo "WARN: topology taxonomy CHANGE permitted by nats.topologyManifest.allowTaxonomyChange=true:" >&2
+                  echo "WARN:   cdc_topology/current [$TM_PREV] -> [$TM_NEXT]." >&2
+                  echo "WARN:   Overwriting — you have asserted every sink release already consumes the NEW subjects." >&2
+                {{- else }}
+                  echo "ERROR: topology taxonomy CHANGE blocked (F2 rollout guard):" >&2
+                  echo "ERROR:   cdc_topology/current is [$TM_PREV]" >&2
+                  echo "ERROR:   but this publisher would publish [$TM_NEXT]." >&2
+                  echo "Changing families/N, normalSegment, or prefixes shifts the published subjects. Any sink release still filtering the OLD subjects would silently lose every event on a changed subject until the 72h stream max-age (VF-16)." >&2
+                  echo "Roll EVERY sink release onto the new taxonomy FIRST and confirm each is registered on the manifest, THEN re-run this publisher with nats.topologyManifest.allowTaxonomyChange=true to permit the overwrite." >&2
+                  exit 1
+                {{- end }}
+                fi
               fi
               echo "topology manifest: publishing cdc_topology/current = $MANIFEST"
               printf '%s' "$MANIFEST" | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology current

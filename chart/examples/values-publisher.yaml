@@ -47,24 +47,38 @@ connect:
   deadLetter:
     enabled: false
 
-  # ── P0 CAVEAT: a sharded publisher does NOT render yet ────────────────────────
+  # ── Publish taxonomy: declare sharding families to feed sharded sink envs ──────
   #
-  # It is tempting to declare the publish taxonomy (sharding families) here, so the
-  # forward leg emits per-shard subjects (kv.cdc.aio.lp.m2g.s<K>.<op>) that sharded
-  # sink envs filter on. That does NOT work in P0 and is deliberately left commented
-  # out below.
+  # A publisher declares the publish taxonomy — the sharding families (and their
+  # shard count N) whose per-shard subjects the forward leg emits. Since P3
+  # (docs/design/multi-env-mixed-sink §3.2 / E5) this is a PUBLISHER-SIDE property,
+  # decoupled from locally-enabled sink groups: declaring a family here makes the
+  # forward publish kv.cdc.lp.m2g.s<K>.<op> (and route non-family keys to
+  # kv.cdc.others.<op>) even though this release owns NO sink group. Downstream
+  # SHARDED sink releases claim {0..N-1,x} across their sinkGroups and filter those
+  # per-shard subjects; this publisher just produces them.
   #
-  # Why: today the forward leg only emits shard/prefix subject tokens when THIS
-  # release owns an ENABLED sharded/prefixed sink group, and the shard-coverage
-  # guard (INV-S4) fails the render when a family has no enabled sink group claiming
-  # its shards. A publisher has NO sink groups, so declaring a family here fails the
-  # render ("shard 0 is not claimed by any ENABLED sinkGroup"). Decoupling the
-  # publish taxonomy from locally-enabled sink groups is a later phase (P3,
-  # docs/design/multi-env-mixed-sink §3.2). Until P3 lands, a publisher that must
-  # feed sharded envs is not expressible — run AIO envs (whole-stream filter, which
-  # already absorbs sharded subjects harmlessly) until then.
+  # The shard-coverage guard (INV-S4) does NOT fire here — it is scoped to
+  # sink-carrying releases, and a publisher (sink.enabled=false, no sinkGroups) is
+  # not one. The publisher's cross-release safety net is instead the topology
+  # manifest (nats.topologyManifest.enabled): it records this taxonomy and each sink
+  # init fails closed if its own families/N/prefixes drift from it.
   #
-  #  sharding:
-  #    families:
-  #      lp:m2g:
-  #        shards: 32        # <- DO NOT set on a publisher until P3; render fails today
+  # Declaring ANY family forces the SERIALIZED forward (threads:1 + max_in_flight:1,
+  # INV-1 row 13) for the WHOLE stream — the ~1/RTT ceiling then applies to every
+  # env, including AIO envs (design R1). Pick N once, over-provisioned; changing it
+  # later is a global pause/drain event.
+  #
+  # ── F2 ROLLOUT WARNING (design §16) ───────────────────────────────────────────
+  # Enabling the first family flips the publish subject GLOBALLY: every non-family
+  # subject shifts kv.cdc.<op> -> kv.cdc.<prefix|others>.<op>. A sharded sink with no
+  # enabled catch-all group then misses ALL non-family traffic (CDCForwardUnrouted).
+  # SEQUENCE A CATCH-ALL SINK GROUP FIRST, and roll it before declaring the family
+  # here. And once the manifest is live (nats.topologyManifest.enabled), CHANGING
+  # this taxonomy on a later run is blocked by the F2 guard unless you set
+  # nats.topologyManifest.allowTaxonomyChange=true AFTER every sink release is
+  # already on the new subjects — do not shift the publisher ahead of the consumers.
+  sharding:
+    families:
+      "lp:m2g":
+        shards: 32

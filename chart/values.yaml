@@ -172,6 +172,23 @@ nats:
   # is mid-rollout. Default false keeps the init jobs byte-identical (INV-3).
   topologyManifest:
     enabled: false
+    # F2 taxonomy-change escape hatch (design §16 / F2). Default false.
+    #
+    # A sharded PUBLISHER owns the publish taxonomy (sharding families + N,
+    # normalSegment, sinkGroup prefixes). When it re-runs with a DIFFERENT taxonomy
+    # than the manifest already records, the init job BLOCKS the manifest overwrite
+    # (fail closed): shifting the taxonomy re-points the published subjects, and any
+    # sink release still filtering the OLD subjects would silently lose every event
+    # on a changed subject until the 72h stream max-age (VF-16). First publisher
+    # deploy (no manifest yet) is never blocked — there is nothing to break.
+    #
+    # Set true ONLY after you have rolled EVERY sink release onto the new taxonomy
+    # and confirmed each is registered on the manifest — then this run overwrites
+    # cdc_topology/current with the new taxonomy. Leave it false again afterwards.
+    # Inert unless enabled=true (with the manifest off the F2 rule rests entirely on
+    # the operator following the rollout runbook). Never touched by legacy (empty
+    # taxonomy) publishers — the guard only compares when shardingEnabled.
+    allowTaxonomyChange: false
   persistence:
     mode: emptyDir
     size: 4Gi
