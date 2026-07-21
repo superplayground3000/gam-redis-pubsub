@@ -5,11 +5,13 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
   labels:
     app: connect-source
+    release: {{ .Release.Name }}
 spec:
   replicas: {{ .Values.connect.source.replicas }}
   selector:
     matchLabels:
       app: connect-source
+      release: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -144,10 +146,12 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "connect-source") }}
   labels:
     app: connect-source
+    release: {{ .Release.Name }}
 spec:
   clusterIP: None
   selector:
     app: connect-source
+    release: {{ .Release.Name }}
   ports:
     - name: http
       port: 4195

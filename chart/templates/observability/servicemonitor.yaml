@@ -25,6 +25,13 @@ spec:
       - key: app
         operator: In
         values: [connect-source, {{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ $g.appLabel }}, {{ end }}{{ end }}writer, latency-calculator]
+      # Release-scoped: two releases of this chart in one namespace both label
+      # their Services `app: connect-source` (etc.); without this ANDed match each
+      # release's ServiceMonitor would scrape BOTH releases' Services and merge
+      # their series. The scoped Services carry `release: {{ "{{" }} .Release.Name {{ "}}" }}`.
+      - key: release
+        operator: In
+        values: [{{ .Release.Name }}]
   {{- /* When connect.envId is set, stamp a static `env` label onto every series
        scraped through this ServiceMonitor (source + sink groups + writer +
        latency-calculator + elector), so Grafana's $env variable and per-env alert

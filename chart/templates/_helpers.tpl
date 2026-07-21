@@ -28,17 +28,28 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-rrcs.podLabels — pod-template labels for a workload: the mandatory `app`
-selector label plus any user-supplied common labels from .Values.podLabels.
-`app` is emitted first; podLabels cannot override it because each workload's
-selector.matchLabels pins `app` and the selector is immutable after install.
+rrcs.podLabels — pod-template labels for a workload: the mandatory `app` +
+`release` selector labels plus any user-supplied common labels from
+.Values.podLabels. `app` and `release` are emitted first; podLabels cannot
+override either (they are omitted from the user set) because each workload's
+selector.matchLabels pins both and the selector is immutable after install.
+
+`release: {{ "{{" }} .Release.Name {{ "}}" }}` is what keeps two releases of THIS
+chart in ONE namespace from cross-wiring: without it every pod carries a bare
+`app: redis-region` (etc.) and BOTH releases' Services select BOTH releases' pods
+(a Service Endpoints set that spans releases round-robins writes into the wrong
+release's Redis — this actually happened, corrupting a multi-env e2e). Scoping the
+pod label + the matching selectors to the release makes each Service select only
+its own pods. See the immutability note in _redis.tpl (redis-region selector) for
+the reinstall-required consequence.
 Usage (at template.metadata.labels indent):
   labels:
     {{- include "rrcs.podLabels" (dict "root" $ "app" "writer") | nindent 8 }}
 */}}
 {{- define "rrcs.podLabels" -}}
 app: {{ .app }}
-{{- with omit .root.Values.podLabels "app" }}
+release: {{ .root.Release.Name }}
+{{- with omit .root.Values.podLabels "app" "release" }}
 {{ toYaml . | trim }}
 {{- end }}
 {{- end -}}

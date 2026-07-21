@@ -5,11 +5,13 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "dashboard") }}
   labels:
     app: dashboard
+    release: {{ .Release.Name }}
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: dashboard
+      release: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -55,9 +57,11 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "dashboard") }}
   labels:
     app: dashboard
+    release: {{ .Release.Name }}
 spec:
   selector:
     app: dashboard
+    release: {{ .Release.Name }}
   ports:
     - name: http
       port: 8080

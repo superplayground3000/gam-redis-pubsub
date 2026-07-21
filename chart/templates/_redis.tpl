@@ -29,11 +29,13 @@ metadata:
   name: {{ $fullname }}-hl
   labels:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
 spec:
   clusterIP: None
   publishNotReadyAddresses: true
   selector:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
   ports:
     - name: redis
       port: 6379
@@ -48,9 +50,11 @@ metadata:
   name: {{ $fullname }}
   labels:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
 spec:
   selector:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
   ports:
     - name: redis
       port: 6379
@@ -62,6 +66,7 @@ metadata:
   name: {{ $fullname }}
   labels:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
 spec:
   # Minimal Redis Cluster: 3 masters, 0 replicas (the cluster floor for full
   # slot coverage). Scaling/HA is an explicit non-goal of bundled cluster mode.
@@ -71,6 +76,7 @@ spec:
   selector:
     matchLabels:
       app: {{ $app }}
+      release: {{ $root.Release.Name }}
   template:
     metadata:
       labels:
@@ -200,11 +206,25 @@ metadata:
   name: {{ $fullname }}
   labels:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
 spec:
   replicas: 1
+  # RELEASE-SCOPED SELECTOR (chart-wide invariant). Every Deployment/StatefulSet
+  # selector, every pod template label (rrcs.podLabels), and every Service
+  # selector in this chart pins BOTH `app` and `release: {{ "{{" }} .Release.Name {{ "}}" }}`.
+  # Rationale: two releases of this chart in ONE namespace share bare `app`
+  # labels; without release scoping each release's Service selects BOTH releases'
+  # pods, so writes round-robin into the wrong release's Redis (this corrupted a
+  # multi-env e2e — keys "vanished" into the sibling release's store).
+  # KNOWN CONSEQUENCE: a Deployment/StatefulSet `.spec.selector` is IMMUTABLE
+  # after creation. An install that predates this change cannot be `helm upgrade`d
+  # in place (the API server rejects the selector edit) — it must be uninstalled
+  # and reinstalled. Acceptable for this lab: same breaking class as the
+  # 2026-07-21 credentials rotation.
   selector:
     matchLabels:
       app: {{ $app }}
+      release: {{ $root.Release.Name }}
   template:
     metadata:
       labels:
@@ -253,9 +273,11 @@ metadata:
   name: {{ $fullname }}
   labels:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
 spec:
   selector:
     app: {{ $app }}
+    release: {{ $root.Release.Name }}
   ports:
     - name: redis
       port: 6379
