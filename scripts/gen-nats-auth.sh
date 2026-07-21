@@ -286,8 +286,14 @@ nsc add user --account "${ACCOUNT_NAME}" --name subscriber \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] user admin"
+# $KV.cdc_topology.> — the topology-manifest drift gate (multi-env design §7):
+# the nats-init Job (admin creds) PUTs/reads the resolved taxonomy in KV bucket
+# cdc_topology. KV bucket create + direct get ride on $JS.API.>; only the value
+# publish needs this extra subject grant. Same one-committed-creds-set reasoning
+# as the DLQ superset grants above.
 nsc add user --account "${ACCOUNT_NAME}" --name admin \
   --allow-pub '$JS.API.>' \
+  --allow-pub '$KV.cdc_topology.>' \
   --allow-sub '_INBOX.>' >/dev/null
 
 echo "[gen] resolver config (MEMORY)"

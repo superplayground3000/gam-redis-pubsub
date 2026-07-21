@@ -158,12 +158,16 @@ nats:
   #     + a best-effort cdc_topology/_unverified_<env> marker on a REDEPLOY, so an
   #     emergency rollback is never blocked on the manifest bucket.
   #
-  # Grant: needs a user-provisioned NATS KV bucket cdc_topology and the
-  # $KV.cdc_topology.> permission on the publisher (put) and subscriber (get) creds
-  # — gen-nats-auth.sh must mint it. In bundled mode the init CREATES the bucket if
-  # absent; on an EXTERNAL NATS the bucket must be pre-provisioned (the init fails
-  # loud with instructions if it is missing — the chart never creates buckets on a
-  # user-owned NATS).
+  # Grant: the manifest put/read runs inside the nats-init Job, i.e. with the
+  # ADMIN identity — the committed lab creds carry $KV.cdc_topology.> pub on the
+  # admin user (minted by gen-nats-auth.sh; regenerated 2026-07-21 — CAUTION:
+  # that regeneration rotated the operator/account identities, same class as the
+  # 2026-07-16 DLQ-grant rotation; releases installed with older creds need a
+  # fresh NATS or a migration, see docs/dlq.md §6 Rollout). On an EXTERNAL NATS
+  # supply the equivalent grant on whatever creds you hand the init Job
+  # (nats.external.auth.adminSecret), and pre-provision the cdc_topology bucket
+  # (the init fails loud if it is missing — the chart never creates buckets on a
+  # user-owned NATS; bundled mode creates it automatically).
   #
   # F2 ROLLOUT RULE (design §16): before ANY publisher-taxonomy change (P3) may
   # roll, this manifest MUST be live and EVERY sink release already registered on

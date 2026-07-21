@@ -122,13 +122,18 @@ for d in connect-source connect-sink-shard-a connect-sink-shard-b connect-sink-o
 done
 sleep 5   # let electors win + POST pipelines
 
-# ── nats admin helper (throwaway nats-box pod with the release's admin creds) ─
+# ── nats helpers (throwaway nats-box pod) ────────────────────────────────────
+# Two creds mounts: admin for stream/consumer inspection, publisher for the
+# direct decode_error injection — the minted admin creds deliberately have NO
+# pub grant on kv.cdc.> (permission model), only the publisher creds do.
+PUBLISHER_SECRET="${PREFIX}publisher-creds"
 log "starting nats-box probe ${PROBE}"
 kubectl --context "$CTX" run "$PROBE" -n "$NS" --image=natsio/nats-box:0.14.5 --restart=Never \
-  --overrides="{\"spec\":{\"volumes\":[{\"name\":\"c\",\"secret\":{\"secretName\":\"${ADMIN_SECRET}\",\"defaultMode\":292}}],\"containers\":[{\"name\":\"nb\",\"image\":\"natsio/nats-box:0.14.5\",\"command\":[\"sleep\",\"3600\"],\"volumeMounts\":[{\"name\":\"c\",\"mountPath\":\"/creds\",\"readOnly\":true}]}]}}" \
+  --overrides="{\"spec\":{\"volumes\":[{\"name\":\"c\",\"secret\":{\"secretName\":\"${ADMIN_SECRET}\",\"defaultMode\":292}},{\"name\":\"p\",\"secret\":{\"secretName\":\"${PUBLISHER_SECRET}\",\"defaultMode\":292}}],\"containers\":[{\"name\":\"nb\",\"image\":\"natsio/nats-box:0.14.5\",\"command\":[\"sleep\",\"3600\"],\"volumeMounts\":[{\"name\":\"c\",\"mountPath\":\"/creds\",\"readOnly\":true},{\"name\":\"p\",\"mountPath\":\"/pubcreds\",\"readOnly\":true}]}]}}" \
   >/dev/null 2>&1 || die "could not create nats-box probe pod"
 k wait --for=condition=Ready "pod/${PROBE}" --timeout=60s >/dev/null 2>&1 || die "nats-box probe not Ready"
-na() { k exec "$PROBE" -- nats --server "$NATS_URL" --creds /creds/user.creds "$@"; }
+na()  { k exec "$PROBE" -- nats --server "$NATS_URL" --creds /creds/user.creds "$@"; }
+napub() { k exec "$PROBE" -- nats --server "$NATS_URL" --creds /pubcreds/user.creds "$@"; }
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 consumer_field() { na consumer info "$STREAM" "$1" --json 2>/dev/null | jq -r "$2"; }
@@ -203,7 +208,7 @@ k exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null; rm -f "$cmds"
 for id in $S2_IDS; do
   payload="$(jq -cn --arg k "lb:company:active:{employees:${id}}:d${RUNID}" --arg e "sdlq-${RUNID}-d${id}" --arg ts "$TS" \
     '{op:"create",type:"hash",kv_key:$k,enc:"gzip:base64",body:"!!!not-base64!!!",ts:($ts|tonumber),event_id:$e}')"
-  na pub "kv.cdc.aio.lb.company.s2.create" "$payload" -H "Nats-Msg-Id:$id-src-${RUNID}" >/dev/null 2>&1 \
+  napub pub "kv.cdc.aio.lb.company.s2.create" "$payload" -H "Nats-Msg-Id:$id-src-${RUNID}" >/dev/null 2>&1 \
     || die "direct decode_error publish to s2 failed"
 done
 

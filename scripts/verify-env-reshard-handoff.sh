@@ -8,7 +8,9 @@
 # their AIO terminal value) — WITHOUT touching the publisher or a second env.
 #
 # Topology (external-PROD-NATS shape; assert-only mode fails render on bundled):
-#   - Release H (envId=envh): PUBLISHER + AIO sink, bundled NATS + central Redis +
+#   - Release H: PUBLISHER-ONLY host (G3 forbids co-locating sinkAllInOne with
+#     families; P3 makes the sink-less publisher render). Its env's AIO sink runs
+#     as a separate sink-only release HS (envId=envh), bundled NATS + central Redis +
 #     its own region Redis. Declares family lb:company N=4 (so the forward already
 #     emits per-shard subjects — the runbook precondition "prefixRouting ON"), DLQ on
 #     in segment mode. Its own AIO sink is the "second env that keeps flowing" across
@@ -66,8 +68,11 @@ NS="${RRCS_NS:-cdc-hoff}"
 CTX="${RRCS_CONTEXT:-kind-cdc}"
 VALUES_FILE="${RRCS_VALUES:-chart/values-dev.yaml}"
 REL_H="${RRCS_RELEASE_H:-hrshh}"
+REL_HS="${RRCS_RELEASE_HS:-hrshs}"       # host env's AIO sink (separate release: G3
+                                         # forbids sinkAllInOne + families in ONE release)
 REL_C="${RRCS_RELEASE_C:-hrshc}"
 PREFIX_H="${RRCS_PREFIX_H:-lab-}"        # host keeps the values-dev default prefix
+PREFIX_HS="${RRCS_PREFIX_HS:-envh-}"     # host sink env distinct prefix (same ns)
 PREFIX_C="${RRCS_PREFIX_C:-envc-}"       # migrating env distinct prefix (same ns)
 ENVH="envh"
 ENVC="envc"
@@ -84,7 +89,7 @@ RUNID="$(date +%s)"
 PROBE="hoff-natsbox-${RUNID}"
 
 CENTRAL="deploy/${PREFIX_H}redis-central"
-REGION_H="deploy/${PREFIX_H}redis-region"
+REGION_H="deploy/${PREFIX_HS}redis-region"
 REGION_C="deploy/${PREFIX_C}redis-region"
 NATS_URL="nats://${PREFIX_H}nats:4222"
 ADMIN_SECRET="${PREFIX_H}admin-creds"
@@ -166,23 +171,40 @@ if kubectl --context "$CTX" get ns "$NS" >/dev/null 2>&1; then
   log "deleting pre-existing namespace ${NS}"
   kubectl --context "$CTX" delete ns "$NS" --wait=true --timeout=180s >/dev/null 2>&1 || true
 fi
-log "=== step 1a: install release H (${REL_H}, envId=${ENVH}: publisher + AIO sink, family N=4) ==="
+log "=== step 1a: install release H (${REL_H}: PUBLISHER-ONLY host, family N=4 — P3 decoupled render) ==="
+# G3 forbids sinkAllInOne + families in one release, and in the real §8.3 topology
+# the publisher IS a separate release anyway — so the host is publisher-only and
+# the host env's AIO sink is its own sink-only release (step 1a', REL_HS) below.
 helm --kube-context "$CTX" upgrade --install "$REL_H" ./chart -n "$NS" --create-namespace \
   --set profile=cdc -f "$VALUES_FILE" \
   --set "resourcePrefix=${PREFIX_H}" \
-  --set "connect.envId=${ENVH}" \
   --set connect.source.enabled=true \
-  --set connect.sink.enabled=true \
-  --set connect.sinkAllInOne.enabled=true \
-  --set connect.deadLetter.enabled=true \
-  --set connect.deadLetter.segment=dlq \
+  --set connect.sink.enabled=false \
   --set nats.stream.normalSegment=aio \
   --set 'connect.sharding.keyPattern=\{employees:(?P<id>[0-9]+)\}' \
   --set 'connect.sharding.families.lb:company.shards=4' \
   --wait --timeout 6m
-for d in connect-source connect-sink; do
-  k rollout status "deploy/${PREFIX_H}${d}" --timeout=180s
-done
+k rollout status "deploy/${PREFIX_H}connect-source" --timeout=180s
+
+log "=== step 1a': install release HS (${REL_HS}, envId=${ENVH}: host env AIO sink-only, external -> ${NATS_URL}) ==="
+helm --kube-context "$CTX" upgrade --install "$REL_HS" ./chart -n "$NS" \
+  --set profile=cdc -f "$VALUES_FILE" \
+  --set "resourcePrefix=${PREFIX_HS}" \
+  --set "connect.envId=${ENVH}" \
+  --set connect.source.enabled=false \
+  --set connect.sink.enabled=true \
+  --set connect.sinkAllInOne.enabled=true \
+  --set connect.sink.bootstrap.deliver=new \
+  --set connect.deadLetter.enabled=true \
+  --set connect.deadLetter.segment=dlq \
+  --set nats.stream.normalSegment=aio \
+  --set writer.enabled=false \
+  --set nats.external.enabled=true \
+  --set "nats.external.url=${NATS_URL}" \
+  --set "nats.external.auth.subscriberSecret=${SUBSCRIBER_SECRET}" \
+  --set "nats.external.auth.adminSecret=${ADMIN_SECRET}" \
+  --wait --timeout 6m
+k rollout status "deploy/${PREFIX_HS}connect-sink" --timeout=180s
 
 log "=== step 1b: install release C (${REL_C}, envId=${ENVC}: AIO sink-only, external -> ${NATS_URL}) ==="
 helm --kube-context "$CTX" upgrade --install "$REL_C" ./chart -n "$NS" \
