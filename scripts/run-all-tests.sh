@@ -15,6 +15,30 @@
 #   (with RUN_FAILOVER=1) verify-sharding-failover.sh + verify-sharding-replay.sh
 #   at L4. measure-shard-throughput.sh (T-8, tc netem) and
 #   sharding-cutover-drill.sh (T-10) stay manual-only.
+# RUN_MULTIENV=1 additionally runs the multi-env mixed-sink L3 proofs (design
+#   docs/design/multi-env-mixed-sink, P7) in namespace cdc-menv/cdc-sdlq:
+#   verify-multi-env.sh (one publisher + a sharded env A + an AIO env B on ONE
+#   stream: fan-out, env-disjoint durables, poison cross-park with no dedup-swallow,
+#   env-A-poison isolation from env B, env attribution, and an OPTIONAL topology-
+#   manifest fail-closed gate) and verify-sharded-dlq-e2e.sh (the focused sharded
+#   park-then-ack proof). verify-multi-env.sh FOLDS IN the old
+#   verify-multi-env-cross-park.sh (its assertion C is the cross-park E2 proof
+#   generalized to an AIO+sharded pair), which was deleted. The manifest gate needs
+#   the user-provisioned $KV.cdc_topology.> grant (design §7) that gen-nats-auth.sh
+#   does not mint; without it that ONE assertion self-skips loudly (MANIFEST_GATE=
+#   require to force it, =skip to suppress).
+#   STANDALONE ONLY — like RUN_E2E_MATRIX, do NOT co-run with RUN_PREFIX/RUN_SHARDING
+#   in the same invocation: two live multi-release installs (~3 connect legs for env
+#   A + 1 for env B, plus the P5 sharded-DLQ release) plus those suites' cdc-mg/
+#   cdc-shard releases oversubscribe connect CPU limits and flake the quiescence
+#   polls. Separate namespaces prevent name collision but not CPU co-tenancy.
+# RUN_HANDOFF=1 additionally runs verify-env-reshard-handoff.sh in namespace cdc-hoff
+#   at L3: mechanizes runbook-aio-to-sharded-handoff.md end-to-end (quiesce + read
+#   F0, F1 filter-coverage gate, precreate shard durables at F0+1 via the P6
+#   assert-only mode incl. a NEGATIVE missing-durable case, no-loss + no-reorder +
+#   R2 across the cutover, second env keeps flowing). STANDALONE ONLY — same CPU
+#   co-tenancy caveat as RUN_MULTIENV (host publisher+AIO sink + migrating env =
+#   several connect legs); run it alone or after scaling other suites to 0.
 # RUN_E2E_MATRIX=1 additionally runs the permanent e2e MATRIX (verify-e2e-matrix.sh)
 #   in namespace cdc-e2e at L3: one install coexisting sharded lb:company + 2-seg
 #   tg:caveat + catchAll (P1 render, P2 traffic/isolation/ordering/loss, P3 graceful
@@ -376,6 +400,56 @@ if grep -q 'kv.cdc.aio' <<<"$DEFAULT_OUT"; then
   echo "[run-all-tests] default render leaked shared-prefix segment layout (kv.cdc.aio)"; fail L1
 fi
 
+# ── Sink bootstrap start policy + start-semantics validation (P4, design §8.4/R3) ──
+# The EXTERNAL nats-init maps connect.sink.bootstrap.deliver -> the consumer's start
+# policy AND validates an EXISTING durable's start semantics. Capture-then-grep.
+EXT_AUTH=(--set nats.external.enabled=true --set nats.external.url=nats://x:4222
+          --set nats.external.auth.subscriberSecret=s --set nats.external.auth.adminSecret=a
+          --set nats.external.auth.publisherSecret=p)
+BS_NEW_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=new) || fail L1
+grep -q 'deliver_policy'   <<<"$BS_NEW_OUT" || { echo "L1: P4 external init missing existing-durable start-semantics (deliver_policy) validation"; fail L1; }
+grep -qF -- '--deliver new' <<<"$BS_NEW_OUT" || { echo "L1: P4 bootstrap.deliver=new must create with --deliver new"; fail L1; }
+grep -q 'allowStartMismatch' <<<"$BS_NEW_OUT" || { echo "L1: P4 start-semantics validation missing the allowStartMismatch escape hatch"; fail L1; }
+BS_ALL_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=all) || fail L1
+grep -qF -- '--deliver all' <<<"$BS_ALL_OUT" || { echo "L1: P4 bootstrap.deliver=all must create with --deliver all"; fail L1; }
+BS_BT_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=by-time --set connect.sink.bootstrap.byStartTime=2026-01-01T00:00:00Z) || fail L1
+grep -q 'by_start_time\|2026-01-01' <<<"$BS_BT_OUT" || { echo "L1: P4 bootstrap.deliver=by-time must anchor at byStartTime"; fail L1; }
+# bundled render is INERT to bootstrap (throwaway consumer, no start-semantics gate).
+BS_BUNDLED_OUT=$(helm template chart/ --set connect.sink.bootstrap.deliver=new) || fail L1
+if grep -q 'deliver_policy' <<<"$BS_BUNDLED_OUT"; then
+  echo "L1: P4 bootstrap.deliver leaked start-semantics validation into the BUNDLED init (should be external-only, inert)"; fail L1
+fi
+# fail-loud: invalid enum, and by-time without a timestamp.
+seg_guard P4-enum 'is invalid — must be' "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=bogus
+seg_guard P4-bytime 'requires connect.sink.bootstrap.byStartTime' "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=by-time
+
+# ── Assert-only handoff mode for named durables (P6, design §8.3/E7) ──
+# handoffAssertOnly makes the EXTERNAL init REFUSE to auto-create: it asserts each
+# derived durable exists and is --deliver by_start_sequence, else exit 1. The
+# ordinary create path (`consumer add "$STREAM" "$CONSUMER"`) must be compiled OUT.
+HANDOFF_SET=("${EXT_AUTH[@]}"
+  --set 'connect.sharding.families.lb:company.shards=4'
+  --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}'
+  --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true)
+HANDOFF_ON_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true) || fail L1
+grep -qF 'handoff assert-only' <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only render missing the [handoff assert-only] branch"; fail L1; }
+grep -qF 'by_start_sequence'   <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must assert deliver_policy by_start_sequence"; fail L1; }
+grep -qF 'does NOT exist'      <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must fail closed (exit 1) on a MISSING durable"; fail L1; }
+if grep -qE 'consumer add "\$STREAM" "\$CONSUMER"' <<<"$HANDOFF_ON_OUT"; then
+  echo "L1: P6 assert-only still executes 'consumer add' (create path not compiled out — would auto-create --deliver all, VF-16)"; fail L1
+fi
+# toggle OFF restores the create path.
+HANDOFF_OFF_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=false) || fail L1
+grep -qE 'consumer add "\$STREAM" "\$CONSUMER"' <<<"$HANDOFF_OFF_OUT" || { echo "L1: P6 create path missing with handoffAssertOnly=false"; fail L1; }
+# fail-loud: bundled release, and pairing with bootstrap.deliver.
+seg_guard P6-bundled 'only valid on an EXTERNAL-NATS release' \
+  --set 'connect.sharding.families.lb:company.shards=4' \
+  --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
+  --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true \
+  --set connect.sink.handoffAssertOnly=true
+seg_guard P6-bootstrap 'mutually exclusive with connect.sink.bootstrap.deliver' \
+  "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.bootstrap.deliver=new
+
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
 for t in writer.enabled:lab-writer dashboard.enabled:lab-dashboard \
@@ -591,6 +665,15 @@ else
   # STANDALONE (see header): do not co-run with RUN_PREFIX/RUN_SHARDING (CPU co-tenancy).
   if [ "${RUN_E2E_MATRIX:-0}" = "1" ]; then
     RRCS_NS=cdc-e2e RRCS_RELEASE=cdce2e scripts/verify-e2e-matrix.sh || fail L3
+  fi
+  # STANDALONE (see header): multi-env mixed-sink proofs (P7). Own namespaces.
+  if [ "${RUN_MULTIENV:-0}" = "1" ]; then
+    RRCS_NS=cdc-menv scripts/verify-multi-env.sh || fail L3
+    RRCS_NS=cdc-sdlq RRCS_RELEASE=cdcsdlq scripts/verify-sharded-dlq-e2e.sh || fail L3
+  fi
+  # STANDALONE (see header): AIO->sharded per-env handoff (P6/P7). Own namespace.
+  if [ "${RUN_HANDOFF:-0}" = "1" ]; then
+    RRCS_NS=cdc-hoff scripts/verify-env-reshard-handoff.sh || fail L3
   fi
   pass L3
 fi
