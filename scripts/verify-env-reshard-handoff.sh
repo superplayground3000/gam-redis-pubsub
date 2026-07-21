@@ -385,7 +385,17 @@ POLL_PID=$!
 helm --kube-context "$CTX" upgrade "$REL_C" ./chart -n "$NS" "${SHARDED_ARGS[@]}" \
   --set connect.sink.handoffAssertOnly=true --wait --timeout 4m >/tmp/hoff_pos.log 2>&1 \
   || { kill "$POLL_PID" 2>/dev/null || true; die "assert-only upgrade FAILED after all durables precreated (see /tmp/hoff_pos.log)"; }
-POS_HOOK="$(k logs -l "job-name" --tail=-1 2>/dev/null | grep -ci 'by_start_sequence' || true)"
+# Server-side assert (stronger than hook-log grep — the hook Job pod is deleted
+# by helm's hook policy right after success): every precreated env C durable
+# must still be by_start_sequence AFTER the assert-only upgrade (proves the init
+# asserted rather than re-created them with --deliver all).
+POS_HOOK=0
+for spec in "${SHARD_SPECS[@]}"; do
+  IFS='|' read -r dur _f _m <<<"$spec"
+  dp="$(consumer_field "$dur" '.config.deliver_policy')"
+  [ "$dp" = "by_start_sequence" ] && POS_HOOK=$(( POS_HOOK + 1 )) \
+    || log "WARN durable ${dur} deliver_policy=${dp} (want by_start_sequence)"
+done
 for d in connect-sink-shard-a connect-sink-others; do
   k rollout status "deploy/${PREFIX_C}${d}" --timeout=180s || true
 done
@@ -432,7 +442,7 @@ add_fail() { PASS=false; REASONS="${REASONS}${REASONS:+; }$1"; }
 (( ORD_MONO == 1 ))          || add_fail "no-reorder: region value went backwards: ${ORD_VIOL}"
 [ "$R2_AFTER" = "R2VALUE" ]  || add_fail "R2: pre-F0 key value changed after handoff (${R2_BEFORE} -> ${R2_AFTER})"
 (( NAP_MAX <= 1 ))           || add_fail "num_ack_pending ${NAP_MAX} > 1 on a shard durable (O-6)"
-(( POS_HOOK >= 6 ))          || add_fail "assert-only hook logged only ${POS_HOOK} by_start_sequence asserts (want >=6)"
+(( POS_HOOK >= 6 ))          || add_fail "server-side deliver_policy check: only ${POS_HOOK} durables are by_start_sequence after the assert-only upgrade (want all 6)"
 (( h_noloss == POST_NOLOSS )) || add_fail "second env (host AIO) got ${h_noloss}/${POST_NOLOSS} post-F0 keys (did not keep flowing)"
 
 RESULT="$(printf '{"runid":"%s","ns":"%s","F0":%s,"post_noloss":{"got":%d,"want":%d},"ord_final":"%s","ord_samples":%d,"ord_monotone":%d,"r2":{"before":"%s","after":"%s"},"num_ack_pending_max":%d,"assert_hook_count":%d,"second_env_noloss":%d,"pass":%s}' \
