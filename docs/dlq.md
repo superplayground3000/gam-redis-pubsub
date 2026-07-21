@@ -30,9 +30,11 @@ published to a sibling subject and acked, so the ack floor advances and healthy
 traffic keeps flowing, while the poison is preserved — never dropped — for
 inspection.
 
-**Scope.** The DLQ only covers the non-sharded sink pipeline
-(`chart/files/connect/cdc-reverse.yaml`). It is deliberately incompatible with
-per-key sharding v2 — see §5. This page documents the feature as it exists today
+**Scope.** The DLQ covers **both** sink pipelines: the non-sharded
+(`chart/files/connect/cdc-reverse.yaml`) and, since the multi-env mixed-sink work
+(2026-07-21), the sharded pipeline (`chart/files/connect/cdc-reverse-sharded.yaml`)
+— see §5 for the sharded park-then-ack path. The old DLQ↔sharding render exclusion
+is **gone**. This page documents the feature as it exists today
 on `master`; the design spec
 `docs/superpowers/specs/2026-07-13-hash-decode-dlq-design.md` is a dated session
 artifact (background rationale, not current requirements — several of its
@@ -104,8 +106,9 @@ Render-time guards for **legacy mode** (all in `chart/templates/_helpers.tpl`):
   disjointness guarantee of the default layout. Segment mode deliberately puts the
   DLQ *inside* the prefix and replaces this structural rule with the render-time
   guards N1–N6 in §10 (chiefly `normalSegment ≠ deadLetter.segment`).
-- `connect.deadLetter.enabled=true` together with `connect.sharding.families`
-  fails the render (`chart/templates/_helpers.tpl:246` — see §5).
+- `connect.deadLetter.enabled=true` together with `connect.sharding.families` is
+  now **supported** (the sharded park-then-ack path, §5); the former render
+  exclusion has been removed.
 
 **Do not duplicate the values here — use the worked example.** A complete,
 heavily commented enablement file lives at `chart/examples/values-dlq.yaml`,
@@ -135,28 +138,52 @@ is permission-denied, which surfaces as an output error → `reject_errored` nac
 the original retries. So a misconfiguration cannot lose data; it just leaves the
 DLQ inert while poison keeps looping (`chart/values.yaml:184-188`).
 
-**Why incompatible with sharding v2.** The sharded sink pipeline
-(`chart/files/connect/cdc-reverse-sharded.yaml`) has the same poison hole but no
-DLQ routing yet. Enabling both would silently protect only the unsharded half of a
-mixed topology, so the chart makes it a loud render error rather than shipping a
-half-protected system (`chart/templates/_helpers.tpl:246`).
+**Sharding is now supported (was a loud render error).** The sharded sink pipeline
+(`chart/files/connect/cdc-reverse-sharded.yaml`) once had the same poison hole but
+no DLQ routing, so the chart used to fail the render when both were set. The
+multi-env work ported the park-then-ack mechanism into the sharded pipeline
+(env-scoped subject *and* msg-id) and closed the hash-guard hole unconditionally,
+so the exclusion is gone — see §5 and `docs/design/multi-env-mixed-sink/design.md` §5.
 
-## 5. Sharding incompatibility (hard error)
+## 5. Sharded DLQ (park-then-ack on the sharded pipeline)
 
-Setting `connect.deadLetter.enabled=true` while `connect.sharding.families` is
-configured **fails the render** with:
+Since the multi-env mixed-sink work (2026-07-21) the DLQ works on the sharded sink
+too — `connect.deadLetter.enabled=true` together with `connect.sharding.families`
+now renders and runs. The old render exclusion (`_helpers.tpl`) has been removed;
+`chart/examples/values-dlq.yaml` and `chart/examples/values-sharding.yaml` may be
+combined. Normative design: `docs/design/multi-env-mixed-sink/design.md` §5.
 
-```
-connect.deadLetter.enabled=true is not supported with subject-sharding v2
-(connect.sharding.families is set) — the sharded sink pipeline
-(cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be
-silently half-protected (unsharded poison parked, sharded poison still loops).
-Disable one of them.
-```
+**What the sharded pipeline does.** It ports the same park-then-ack mechanism as the
+non-sharded pipeline (§2): permanent poison (`decode_error`, `hash_decode_error`,
+`unknown_op`) is published to the DLQ subject and only acked once the DLQ publish is
+PubAck-confirmed (write-then-ack — INV-1 preserved). The output is a single global
+`switch` over the broker fan-in (`reject_errored` → `switch{dlq_out, drop}`), never
+per-child; the broker routes the park's ack back to the ORIGINATING shard child, so
+a park occupies that shard's `max_ack_pending=1` slot exactly as a normal apply
+would — per-shard ordering (O-6/O-7) is unchanged because a parked message carries
+no valid change. Transient region-Redis errors and the `sx` cross-shard rename lane
+are NEVER parked (they keep nacking — the intended loud fail-stop).
 
-(`chart/templates/_helpers.tpl:246`.) Use `chart/examples/values-dlq.yaml` **or**
-`chart/examples/values-sharding.yaml`, never both at once. Combined DLQ + sharding
-support is a documented follow-up (§9).
+**Two differences from the non-sharded path, both load-bearing:**
+
+- **Env-scoped subject AND msg-id.** The parked message goes to
+  `<dlqRoot>.<envId>.<reason>` with `Nats-Msg-Id: dlq.<envId>.<event_id>`. JetStream
+  msg-id dedup is stream-wide and subject-independent, so in a multi-env topology two
+  envs parking the same poison would collide on a bare `dlq.<event_id>` — one env's
+  copy would be silently deduped away while it still acks (a per-env silent hole).
+  Scoping BOTH the subject and the msg-id gives every env its own deterministic copy.
+  (The AIO/non-sharded path is env-scoped on the msg-id too, for the same reason.)
+- **Hash guard renders unconditionally.** The sharded pipeline previously threw an
+  un-counted error on a non-object hash body (an INV-2 hole). The
+  `hash_decode_failed` guard + `cdc_unprocessable{shard,reason=hash_decode_error}`
+  counter now render **whether or not** the DLQ is enabled — only the PARK action is
+  gated on `deadLetter.enabled`. With the DLQ off, the sharded output returns to
+  `reject_errored`+`drop` and poison nack-loops as before, but it is now counted.
+
+Headers on the sharded parked message add `dlq_env` and `dlq_shard` (alongside the
+existing `dlq_reason`) so a per-env drain tool can correlate copies across lanes.
+Metrics: `cdc_dlq_forwarded{shard,reason}` (routed) and `output_sent{label=dlq_out}`
+(confirmed parked) — dashboard panel 18 breaks both out by `shard`.
 
 ## 6. Operational notes
 
@@ -269,11 +296,13 @@ path not exercised is external NATS — see §8.
 
 ## 9. Potential improvements
 
-- Add DLQ routing to the sharded sink pipeline so the DLQ and sharding are no
-  longer mutually exclusive (removes the render-time incompatibility in §5).
+- **SHIPPED (2026-07-21):** DLQ routing on the sharded sink pipeline, so the DLQ
+  and sharding are no longer mutually exclusive — the §5 render exclusion is gone
+  (`docs/design/multi-env-mixed-sink/design.md` §5).
 - Ship a "DLQ drain" helper or runbook for inspecting and replaying parked
-  messages, so operators are not left with a growing `dlq.cdc.>` subject and no
-  tooling.
+  messages, so operators are not left with a growing DLQ subtree and no tooling.
+  (Multi-env per-env manual drain is described in `design.md` §8.5 — the automated
+  helper is still open.)
 - Emit a post-write "parked" counter so the dashboard no longer needs to lean on
   the `output_sent{label="dlq_out"}` proxy to prove parking (the `cdc_dlq_forwarded`
   counter cannot count post-write on this Connect build —

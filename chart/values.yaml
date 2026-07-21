@@ -158,6 +158,17 @@ nats:
   #     + a best-effort cdc_topology/_unverified_<env> marker on a REDEPLOY, so an
   #     emergency rollback is never blocked on the manifest bucket.
   #
+  # OPERATIONAL CHECK (fail-open surfacing — no Prometheus alert in this lab).
+  # A real CDCTopologyManifestUnverified *alert* would need the shared ops-owned
+  # NATS KV exporter (design §9 / E10) that this lab deliberately does NOT ship;
+  # rather than ship a permanently-non-firing alert, the fail-open banner is
+  # surfaced by hand. After any redeploy, list the marker keys:
+  #   nats kv ls cdc_topology | grep '^_unverified_'      # any hit => a release
+  #     came up UNVERIFIED against the manifest (grant/bucket gap); investigate
+  #     and re-run its nats-init once the manifest is readable, then delete the
+  #     stale marker: `nats kv del cdc_topology _unverified_<env>`.
+  # See docs/design/multi-env-mixed-sink/runbook-first-sharded-env.md.
+  #
   # Grant: the manifest put/read runs inside the nats-init Job, i.e. with the
   # ADMIN identity — the committed lab creds carry $KV.cdc_topology.> pub on the
   # admin user (minted by gen-nats-auth.sh; regenerated 2026-07-21 — CAUTION:

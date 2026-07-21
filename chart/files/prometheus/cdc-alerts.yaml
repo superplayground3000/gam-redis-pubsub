@@ -138,11 +138,28 @@ groups:
       # exists for. The join extracts the shard token from the durable name
       # (cdc_sink_<family>_s<K>) via label_replace and drops any backlogged
       # durable whose shard still shows apply throughput.
+      #
+      # MULTI-ENV env extraction (design §9 / E10): the NATS-exporter series
+      # carry only a `durable` label (no namespace/env), so for a multi-env
+      # deployment the env is recovered from the durable name with a SECOND
+      # label_replace and Alertmanager routes by the extracted `env`. Env-scoped
+      # durables are cdc_sink_<envId>_<fam>_s<K> where envId is a DNS-1123 label
+      # (dashes, NEVER underscores — the connect.envId grammar guard, design §4),
+      # so `cdc_sink_([a-z0-9-]+?)_[a-z0-9_]+_s(...)` captures the leading env
+      # token (the family segment carries the underscores). label_replace leaves
+      # `env` empty (unchanged) when the regex does not match. Best-effort caveat
+      # for a LEGACY single-env durable cdc_sink_<fam>_s<K> (no envId token): the
+      # non-greedy capture can surface the family's first token (e.g. `lp`) as
+      # `env` — harmless because a single-env stack has nothing to route between;
+      # multi-env stacks always carry a real envId token and resolve correctly.
       - alert: CDCShardStuck
         expr: |
           label_replace(
-            max by (durable) (jetstream_consumer_num_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}),
-            "shard", "$1", "durable", ".*_(s[0-9]+|sx)$"
+            label_replace(
+              max by (durable) (jetstream_consumer_num_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}),
+              "shard", "$1", "durable", ".*_(s[0-9]+|sx)$"
+            ),
+            "env", "$1", "durable", "cdc_sink_([a-z0-9-]+?)_[a-z0-9_]+_s(?:[0-9]+|x)$"
           ) > 1000
           unless on (shard)
             (sum by (shard) (rate({__name__=~"cdc_apply(_total)?", shard!=""}[5m])) > 0)
@@ -234,10 +251,15 @@ groups:
       # A6 — O-6 assertion: a shard durable with more than one un-acked
       # delivery means max_ack_pending!=1 (someone edited the consumer) —
       # redelivery can now overtake later messages and ordering breaks with NO
-      # other signal. Needs the NATS exporter (see group header).
+      # other signal. Needs the NATS exporter (see group header). The
+      # label_replace recovers the per-env `env` label from the durable name for
+      # multi-env Alertmanager routing (same extraction + legacy caveat as A1).
       - alert: CDCShardAckPendingViolation
         expr: |
-          max by (durable) (jetstream_consumer_num_ack_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}) > 1
+          label_replace(
+            max by (durable) (jetstream_consumer_num_ack_pending{durable=~"cdc_sink_.+_s([0-9]+|x)", is_consumer_leader="true"}),
+            "env", "$1", "durable", "cdc_sink_([a-z0-9-]+?)_[a-z0-9_]+_s(?:[0-9]+|x)$"
+          ) > 1
         for: 0m
         labels:
           severity: critical

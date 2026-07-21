@@ -573,3 +573,22 @@ safe once the external init validates existing-consumer start semantics, so that
 into the bootstrap phase (R3, §8.4); F4 — the assert-only handoff mode for named durables is a
 required new capability with no baseline phase, so it gets its own phase (E7, implementation-plan
 P-handoff). No transcript retained.
+
+**Implementation status (2026-07-21): COMPLETE.** All eight phases (P0–P8) landed on branch
+`feat/multi-env-mixed-sink` and the full e2e ladder is green — 10/10 suites, including the three
+new multi-env proofs `verify-multi-env.sh` (fan-out, disjoint durables, cross-park no
+dedup-swallow, manifest gate fail-closed), `verify-sharded-dlq-e2e.sh` (3 classes parked
+env-scoped, +9 PubAck, O-6 held) and `verify-env-reshard-handoff.sh` (F0 anchor, no-loss 13/13,
+6/6 by_start_sequence), plus `verify-sharding{,-failover,-replay}.sh`, `verify-cdc.sh`,
+`verify-dlq-e2e.sh`, and `verify-alert.sh`. Operational procedures are in
+`runbook-first-sharded-env.md` (first-sharded-env onboarding), `runbook-aio-to-sharded-handoff.md`
+(§8.3) and `runbook-new-env-bootstrap.md` (§8.4). **Two deviations from this design were made and
+are recorded here:** (1) the `CDCTopologyManifestUnverified` Prometheus alert (§9/E10) was
+DEFERRED — a real alert needs the shared ops-owned NATS KV exporter this lab does not ship, so
+rather than ship a permanently-non-firing rule the fail-open path is surfaced by an operational
+`nats kv ls cdc_topology` check documented on the `connect.topologyManifest` values key and in the
+first-sharded-env runbook. (2) A cross-release wiring bug found during multi-env e2e — Services and
+Deployments without release-scoped selectors round-robined connections across two same-namespace
+releases (applied+acked+counted, yet key absent) — was fixed by adding a `release` label to every
+selector (commit `280034f`); it was invisible to every single-release install and is the reason the
+multi-env e2e is load-bearing.
