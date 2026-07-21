@@ -321,8 +321,11 @@ log "F1 coverage OK: {s0,s1,s2,s3,sx,others} all present (no configured publishe
 
 # ── 5. NEGATIVE: precreate all-but-one durable, assert-only upgrade FAILS ─────
 precreate() { # $1=durable $2=filter $3=map
+  # nats CLI (nats-box 0.14.5): a NUMERIC --deliver value IS by_start_sequence
+  # (there is no --start-sequence flag; "--deliver <seq>" renders as
+  # "Deliver Policy: From Sequence <seq>").
   na consumer add "$STREAM" "$1" --pull --filter "$2" --ack explicit \
-    --deliver by_start_sequence --start-sequence "$SSEQ" --replay instant \
+    --deliver "$SSEQ" --replay instant \
     --wait "${ACKWAIT_S}s" --max-pending "$3" --max-deliver=-1 --defaults >/dev/null 2>&1 \
     || die "precreate of durable $1 failed"
 }
