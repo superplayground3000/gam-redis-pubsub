@@ -204,19 +204,27 @@ rc XGROUP CREATE "$CENTRAL_STREAM" "$GROUP" 0 MKSTREAM >/dev/null 2>&1 || true
 # regions actually applied both, then flush and start the measured test from a
 # proven-hot pipeline.
 log "warm-up: proving both sinks' apply paths end-to-end before the measured run"
-rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-f" op create type string \
-  kv_key "lb:company:active:{employees:1}:warmup${RUNID}" ts "$(now_ms)" body warm >/dev/null
-rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-o" op create type string \
-  kv_key "misc:warmup:1:${RUNID}" ts "$(now_ms)" body warm >/dev/null
-WU_DEADLINE=$(( $(date +%s) + 120 )); WARM_OK=0; wa=0; wb=0
-while (( $(date +%s) < WU_DEADLINE )); do
-  wa=$(( $(cntA "*warmup${RUNID}") + $(cntA "misc:warmup:*:${RUNID}") ))
-  wb=$(( $(cntB "*warmup${RUNID}") + $(cntB "misc:warmup:*:${RUNID}") ))
-  if (( wa >= 2 && wb >= 2 )); then WARM_OK=1; break; fi
-  sleep 3
+# RETRY ROUNDS: a probe injected during the elector-churn window can stall in the
+# forward's PEL (replayed only on the next forward restart — an availability
+# delay, not a loss). A fresh probe pair per round proves steady state is
+# reached; stale stuck probes are harmless (idempotent create, replays later).
+WARM_OK=0; wa=0; wb=0; wround=0
+for wround in 1 2 3 4; do
+  rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-r${wround}-f" op create type string \
+    kv_key "lb:company:active:{employees:1}:warmup${RUNID}r${wround}" ts "$(now_ms)" body warm >/dev/null
+  rc XADD "$CENTRAL_STREAM" '*' event_id "warmup-${RUNID}-r${wround}-o" op create type string \
+    kv_key "misc:warmup:${wround}:${RUNID}" ts "$(now_ms)" body warm >/dev/null
+  WU_DEADLINE=$(( $(date +%s) + 60 ))
+  while (( $(date +%s) < WU_DEADLINE )); do
+    wa=$(( $(cntA "*warmup${RUNID}r${wround}") + $(cntA "misc:warmup:${wround}:${RUNID}") ))
+    wb=$(( $(cntB "*warmup${RUNID}r${wround}") + $(cntB "misc:warmup:${wround}:${RUNID}") ))
+    if (( wa >= 2 && wb >= 2 )); then WARM_OK=1; break 2; fi
+    sleep 3
+  done
+  log "warm-up round ${wround}: not fully applied yet (A ${wa}/2, B ${wb}/2) — injecting a fresh probe pair"
 done
-(( WARM_OK == 1 )) || die "warm-up: sinks did not apply the readiness probes within 120s (env A ${wa}/2, env B ${wb}/2) — apply path not proven, refusing to start the measured run"
-log "warm-up OK: both envs applied the readiness probes (A=${wa}/2 B=${wb}/2)"
+(( WARM_OK == 1 )) || die "warm-up: sinks did not apply a full probe pair in ${wround} rounds (last: env A ${wa}/2, env B ${wb}/2) — apply path not proven, refusing to start the measured run"
+log "warm-up OK (round ${wround}): both envs applied the readiness probes (A=${wa}/2 B=${wb}/2)"
 rrA FLUSHDB >/dev/null; rrB FLUSHDB >/dev/null
 TS="$(now_ms)"
 

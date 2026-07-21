@@ -243,8 +243,27 @@ cntC() { rrC --scan --pattern "$1" 2>/dev/null | grep -c . || true; }
 cntH() { rrH --scan --pattern "$1" 2>/dev/null | grep -c . || true; }
 now_ms() { date +%s%3N; }
 
-rrH FLUSHDB >/dev/null; rrC FLUSHDB >/dev/null
 rc XGROUP CREATE "$CENTRAL_STREAM" "$GROUP" 0 MKSTREAM >/dev/null 2>&1 || true
+# Warm-up readiness PROOF with retry rounds (same 2026-07-21 lesson as
+# verify-multi-env.sh): a probe injected during the elector-churn window can
+# stall in the forward's PEL until the next forward restart. Prove BOTH envs'
+# apply paths with fresh probe pairs before flushing and measuring.
+log "warm-up: proving env H + env C apply paths before the measured run"
+WARM_OK=0; wh=0; wc=0; wround=0
+for wround in 1 2 3 4; do
+  rc XADD "$CENTRAL_STREAM" '*' event_id "hoff-${RUNID}-warm-r${wround}" op create type string \
+    kv_key "lb:company:active:{employees:2}:warm${RUNID}r${wround}" ts "$(now_ms)" body warm >/dev/null
+  WU_DEADLINE=$(( $(date +%s) + 60 ))
+  while (( $(date +%s) < WU_DEADLINE )); do
+    wh="$(cntH "*warm${RUNID}r${wround}")"; wc="$(cntC "*warm${RUNID}r${wround}")"
+    if (( wh >= 1 && wc >= 1 )); then WARM_OK=1; break 2; fi
+    sleep 3
+  done
+  log "warm-up round ${wround}: not applied yet (H ${wh}/1, C ${wc}/1) — injecting a fresh probe"
+done
+(( WARM_OK == 1 )) || die "warm-up: envs did not apply a probe in ${wround} rounds (H ${wh}/1, C ${wc}/1) — apply path not proven"
+log "warm-up OK (round ${wround}): both envs applied the probe"
+rrH FLUSHDB >/dev/null; rrC FLUSHDB >/dev/null
 TS="$(now_ms)"
 
 # ── 2. pre-F0 traffic (applied by AIO env C), incl. the R2 key ───────────────
