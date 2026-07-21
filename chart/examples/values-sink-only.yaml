@@ -55,6 +55,24 @@ connect:
     # (the whole-stream filter is a superset of the per-shard subjects).
     enabled: true
 
+    # Start this NEW env at the stream head — replay NOTHING. This is the safe
+    # go-forward default for onboarding a fresh env: a durable created with the
+    # legacy --deliver all would instead replay the whole 72h retained backlog of
+    # CHANGES (a partial history, NOT a snapshot), leaving an inconsistent region
+    # Redis. With deliver: new the EXTERNAL nats-init also VALIDATES an existing
+    # durable's start semantics and fails closed if a stale --deliver all consumer
+    # is squatting on this durable name (design §8.4, R3). To seed a fully-correct
+    # region instead, use deliver: by-time with byStartTime = your snapshot instant
+    # — see docs/design/multi-env-mixed-sink/runbook-new-env-bootstrap.md.
+    #
+    # NOTE: this switch is acted on by the EXTERNAL nats-init only — the real
+    # multi-env case is a shared external PROD stream (set nats.external.* as in
+    # values-dlq.yaml). The bundled-NATS demo install above ignores it and creates
+    # its throwaway consumer --deliver all, which is harmless for a disposable
+    # in-cluster Redis.
+    bootstrap:
+      deliver: new
+
   # Turn the DLQ on so this env parks a poison message it can never apply instead of
   # head-of-line-blocking its whole consumer forever. Each env parks on its OWN lane
   # and its own dedup key — the DLQ subject and msg-id are env-scoped

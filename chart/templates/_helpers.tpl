@@ -116,6 +116,47 @@ Usage: {{ include "rrcs.resourcePrefix" $ }}
 {{- end -}}
 
 {{/*
+rrcs.connect.sink.bootstrapDeliver — the validated connect.sink.bootstrap.deliver
+token: "" (legacy), "new", "all", or "by-time". This is the sole gate the EXTERNAL
+nats-init consults to (a) choose the deliver_policy for a durable it CREATES and
+(b) — when non-empty — VALIDATE an already-existing durable's start semantics against
+that choice, failing closed on a mismatch (design §8.4, R3/F3). Only the external
+init acts on it; the bundled nats-init owns/recreates its throwaway consumers and
+always creates --deliver all (nats-init-job.yaml).
+
+Empty ("", the default) is LEGACY: the external create path stays --deliver all and
+NO start-semantics validation renders, so the whole chart stays byte-identical to the
+pre-bootstrap version. A future major may flip the default to "new".
+
+Fails the render loud on: an unknown deliver value; deliver="by-time" without a
+byStartTime; a byStartTime that is not an RFC3339 timestamp; or a byStartTime set for
+a non-by-time mode (it would be silently ignored — a trap). Calling this helper is
+therefore what enforces the guards; call it wherever the token is needed.
+Usage: {{ include "rrcs.connect.sink.bootstrapDeliver" . }}
+*/}}
+{{- define "rrcs.connect.sink.bootstrapDeliver" -}}
+{{- $b := (.Values.connect.sink).bootstrap | default dict -}}
+{{- $d := $b.deliver | default "" -}}
+{{- $ts := $b.byStartTime | default "" -}}
+{{- if not (has $d (list "" "new" "all" "by-time")) -}}
+{{-   fail (printf "connect.sink.bootstrap.deliver=%q is invalid — must be \"\" (legacy: create --deliver all, no start-semantics validation, byte-identical render), \"new\" (start at the stream head, replay nothing — the safe go-forward default for a new env), \"all\" (replay the whole 72h backlog of CHANGES — NOT a snapshot), or \"by-time\" (start at bootstrap.byStartTime). See design §8.4." $d) -}}
+{{- end -}}
+{{- if eq $d "by-time" -}}
+{{-   if eq $ts "" -}}
+{{-     fail "connect.sink.bootstrap.deliver=\"by-time\" requires connect.sink.bootstrap.byStartTime — an RFC3339 UTC timestamp (e.g. 2026-07-21T00:00:00Z) giving the stream position the durable starts from. Set it to the snapshot instant T0 (design §8.4 strict path)." -}}
+{{-   end -}}
+{{-   if not (regexMatch "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$" $ts) -}}
+{{-     fail (printf "connect.sink.bootstrap.byStartTime=%q is not an RFC3339 timestamp — expected e.g. 2026-07-21T00:00:00Z or 2026-07-21T00:00:00+00:00. It is passed verbatim to `nats consumer add --deliver <ts>` (which sets deliver_policy=by_start_time / opt_start_time); a malformed value would fail the consumer creation at deploy time." $ts) -}}
+{{-   end -}}
+{{- else -}}
+{{-   if ne $ts "" -}}
+{{-     fail (printf "connect.sink.bootstrap.byStartTime=%q is set but connect.sink.bootstrap.deliver=%q is not \"by-time\", so the timestamp would be silently ignored. Set deliver=\"by-time\" to use it, or clear byStartTime." $ts $d) -}}
+{{-   end -}}
+{{- end -}}
+{{- $d -}}
+{{- end -}}
+
+{{/*
 rrcs.connect.durableBase — the env-scoped durable base: nats.stream.consumer.durable
 with "_<envId>" appended when connect.envId is set, else the bare base. This is the
 single seam through which envId reaches EVERY derived durable — the synthesized

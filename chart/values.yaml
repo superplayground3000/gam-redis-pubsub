@@ -465,6 +465,49 @@ connect:
       duration: 6s
       renewDeadline: 4s
       retryPeriod: 1s
+    # ── New-env bootstrap start policy (EXTERNAL NATS onboarding; design §8.4, R3) ──
+    # Chooses the deliver_policy the EXTERNAL nats-init job gives a durable it CREATES
+    # for this env, and — when `deliver` is non-empty — makes that job VALIDATE an
+    # already-existing durable's start semantics against this choice, FAILING CLOSED on
+    # a mismatch instead of blessing whatever position it happens to be at. This closes
+    # the F3 gap: today the init accepts any existing consumer as "usable" without
+    # inspecting deliver_policy, so a durable left from a prior `--deliver all` create
+    # silently replays 72h of history even when you want a fresh go-forward env.
+    #
+    # ONLY the external init acts on this. The bundled nats-init (bundled NATS / labs)
+    # owns and freely recreates its throwaway consumers and always creates them
+    # --deliver all — a bundled disposable region Redis does not need this switch. A
+    # bootstrap value set on a bundled release is therefore inert (see nats-init-job.yaml).
+    #
+    #   deliver:
+    #     ""        LEGACY (default): create --deliver all, run NO start-semantics
+    #               validation. Byte-identical to the pre-bootstrap chart. A future
+    #               major may flip this default to "new".
+    #     "new"     go-forward only — the durable starts at the stream head and replays
+    #               NOTHING. The safe default for a NEW env that is seeded another way
+    #               (or is change-tolerant). Needs the validation so a stale --deliver
+    #               all durable can't be silently accepted in its place (design R3/F3).
+    #     "all"     replay the whole 72h retained backlog of CHANGES (a partial history,
+    #               NOT a snapshot — VF-16). Only for a snapshot-seeded or change-tolerant
+    #               env. Same effect as legacy, but now explicit and validated.
+    #     "by-time" start at `byStartTime` (deliver_policy=by_start_time). The strict
+    #               snapshot-seed path (§8.4): snapshot the source at T0, load this env's
+    #               region Redis, then start the durable at T0 so nothing before it and
+    #               nothing after it is missed. See runbook-new-env-bootstrap.md.
+    bootstrap:
+      deliver: ""
+      # RFC3339 UTC timestamp, REQUIRED iff deliver="by-time" (and rejected otherwise so
+      # it can't be silently ignored). The stream position the durable starts from — set
+      # it to the snapshot instant T0. Passed verbatim to `nats consumer add --deliver`.
+      byStartTime: ""
+      # Escape hatch for the start-semantics validation. When an existing durable's
+      # deliver_policy / opt_start_time does NOT match `deliver`, the init fails closed
+      # by default (the operator deletes+recreates the durable, since a durable's start
+      # policy is fixed at creation and the chart never mutates a user-owned consumer).
+      # Set true to DOWNGRADE that failure to a WARN and proceed with the existing
+      # durable as-is — use only when you deliberately pre-created it and accept its
+      # position (this is also the machinery the P6 assert-only handoff builds on).
+      allowStartMismatch: false
 
   # ── Multi-subject sink groups (design D3) ──────────────────────────────────
   # Split the sink leg into N groups, each = (durable pull consumer × filter

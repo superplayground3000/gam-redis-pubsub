@@ -218,6 +218,16 @@ spec:
                     --force
                 elif [ "$ACTION" = create ]; then
                   echo "creating pull consumer $CONSUMER (filter [$DESIRED_FILTER_SORTED])"
+                  {{- /* This bundled job always creates --deliver all and deliberately
+                       does NOT honor connect.sink.bootstrap (the new-env start policy +
+                       start-semantics validation). That switch is EXTERNAL-only by design
+                       (§8.4, R3/F3): it exists for onboarding an env against a shared
+                       external PROD stream whose durable is user-owned and must never be
+                       silently mis-positioned. This bundled variant owns and freely
+                       recreates its throwaway consumers, so --deliver all is always correct
+                       here. Keep the two variants from drifting: bootstrap behavior lives
+                       in nats-init-external-job.yaml, not here. (Helm comment => renders
+                       nothing, so the bundled Job stays byte-identical.) */}}
                   nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
                     --pull \
                     $FILTER_ARGS \

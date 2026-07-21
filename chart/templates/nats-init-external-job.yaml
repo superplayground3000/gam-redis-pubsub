@@ -16,6 +16,18 @@
   create the consumer.
 */}}
 {{- $credsSecret := .Values.nats.external.auth.adminSecret | default (include "rrcs.nats.credsSecret.subscriber" .) }}
+{{- /* Bootstrap start policy (design §8.4, R3/F3). bDeliver="" is LEGACY: create
+     --deliver all and render NO start-semantics validation, so the whole job stays
+     byte-identical. Calling the helper also runs its render guards. deliverArg is the
+     literal `--deliver` argument (byte-identically "all" when legacy) and
+     expectedPolicy is the JetStream deliver_policy an EXISTING durable must report. */}}
+{{- $bDeliver := include "rrcs.connect.sink.bootstrapDeliver" . }}
+{{- $bTs := ((.Values.connect.sink).bootstrap | default dict).byStartTime | default "" }}
+{{- $bAllowMismatch := ((.Values.connect.sink).bootstrap | default dict).allowStartMismatch | default false }}
+{{- $deliverArg := "all" }}
+{{- $expectedPolicy := "all" }}
+{{- if eq $bDeliver "new" }}{{- $deliverArg = "new" }}{{- $expectedPolicy = "new" }}{{- end }}
+{{- if eq $bDeliver "by-time" }}{{- $deliverArg = ($bTs | quote) }}{{- $expectedPolicy = "by_start_time" }}{{- end }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -163,14 +175,51 @@ spec:
                     echo "note: consumer '$CONSUMER' max_ack_pending=$CUR_MAXPENDING vs values $DESIRED_MAXPENDING (throughput only; still usable, not changing a user-owned consumer)." >&2
                   fi
                   {{- end }}
+                  {{- if ne $bDeliver "" }}
+                  # ── Start-semantics validation (design §8.4, R3/F3) ────────────────
+                  # Without this, a durable created by a PRIOR `--deliver all` (or any
+                  # other policy) is accepted as "usable" below without ever inspecting
+                  # its deliver_policy — so this env would silently run from the WRONG
+                  # stream position (e.g. replay the whole 72h backlog when it asked to
+                  # start fresh). deliver_policy/opt_start_time are FIXED at creation and
+                  # we never mutate a user-owned consumer, so a mismatch fails closed.
+                  CUR_DELIVER_POLICY=$(jq -r '.config.deliver_policy // "all"' /tmp/cons.json)
+                  CUR_OPT_START_TIME=$(jq -r '.config.opt_start_time // ""' /tmp/cons.json)
+                  CUR_START_SEQ=$(jq -r '.config.opt_start_seq // ""' /tmp/cons.json)
+                  # start_sequence is REPORTED only — the P6 assert-only handoff mode
+                  # owns sequence assertions; here we assert policy (+ time for by-time).
+                  echo "note: consumer '$CONSUMER' deliver_policy=$CUR_DELIVER_POLICY start_seq=[${CUR_START_SEQ:-none}] start_time=[${CUR_OPT_START_TIME:-none}] (checking against bootstrap.deliver={{ $bDeliver }})" >&2
+                  norm_ts() { printf '%s' "$1" | sed -e 's/[.][0-9]*//' -e 's/+00:00$/Z/' -e 's/-00:00$/Z/'; }
+                  START_MISMATCH=""
+                  if [ "$CUR_DELIVER_POLICY" != {{ $expectedPolicy | quote }} ]; then
+                    START_MISMATCH="deliver_policy=[$CUR_DELIVER_POLICY], but bootstrap.deliver={{ $bDeliver }} wants [{{ $expectedPolicy }}]"
+                  fi
+                  {{- if eq $bDeliver "by-time" }}
+                  if [ -z "$START_MISMATCH" ] && [ "$(norm_ts "$CUR_OPT_START_TIME")" != "$(norm_ts {{ $bTs | quote }})" ]; then
+                    START_MISMATCH="opt_start_time=[$CUR_OPT_START_TIME], but bootstrap.byStartTime wants [{{ $bTs }}]"
+                  fi
+                  {{- end }}
+                  if [ -n "$START_MISMATCH" ]; then
+                    {{- if $bAllowMismatch }}
+                    echo "WARN: consumer '$CONSUMER' start-semantics MISMATCH ($START_MISMATCH); connect.sink.bootstrap.allowStartMismatch=true => proceeding with the EXISTING durable as-is. Its delivery position is NOT what bootstrap.deliver requests — you asserted this is intentional." >&2
+                    {{- else }}
+                    echo "ERROR: consumer '$CONSUMER' on '$STREAM' has start semantics that do NOT match connect.sink.bootstrap.deliver: $START_MISMATCH." >&2
+                    echo "A durable's deliver_policy/opt_start_time are FIXED at creation and the chart never mutates a user-owned consumer, so this env would run from the wrong stream position — e.g. a stale --deliver all durable replays the whole 72h backlog when you asked for 'new'. Two ways out: (1) delete the durable and re-run this Job (or scripts/create-consumer.sh) so it is recreated with the requested start policy; or (2) set connect.sink.bootstrap.allowStartMismatch=true to accept the existing durable's position as-is." >&2
+                    exit 1
+                    {{- end }}
+                  fi
+                  {{- end }}
                   echo "pull consumer '$CONSUMER' already exists on '$STREAM' with desired filter [$FILTER_SORTED], ack_policy=explicit, max_deliver=$CUR_MAXDELIVER; usable"
                 else
+                  {{- if ne $bDeliver "" }}
+                  # bootstrap.deliver={{ $bDeliver }} => create with deliver_policy={{ $expectedPolicy }}{{ if eq $bDeliver "by-time" }} (opt_start_time={{ $bTs }}; natscli reads the RFC3339 --deliver value as by_start_time){{ end }} (design §8.4, R3). Legacy ("") keeps --deliver all.
+                  {{- end }}
                   echo "creating pull consumer '$CONSUMER' (filter [$FILTER_SORTED]) on external stream '$STREAM'"
                   nats --server "$SERVER" --creds "$CREDS" consumer add "$STREAM" "$CONSUMER" \
                     --pull \
                     $FILTER_ARGS \
                     --ack explicit \
-                    --deliver all \
+                    --deliver {{ $deliverArg }} \
                     --replay instant \
                     --wait "$DESIRED_ACKWAIT" \
                     {{- if eq (include "rrcs.connect.shardingEnabled" $) "true" }}
