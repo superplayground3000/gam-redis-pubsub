@@ -207,6 +207,40 @@ Usage: {{ if eq (include "rrcs.connect.sink.handoffAssertOnly" .) "true" }}...
 {{- end -}}
 
 {{/*
+rrcs.connect.sink.validateHandoffStartSeq — render guard binding connect.sink.handoffStartSeq
+to connect.sink.handoffAssertOnly (design §8.3/E7, F1 exact-seq fix). Emits NOTHING; it
+only fails render. Invoked from rrcs.connect.sinkGroups so it runs on EVERY render path
+(external, bundled, source, sink) rather than only where the external nats-init assert
+branch renders.
+
+  - handoffAssertOnly=true  => handoffStartSeq is REQUIRED and must be a positive integer
+    (it is F0+1, the exact opt_start_seq every precreated shard durable must report). The
+    assert-only init compares the observed opt_start_seq against it byte-for-byte.
+  - handoffAssertOnly=false => handoffStartSeq is FORBIDDEN (a start-seq only means something
+    inside the handoff window; a leftover value is an operator mistake, so we fail rather
+    than silently ignore it).
+Usage: {{ include "rrcs.connect.sink.validateHandoffStartSeq" . }}
+*/}}
+{{- define "rrcs.connect.sink.validateHandoffStartSeq" -}}
+{{- $sink := .Values.connect.sink | default dict -}}
+{{- $h := $sink.handoffAssertOnly | default false -}}
+{{- $seq := $sink.handoffStartSeq -}}
+{{- $seqSet := and (ne (kindOf $seq) "invalid") (ne (printf "%v" $seq) "") -}}
+{{- if $h -}}
+{{-   if not $seqSet -}}
+{{-     fail "connect.sink.handoffStartSeq is REQUIRED when connect.sink.handoffAssertOnly=true — it is F0+1, the EXACT opt_start_seq every precreated shard durable must report (F0 = the old AIO durable's ack_floor.stream_seq at quiesce; runbook-aio-to-sharded-handoff.md step 1). The assert-only init asserts deliver_policy=by_start_sequence AND opt_start_seq==handoffStartSeq, so it cannot run without the expected value. Pass --set connect.sink.handoffStartSeq=$((F0+1)) at the assert-only upgrade." -}}
+{{-   end -}}
+{{-   if or (ne (printf "%v" $seq) (printf "%d" (int64 $seq))) (le (int64 $seq) 0) -}}
+{{-     fail (printf "connect.sink.handoffStartSeq=%v must be a POSITIVE INTEGER (it is F0+1, a JetStream stream sequence >= 1). Set it to the ack_floor.stream_seq you read at quiesce, plus one." $seq) -}}
+{{-   end -}}
+{{- else -}}
+{{-   if $seqSet -}}
+{{-     fail (printf "connect.sink.handoffStartSeq=%v is set but connect.sink.handoffAssertOnly is not true — a start sequence only means something during the §8.3 AIO→sharded handoff window (it is the exact position the assert-only init checks against). A leftover value outside that window is an operator mistake, so the render fails rather than silently ignore it. Clear connect.sink.handoffStartSeq, or set handoffAssertOnly=true for the cutover." $seq) -}}
+{{-   end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.connect.durableBase — the env-scoped durable base: nats.stream.consumer.durable
 with "_<envId>" appended when connect.envId is set, else the bare base. This is the
 single seam through which envId reaches EVERY derived durable — the synthesized
@@ -626,6 +660,7 @@ in this pass); the 57-char name budget.
 {{- $v := .Values -}}
 {{- include "rrcs.connect.validateAllInOne" . -}}
 {{- include "rrcs.nats.validateSegmentLayout" . -}}
+{{- include "rrcs.connect.sink.validateHandoffStartSeq" . -}}
 {{- $subjectPrefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
 {{- /* Shared-prefix subject layout: when nats.stream.normalSegment is set, ALL
      normal traffic (and therefore every derived sink filter) moves under
@@ -986,6 +1021,43 @@ in this pass); the 57-char name budget.
 {{-   end -}}
 {{- end -}}
 {{- end -}}
+{{- /* Final filter-overlap sweep (Codex review 2026-07-21, F2). The per-domain guards
+     above catch prefix-vs-prefix and whole-stream-vs-prefix overlaps, but an EXPLICIT
+     filterSubject is passed through verbatim (N5) and, in legacy mode, is not checked
+     against any OTHER group's synthesized filter — so a shard family PLUS an explicit
+     filterSubject on one of its shard subjects (e.g. kv.cdc.aio.lb.company.s0.>) both
+     render and double-consume that subject. This sweep is the catch-all: it collects
+     EVERY enabled group's RESOLVED filters (a group's `filter` is a comma-joined list of
+     synthesized shard filters / catch-all / whole-stream / prefixed subjects, or the
+     verbatim explicit filterSubject) and fails loud on ANY cross-group overlap.
+
+     All these shapes are either `<literal>.>` wildcards or plain literals, so overlap
+     reduces to a dot-boundary prefix test: strip a trailing ".>" to get each filter's
+     prefix; two filters overlap iff their prefixes are EQUAL or one is a dot-boundary
+     prefix of the other (prefixB == prefixA or prefixB starts with "prefixA."). Only
+     DIFFERENT groups are compared — a single group's own multiple filters are disjoint by
+     construction (distinct shards / distinct prefixes, already validated above). Overlaps
+     the earlier domain guards also catch fail there first with their specific message;
+     this sweep is reached only for the gap they miss. */ -}}
+{{- $flat := list -}}
+{{- range $g := $out -}}
+{{-   if $g.enabled -}}
+{{-     range $f := (splitList "," $g.filter) -}}
+{{-       $flat = append $flat (dict "group" $g.name "filter" $f) -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- range $i, $a := $flat -}}
+{{-   range $j, $b := $flat -}}
+{{-     if and (lt $i $j) (ne $a.group $b.group) -}}
+{{-       $pa := trimSuffix ".>" $a.filter -}}
+{{-       $pb := trimSuffix ".>" $b.filter -}}
+{{-       if or (eq $pa $pb) (hasPrefix (printf "%s." $pa) $pb) (hasPrefix (printf "%s." $pb) $pa) -}}
+{{-         fail (printf "connect.sinkGroups: filter overlap between group %q (filter %q) and group %q (filter %q) — the two consumer filters cover overlapping subject space, so every message on the shared subtree is delivered to BOTH durables (double consumption / double apply). Every enabled sink filter must be disjoint at a dot boundary. This most often means an explicit filterSubject was pointed at a subject a sharded family or another group already owns; re-scope one of them (a more specific filterSubject, or let the owning group consume the subtree)." $a.group $a.filter $b.group $b.filter) -}}
+{{-       end -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
 
@@ -1326,12 +1398,19 @@ MISMATCH => fail closed ALWAYS. UNREADABLE (bucket/key gone or no $KV grant) =>
 fail closed on a FIRST install, fail OPEN (+ loud marker) on a redeploy so an
 emergency rollback is never blocked on the monitoring-adjacent bucket.
 
-First-install vs redeploy discriminator: the presence of THIS release's OWN
-durables on the stream. A durable IS the per-env ack floor, created by this same
-job below; if one already exists the env has been deployed before (redeploy),
-otherwise this is its first install. Ground truth on the stream itself — no
-external clock or side marker needed. The check runs BEFORE the create loop so it
-reflects PRIOR deploys, not this run.
+First-install vs redeploy discriminator (F3 fix, Codex review 2026-07-21): a durable
+VERIFIED-MARKER — cdc_topology/_verified_<envId-or-default> — written ONLY after a
+SUCCESSFUL manifest compare. Marker PRESENT => this env verified the taxonomy on a
+prior deploy => redeploy (unreadable manifest => fail-open + loud warn). Marker ABSENT
+=> first install (unreadable manifest => fail-closed). This replaces the earlier
+"do any of this env's durables already exist?" test, which misclassified a FIRST
+install whose durables the operator PRECREATED (the AIO->sharded handoff, E7) as a
+redeploy and fail-OPENED on an unreadable manifest — skipping the drift gate on a
+brand-new env, in violation of E6. Precreated durables prove nothing about whether the
+taxonomy was ever checked; only the verified-marker does. The marker PUT needs
+$KV.cdc_topology.> (the admin creds carry it since the 2026-07-21 regen); a denied PUT
+degrades to a warning and the safe first-install (fail-closed) default. Same helper is
+included by BOTH the external and bundled nats-init jobs, so both stay consistent.
 Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
 */}}
 {{- define "rrcs.connect.topologyManifest.readScript" -}}
@@ -1347,17 +1426,12 @@ Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
               EXPECTED_MANIFEST='{{ include "rrcs.connect.topologyManifest.json" . }}'
               TM_SHARDED='{{ include "rrcs.connect.shardingEnabled" . }}'
               TM_HAS_PREFIX='{{ ternary "true" "false" $hasPrefix }}'
-              TM_DESIRED_DURABLES='{{ range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) }}{{ if $g.enabled }}{{ range $c := $g.consumers }}{{ printf "%s " $c.durable }}{{ end }}{{ end }}{{ end }}'
-
-              # First install vs redeploy: does any of THIS release's durables already exist?
-              TM_REDEPLOY=0
-              for d in $TM_DESIRED_DURABLES; do
-                [ -z "$d" ] && continue
-                if nats --server "$SERVER" --creds "$CREDS" consumer info "$STREAM" "$d" >/dev/null 2>&1; then
-                  TM_REDEPLOY=1; break
-                fi
-              done
-
+              # First install vs redeploy is decided by a durable VERIFIED-MARKER
+              # (cdc_topology/_verified_<env>) written after a SUCCESSFUL compare below —
+              # NOT by whether this env's durables exist. Durable-existence misclassifies
+              # a FIRST install whose durables the operator PRECREATED (the AIO->sharded
+              # handoff, E7) as a redeploy, which would fail-OPEN on an unreadable manifest
+              # and skip the drift gate on a brand-new env (design §7 / E6, F3 fix).
               if nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology current --raw >/tmp/manifest.json 2>/dev/null; then
                 # Accumulate mismatches with literal \n escapes (a real newline here
                 # would terminate the YAML block scalar); render them with printf %b.
@@ -1382,12 +1456,22 @@ Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
                   exit 1
                 fi
                 echo "topology manifest: verified against publisher (normalSegment/families/prefixes match); proceeding."
-              elif [ "$TM_REDEPLOY" = 1 ]; then
+                # F3: record a durable verified-marker so a LATER run that finds the
+                # manifest unreadable can tell a redeploy (marker present) from a first
+                # install (marker absent) WITHOUT inferring it from durable existence.
+                # Admin creds carry $KV.cdc_topology.> since the 2026-07-21 regen; if the
+                # PUT is denied we DEGRADE with a warning (a future unreadable run then
+                # treats this env as a first install and fails closed — the safe default).
+                printf '%s' "verified reason=manifest_match" \
+                  | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology {{ printf "_verified_%s" $markerToken }} 2>/dev/null \
+                  || echo "WARN: could not write the _verified_{{ $markerToken }} marker (creds lack \$KV.cdc_topology.> PUT) — a later UNREADABLE-manifest run will treat this env as a FIRST install (fail-closed) rather than a redeploy fail-open; grant the PUT to enable redeploy fail-open." >&2
+              elif nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology {{ printf "_verified_%s" $markerToken }} >/dev/null 2>&1; then
                 echo "WARN: ================================================================" >&2
                 echo "WARN: CDCTopologyManifestUnverified — cdc_topology/current is UNREADABLE" >&2
-                echo "WARN:   (bucket/key missing or creds lack \$KV.cdc_topology.>) and this is a" >&2
-                echo "WARN:   REDEPLOY (this env's durables already exist) => proceeding FAIL-OPEN so" >&2
-                echo "WARN:   an emergency rollback is never blocked on the manifest bucket." >&2
+                echo "WARN:   (bucket/key missing or creds lack \$KV.cdc_topology.>) and this env has a" >&2
+                echo "WARN:   _verified_{{ $markerToken }} marker from a prior verified deploy (REDEPLOY)" >&2
+                echo "WARN:   => proceeding FAIL-OPEN so an emergency rollback is never blocked on the" >&2
+                echo "WARN:   manifest bucket." >&2
                 echo "WARN:   The drift gate did NOT run: if the publisher taxonomy changed, this sink" >&2
                 echo "WARN:   may now be silently mis-consuming. Restore the manifest and re-verify." >&2
                 echo "WARN: ================================================================" >&2
@@ -1397,8 +1481,8 @@ Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
                   | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology {{ printf "_unverified_%s" $markerToken }} 2>/dev/null \
                   || echo "WARN:   (could not write the _unverified_{{ $markerToken }} marker — subscriber creds lack \$KV.cdc_topology.> PUT; log signal above stands)" >&2
               else
-                echo "ERROR: cdc_topology/current is UNREADABLE and this is a FIRST install of this env (none of its durables exist yet) — FAIL CLOSED." >&2
-                echo "The manifest is a hard, ordered dependency for a NEW sink env: without it we cannot prove the publisher's N/prefixes/normalSegment match this release, and a mismatch is silent 72h loss (VF-16). Run the publisher release (nats.topologyManifest.enabled) so it populates cdc_topology/current, grant this release's creds \$KV.cdc_topology.>, then redeploy." >&2
+                echo "ERROR: cdc_topology/current is UNREADABLE and this env has NO _verified_{{ $markerToken }} marker — treating as a FIRST install and FAILING CLOSED." >&2
+                echo "The manifest is a hard, ordered dependency for a NEW sink env: without it we cannot prove the publisher's N/prefixes/normalSegment match this release, and a mismatch is silent 72h loss (VF-16). This holds even when the env's durables were PRECREATED (the AIO->sharded handoff) — precreated durables are not proof the taxonomy was ever verified, which is exactly why the discriminator is the _verified marker and not durable existence. Run the publisher release (nats.topologyManifest.enabled) so it populates cdc_topology/current, grant this release's creds \$KV.cdc_topology.>, then redeploy." >&2
                 exit 1
               fi
 {{- end }}

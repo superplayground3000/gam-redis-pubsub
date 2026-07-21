@@ -45,10 +45,15 @@ derives, the init:
 
 - **missing** → `exit 1` (never creates — you must precreate it), and
 - **present** → runs the ordinary usability checks (PULL, filter, `ack_policy=explicit`,
-  `max_deliver`, and `max_ack_pending=1` for shard durables) **plus** asserts
-  `deliver_policy == by_start_sequence`, failing loud on anything else. The observed
-  `start_seq` is logged for audit (any value is accepted — F0+1 is discovered at runtime, so
-  the mode asserts the *policy*, not the exact sequence).
+  `max_deliver`, and `max_ack_pending=1` for shard durables) **plus** asserts BOTH
+  `deliver_policy == by_start_sequence` AND `opt_start_seq == connect.sink.handoffStartSeq`,
+  failing loud on either mismatch. F0+1 is discovered at runtime, so the operator passes it as
+  `connect.sink.handoffStartSeq` at the upgrade (`--set connect.sink.handoffStartSeq=$((F0+1))`);
+  the render fails if `handoffStartSeq` is unset while `handoffAssertOnly=true`, or set while it
+  is false. Asserting the *exact* sequence (not just the policy) catches a durable precreated at
+  the wrong position — a typo, or a stale `by_start_sequence` durable squatting the name at a
+  different seq — which would replay too much (duplicate reapply) or skip a range (silent gap)
+  the instant the old AIO durable is deleted.
 
 It deliberately does **not** honour `connect.sink.bootstrap.allowStartMismatch` — the mode
 exists precisely to catch precreate mistakes, so an escape hatch would defeat it. It is also
@@ -177,9 +182,13 @@ what assert-only mode will check:
 
 ```sh
 helm template chart -f <env-sharded-values> --set nats.external.enabled=true \
-  --set connect.sink.handoffAssertOnly=true -s templates/nats-init-external-job.yaml \
-  | grep -E "consumer info|--filter"
+  --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq="$SSEQ" \
+  -s templates/nats-init-external-job.yaml | grep -E "consumer info|--filter"
 ```
+
+(`handoffStartSeq` is REQUIRED whenever `handoffAssertOnly=true`, so it must be present even for
+this render-only inspection; any positive integer renders, but pass the real `$SSEQ` to keep the
+command identical to the one you deploy with.)
 
 Once **all** durables are precreated (and only then, per the F1 gate), delete env A's old AIO
 durable so old and new never run concurrently (the AIO `kv.cdc.aio.>` filter is a superset of the
@@ -203,21 +212,33 @@ connect:
   envId: <env>
   sink:
     handoffAssertOnly: true    # ON only for this cutover window; turn OFF in step 6
+    handoffStartSeq: <F0+1>     # the SSEQ from step 1; asserted byte-for-byte
 ```
 
-`helm upgrade --install`. The external `nats-init` runs as a pre-install/pre-upgrade hook and, in
-assert-only mode, **verifies** each precreated durable rather than creating anything. If any
-durable is missing or is not `by_start_sequence`, the hook **fails the release closed** — this is
-the safety net catching a precreate you missed in step 3.
+`helm upgrade --install`, passing `$SSEQ` explicitly so it is never stale:
+
+```sh
+helm upgrade --install <release> chart -f <env-sharded-values> \
+  --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq="$SSEQ"
+```
+
+The external `nats-init` runs as a pre-install/pre-upgrade hook and, in assert-only mode,
+**verifies** each precreated durable rather than creating anything. If any durable is missing, is
+not `by_start_sequence`, or does not start at exactly `handoffStartSeq` (F0+1), the hook **fails
+the release closed** — this is the safety net catching a precreate you missed or mis-positioned in
+step 3.
 
 - **GATE (render, L1):** `helm template chart -f <values> --set connect.sink.handoffAssertOnly=true
-  -s templates/nats-init-external-job.yaml` shows, in the ensure-consumer script, the
-  `deliver_policy == by_start_sequence` assertion and a MISSING-durable `exit 1`, and **no**
-  `nats ... consumer add` call anywhere (the create path is compiled out).
+  --set connect.sink.handoffStartSeq=$SSEQ -s templates/nats-init-external-job.yaml` shows, in the
+  ensure-consumer script, the `deliver_policy == by_start_sequence` **and**
+  `opt_start_seq == $SSEQ` assertions and a MISSING-durable `exit 1`, and **no**
+  `nats ... consumer add` call anywhere (the create path is compiled out). Omitting
+  `handoffStartSeq` here fails the render loud (it is required whenever assert-only is on).
 - **GATE (deploy):** the `nats-init-ext` hook Job **completes** (`kubectl get job`). Its log shows,
-  for every durable, `[handoff assert-only] ... deliver_policy=by_start_sequence` and
-  `start_seq observed = [<F0+1>]`. A hook FAILURE here means a durable is missing or wrong —
-  re-check step 3, fix the precreate, and re-run; do not force past it.
+  for every durable, `[handoff assert-only] ... asserting deliver_policy=by_start_sequence AND
+  opt_start_seq=<F0+1>` and `start_seq verified = [<F0+1>] == connect.sink.handoffStartSeq`. A hook
+  FAILURE here means a durable is missing, wrong-policy, or at the wrong sequence — re-check step 3,
+  fix the precreate (or the `handoffStartSeq` you passed), and re-run; do not force past it.
 
 ### 5. Bring env A's sink up sharded, and verify no gap at the boundary
 
@@ -241,10 +262,17 @@ turn it back off and `helm upgrade` again:
 connect:
   sink:
     handoffAssertOnly: false   # back to create-if-absent for ordinary redeploys
+    handoffStartSeq: ""        # MUST clear it too — it is forbidden while assert-only is off
 ```
 
-Leaving it on would make any future redeploy that legitimately needs a new durable (e.g. adding a
-prefixed group) fail closed instead of provisioning it.
+Clear `handoffStartSeq` in the same edit: it is only valid during the handoff window, so the
+render fails loud if it is left set while `handoffAssertOnly=false` (a leftover value is an
+operator mistake, not something to silently ignore). If you drove the upgrade with `--set`, simply
+drop both `--set connect.sink.handoffAssertOnly=true` and `--set connect.sink.handoffStartSeq=…`
+from the off-cycle command.
+
+Leaving assert-only on would make any future redeploy that legitimately needs a new durable (e.g.
+adding a prefixed group) fail closed instead of provisioning it.
 
 - **GATE:** `helm template ... -s templates/nats-init-external-job.yaml` again shows the ordinary
   create path (`nats ... consumer add`) restored, and a normal redeploy's `nats-init-ext` hook

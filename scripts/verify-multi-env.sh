@@ -380,10 +380,15 @@ if [ "$MANIFEST_GATE" != "skip" ]; then
       --wait --timeout 3m >/tmp/menvc_bad.log 2>&1
     BAD_RC=$?
     set -e
-    # The pre-install hook Job for release menvc must have failed closed with the DRIFT message.
+    # The pre-install hook Job for release menvc must have failed closed WITH the
+    # topology-DRIFT message. A bare nonzero helm rc is NOT accepted as proof: helm
+    # fails a hook Job for many unrelated reasons (image pull, RBAC, timeout), and
+    # counting any of them as "the manifest gate rejected the drift" would green a run
+    # where the gate never actually fired. The DRIFT signal in the hook log is the
+    # drift-specific evidence the gate ran and blocked (design §12/§16).
     HOOKLOG="$(k logs -l "job-name" --tail=-1 2>/dev/null | grep -i 'topology DRIFT' || true)"
-    if (( BAD_RC != 0 )) || [ -n "$HOOKLOG" ]; then
-      log "mismatched sink failed closed (helm rc=${BAD_RC}); DRIFT signal: ${HOOKLOG:-<see nats-init hook log>}"
+    if [ -n "$HOOKLOG" ]; then
+      log "mismatched sink failed closed with the topology-DRIFT signal (helm rc=${BAD_RC}); ${HOOKLOG}"
       # Correct the mismatch (N=4) → init passes. Uninstall the FAILED release
       # first: helm leaves it in FAILED state and the sinks' wait-consumer
       # initContainers from the bad revision keep their pods (and CPU requests)
@@ -408,6 +413,12 @@ if [ "$MANIFEST_GATE" != "skip" ]; then
       else
         GATE_STATUS="fail-corrected-install-did-not-pass"
       fi
+    elif (( BAD_RC != 0 )); then
+      # helm failed but WITHOUT the drift signal — inconclusive. Do not credit a bare
+      # nonzero rc as the manifest gate rejecting the mismatch (it may be an unrelated
+      # failure); the case "fail-*" arm in the verdict turns this into an overall FAIL.
+      GATE_STATUS="fail-mismatch-rejected-without-drift-signal"
+      log "WARN: mismatched sink helm rc=${BAD_RC} but NO 'topology DRIFT' signal in the hook log — cannot attribute the block to the manifest gate (see /tmp/menvc_bad.log)"
     else
       GATE_STATUS="fail-mismatch-was-not-rejected"
     fi

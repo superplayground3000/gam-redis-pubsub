@@ -156,7 +156,11 @@ nats:
   #     (bucket/key missing or no grant) => fail closed on a NEW env's first
   #     install, but fail OPEN with a loud CDCTopologyManifestUnverified log banner
   #     + a best-effort cdc_topology/_unverified_<env> marker on a REDEPLOY, so an
-  #     emergency rollback is never blocked on the manifest bucket.
+  #     emergency rollback is never blocked on the manifest bucket. First-install vs
+  #     REDEPLOY is discriminated by a cdc_topology/_verified_<env> KV marker written
+  #     after a SUCCESSFUL compare — NOT by whether the env's durables exist, so an
+  #     env whose durables the operator PRECREATED for the AIO->sharded handoff is
+  #     still treated as a first install (fail-closed) until it has verified once.
   #
   # OPERATIONAL CHECK (fail-open surfacing — no Prometheus alert in this lab).
   # A real CDCTopologyManifestUnverified *alert* would need the shared ops-owned
@@ -564,6 +568,25 @@ connect:
     # declare a bootstrap start policy). It is EXTERNAL-NATS only — a bundled
     # release carrying it fails render (bundled labs recreate from scratch).
     handoffAssertOnly: false
+
+    # The EXACT start sequence every precreated shard durable must report — F0+1,
+    # where F0 is the old AIO durable's ack_floor.stream_seq read at quiesce (the
+    # contiguous-APPLIED prefix; see runbook-aio-to-sharded-handoff.md step 1).
+    # REQUIRED (must be a positive integer) when handoffAssertOnly=true, and
+    # FORBIDDEN otherwise — the render fails loud either way. F0 is discovered at
+    # runtime, so the operator passes it at the assert-only upgrade:
+    #   helm upgrade ... --set connect.sink.handoffAssertOnly=true \
+    #                    --set connect.sink.handoffStartSeq=$((F0+1))
+    #
+    # The assert-only init then fails closed unless EVERY derived durable is
+    # deliver_policy=by_start_sequence AND opt_start_seq == handoffStartSeq. This
+    # closes the F1 gap where the mode asserted only the POLICY and accepted ANY
+    # start sequence: a durable precreated at the wrong seq (a typo, or a stale
+    # by_start_sequence durable squatting the name at a different position) would
+    # replay too much (duplicate reapply) or skip a range (silent gap) the instant
+    # the old AIO durable is deleted. Asserting the exact seq catches that before
+    # any traffic moves. Empty/default => no handoff (handoffAssertOnly must be off).
+    handoffStartSeq: ""
 
   # ── Multi-subject sink groups (design D3) ──────────────────────────────────
   # Split the sink leg into N groups, each = (durable pull consumer × filter

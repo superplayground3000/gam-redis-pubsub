@@ -147,7 +147,10 @@ trap cleanup EXIT
 # ── 0. render-time GATE (runbook step 6): toggle OFF has the create path, ─────
 #       toggle ON compiles it out. Do this before touching the cluster.
 log "=== step 0: render gate — assert-only compiles out the create path (runbook step 6) ==="
-ON_INIT=$(helm template "$REL_C" ./chart "${SHARDED_ARGS[@]}" --set connect.sink.handoffAssertOnly=true \
+# F0 is not known yet (read at step 3); the render gate only checks the assert
+# branch is present, so any positive integer satisfies the handoffStartSeq render
+# guard (connect.sink.handoffStartSeq is REQUIRED whenever handoffAssertOnly=true).
+ON_INIT=$(helm template "$REL_C" ./chart "${SHARDED_ARGS[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=1 \
             -s templates/nats-init-external-job.yaml 2>/dev/null) || die "assert-only render failed"
 OFF_INIT=$(helm template "$REL_C" ./chart "${SHARDED_ARGS[@]}" --set connect.sink.handoffAssertOnly=false \
             -s templates/nats-init-external-job.yaml 2>/dev/null) || die "create-path render failed"
@@ -309,7 +312,7 @@ log "quiesced; F0=ack_floor=${F0}; new durables will start at F0+1=${SSEQ}"
 
 # ── 4. F1 coverage check (runbook step 2) BEFORE deleting the old AIO durable ─
 log "=== step 4: F1 coverage — sharded filters must cover kv.cdc.aio.> {shards,sx,others} ==="
-RENDER_FILTERS=$(helm template "$REL_C" ./chart "${SHARDED_ARGS[@]}" --set connect.sink.handoffAssertOnly=true \
+RENDER_FILTERS=$(helm template "$REL_C" ./chart "${SHARDED_ARGS[@]}" --set connect.sink.handoffAssertOnly=true --set "connect.sink.handoffStartSeq=${SSEQ}" \
   -s templates/nats-init-external-job.yaml 2>/dev/null | grep -oE 'kv\.cdc\.aio\.[^ "|]+' | sort -u)
 cover_ok=1
 for want in kv.cdc.aio.lb.company.s0.\> kv.cdc.aio.lb.company.s1.\> kv.cdc.aio.lb.company.s2.\> \
@@ -338,7 +341,7 @@ done
 log "assert-only upgrade with ${MISS_DUR} MISSING — expect fail-closed"
 set +e
 helm --kube-context "$CTX" upgrade "$REL_C" ./chart -n "$NS" "${SHARDED_ARGS[@]}" \
-  --set connect.sink.handoffAssertOnly=true --wait --timeout 3m >/tmp/hoff_neg.log 2>&1
+  --set connect.sink.handoffAssertOnly=true --set "connect.sink.handoffStartSeq=${SSEQ}" --wait --timeout 3m >/tmp/hoff_neg.log 2>&1
 NEG_RC=$?
 set -e
 NEG_HOOK="$(k logs -l "job-name" --tail=-1 2>/dev/null | grep -i "does NOT exist" | grep -i "$MISS_DUR" || true)"
@@ -357,10 +360,53 @@ done
 na consumer rm "$STREAM" "$AIO_DUR" --force >/dev/null 2>&1 || die "could not delete old AIO durable ${AIO_DUR}"
 na consumer info "$STREAM" "$AIO_DUR" >/dev/null 2>&1 && die "old AIO durable ${AIO_DUR} still present after delete"
 
-# inject POST-F0 traffic BEFORE resume so it is all > F0 and delivered from F0+1.
-log "injecting post-F0 traffic: ${NSEQ} ordered updates on one key + a no-loss batch"
+# POST-F0 traffic is injected in step 7 (AFTER the sharded sink resumes) so the
+# ordering poller can observe the LIVE apply window — the F4 fix. Every event is
+# still emitted after quiesce, so its stream seq is > F0 and it is delivered from
+# F0+1. Names/counts defined here because the POS_HOOK verdict below reuses them.
 ORD_KEY="lb:company:active:{employees:9}:ord-${RUNID}"   # id 9 -> shard s1
+POST_NOLOSS=$(( 9 + NOTHERS ))   # distinct post-F0 keys expected in region C (excl. the ordering key)
+
+helm --kube-context "$CTX" upgrade "$REL_C" ./chart -n "$NS" "${SHARDED_ARGS[@]}" \
+  --set connect.sink.handoffAssertOnly=true --set "connect.sink.handoffStartSeq=${SSEQ}" --wait --timeout 4m >/tmp/hoff_pos.log 2>&1 \
+  || die "assert-only upgrade FAILED after all durables precreated (see /tmp/hoff_pos.log)"
+# Server-side assert (stronger than hook-log grep — the hook Job pod is deleted by
+# helm's hook policy right after success): every precreated env C durable must
+# still be by_start_sequence AND start at EXACTLY F0+1 after the assert-only
+# upgrade (F1: proves the init asserted the exact seq, not just the policy, and did
+# not re-create them with --deliver all or bless a wrong position).
+POS_HOOK=0
+for spec in "${SHARD_SPECS[@]}"; do
+  IFS='|' read -r dur _f _m <<<"$spec"
+  dp="$(consumer_field "$dur" '.config.deliver_policy')"
+  oss="$(consumer_field "$dur" '.config.opt_start_seq')"
+  if [ "$dp" = "by_start_sequence" ] && [ "$oss" = "$SSEQ" ]; then
+    POS_HOOK=$(( POS_HOOK + 1 ))
+  else
+    log "WARN durable ${dur} deliver_policy=${dp} opt_start_seq=${oss} (want by_start_sequence @ ${SSEQ})"
+  fi
+done
+for d in connect-sink-shard-a connect-sink-others; do
+  k rollout status "deploy/${PREFIX_C}${d}" --timeout=180s || true
+done
+log "assert-only upgrade PASSED (hook by_start_sequence@${SSEQ} asserts: ${POS_HOOK}/6)"
+
+# ── 7. inject post-F0 traffic with the ordering poller live, then settle ──────
+log "=== step 7: start ordering poller, inject post-F0 traffic, settle apply ==="
 LOSS_TS="$(now_ms)"
+# Start the region-C ordering poller BEFORE injecting so it captures the live
+# 1..NSEQ monotone progression as the sharded sink applies it (F4). Host-side and
+# self-rate-limited by the kubectl-exec round-trip (~10s of samples over the apply
+# window) — no in-pod fractional-sleep dependency, and each exec is independent so
+# a transient failure during rollout just yields an (uncounted) empty line. `|| true`
+# keeps a failed exec from tripping the subshell's set -e.
+POLL_OUT="$(mktemp)"
+( pend=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
+  while [ "$(date +%s)" -lt "$pend" ]; do rrC GET "$ORD_KEY" 2>/dev/null | tr -d '\r' || true; done ) \
+  > "$POLL_OUT" 2>/dev/null &
+POLL_PID=$!
+
+log "injecting post-F0 traffic: ${NSEQ} ordered updates on one key + a no-loss batch"
 cmds="$(mktemp)"
 for (( i=1; i<=NSEQ; i++ )); do
   echo "XADD $CENTRAL_STREAM * event_id hoff-${RUNID}-ord-${i} op update type string kv_key ${ORD_KEY} ts ${LOSS_TS} body ${i}"
@@ -373,36 +419,7 @@ for (( i=1; i<=NOTHERS; i++ )); do
   echo "XADD $CENTRAL_STREAM * event_id hoff-${RUNID}-post-o${i} op create type string kv_key misc:post:${i}:${RUNID} ts ${LOSS_TS} body postO"
 done >> "$cmds"
 k exec -i "$CENTRAL" -- redis-cli < "$cmds" >/dev/null; rm -f "$cmds"
-POST_NOLOSS=$(( 9 + NOTHERS ))   # distinct post-F0 keys expected in region C (excl. the ordering key)
 
-# start a region-C ordering poller (like verify-sharding.sh T-4) before resume
-POLL_OUT="$(mktemp)"
-k exec "$REGION_C" -- sh -c \
-  "i=0; while [ \$i -lt 9000 ]; do redis-cli GET '$ORD_KEY'; i=\$((i+1)); done" \
-  > "$POLL_OUT" 2>/dev/null &
-POLL_PID=$!
-
-helm --kube-context "$CTX" upgrade "$REL_C" ./chart -n "$NS" "${SHARDED_ARGS[@]}" \
-  --set connect.sink.handoffAssertOnly=true --wait --timeout 4m >/tmp/hoff_pos.log 2>&1 \
-  || { kill "$POLL_PID" 2>/dev/null || true; die "assert-only upgrade FAILED after all durables precreated (see /tmp/hoff_pos.log)"; }
-# Server-side assert (stronger than hook-log grep — the hook Job pod is deleted
-# by helm's hook policy right after success): every precreated env C durable
-# must still be by_start_sequence AFTER the assert-only upgrade (proves the init
-# asserted rather than re-created them with --deliver all).
-POS_HOOK=0
-for spec in "${SHARD_SPECS[@]}"; do
-  IFS='|' read -r dur _f _m <<<"$spec"
-  dp="$(consumer_field "$dur" '.config.deliver_policy')"
-  [ "$dp" = "by_start_sequence" ] && POS_HOOK=$(( POS_HOOK + 1 )) \
-    || log "WARN durable ${dur} deliver_policy=${dp} (want by_start_sequence)"
-done
-for d in connect-sink-shard-a connect-sink-others; do
-  k rollout status "deploy/${PREFIX_C}${d}" --timeout=180s || true
-done
-log "assert-only upgrade PASSED (hook by_start_sequence asserts: ${POS_HOOK})"
-
-# ── 7. settle post-F0 apply, then stop the poller ────────────────────────────
-log "=== step 7: settle post-F0 apply on the sharded env C ==="
 deadline=$(( $(date +%s) + SETTLE_TIMEOUT_S ))
 noloss=0; ord_final=""
 while (( $(date +%s) < deadline )); do
@@ -439,10 +456,11 @@ PASS=true; REASONS=""
 add_fail() { PASS=false; REASONS="${REASONS}${REASONS:+; }$1"; }
 (( noloss == POST_NOLOSS ))  || add_fail "no-loss: env C region got ${noloss}/${POST_NOLOSS} post-F0 keys"
 [ "$ord_final" = "$NSEQ" ]   || add_fail "no-reorder: final ordering value ${ord_final} != ${NSEQ}"
+(( ORD_SAMPLES >= 10 ))      || add_fail "no-reorder: only ${ORD_SAMPLES} ordering samples (< 10 floor) — the monotone oracle is vacuous; the poller did not observe the post-F0 apply window"
 (( ORD_MONO == 1 ))          || add_fail "no-reorder: region value went backwards: ${ORD_VIOL}"
 [ "$R2_AFTER" = "R2VALUE" ]  || add_fail "R2: pre-F0 key value changed after handoff (${R2_BEFORE} -> ${R2_AFTER})"
 (( NAP_MAX <= 1 ))           || add_fail "num_ack_pending ${NAP_MAX} > 1 on a shard durable (O-6)"
-(( POS_HOOK >= 6 ))          || add_fail "server-side deliver_policy check: only ${POS_HOOK} durables are by_start_sequence after the assert-only upgrade (want all 6)"
+(( POS_HOOK >= 6 ))          || add_fail "server-side start-semantics check: only ${POS_HOOK}/6 durables are by_start_sequence AND opt_start_seq==F0+1 (${SSEQ}) after the assert-only upgrade"
 (( h_noloss == POST_NOLOSS )) || add_fail "second env (host AIO) got ${h_noloss}/${POST_NOLOSS} post-F0 keys (did not keep flowing)"
 
 RESULT="$(printf '{"runid":"%s","ns":"%s","F0":%s,"post_noloss":{"got":%d,"want":%d},"ord_final":"%s","ord_samples":%d,"ord_monotone":%d,"r2":{"before":"%s","after":"%s"},"num_ack_pending_max":%d,"assert_hook_count":%d,"second_env_noloss":%d,"pass":%s}' \

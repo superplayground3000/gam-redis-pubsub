@@ -34,6 +34,12 @@
      runs its render guards: fail on a bundled release, and fail if bootstrap.deliver
      is also set (mutually exclusive — enforced here so both entry points share it). */}}
 {{- $handoffAssertOnly := eq (include "rrcs.connect.sink.handoffAssertOnly" .) "true" }}
+{{- /* F1 (Codex review 2026-07-21): the EXACT start sequence (F0+1) every precreated
+     shard durable must report. rrcs.connect.sink.validateHandoffStartSeq (run via
+     rrcs.connect.sinkGroups) has already proven it is a positive integer when
+     handoffAssertOnly is on, so the assert branch below can compare opt_start_seq
+     against it verbatim. */}}
+{{- $handoffStartSeq := ((.Values.connect.sink).handoffStartSeq | default "") }}
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -182,24 +188,33 @@ spec:
                   fi
                   {{- end }}
                   {{- if $handoffAssertOnly }}
-                  # ── Assert-only handoff: deliver_policy MUST be by_start_sequence (design §8.3/E7) ──
+                  # ── Assert-only handoff: deliver_policy==by_start_sequence AND ─────────
+                  #    opt_start_seq==connect.sink.handoffStartSeq (design §8.3/E7, F1) ──
                   # The operator precreated each shard durable with
                   # `--deliver by_start_sequence --start-sequence <F0+1>` (F0 = the old
-                  # AIO durable's ack_floor.stream_seq, the contiguous-APPLIED prefix).
-                  # We assert the POLICY only; the start_seq itself is F0+1, discovered at
-                  # runtime by the operator, so we accept any value and just LOG it for
-                  # audit. A wrong policy (e.g. a leftover --deliver all durable squatting
-                  # on the name) would replay the whole 72h backlog (VF-16) the moment the
-                  # old AIO durable is deleted — so we fail closed and never auto-fix.
+                  # AIO durable's ack_floor.stream_seq, the contiguous-APPLIED prefix) and
+                  # passed that SAME F0+1 as connect.sink.handoffStartSeq. We assert BOTH
+                  # the policy AND the exact sequence: a wrong policy (a leftover
+                  # --deliver all durable squatting the name) would replay the whole 72h
+                  # backlog (VF-16), and a wrong SEQUENCE (a typo, or a stale
+                  # by_start_sequence durable at a different position) would replay too
+                  # much (duplicate reapply) or skip a range (silent gap) the moment the
+                  # old AIO durable is deleted — so we fail closed on either and never
+                  # auto-fix.
+                  EXPECTED_START_SEQ={{ $handoffStartSeq | quote }}
                   CUR_DELIVER_POLICY=$(jq -r '.config.deliver_policy // "all"' /tmp/cons.json)
                   CUR_START_SEQ=$(jq -r '.config.opt_start_seq // ""' /tmp/cons.json)
-                  echo "note: [handoff assert-only] consumer '$CONSUMER' deliver_policy=$CUR_DELIVER_POLICY start_seq=[${CUR_START_SEQ:-none}] — asserting by_start_sequence (operator precreated at F0+1; any start_seq accepted, logged for audit)." >&2
+                  echo "note: [handoff assert-only] consumer '$CONSUMER' deliver_policy=$CUR_DELIVER_POLICY start_seq=[${CUR_START_SEQ:-none}] — asserting deliver_policy=by_start_sequence AND opt_start_seq=$EXPECTED_START_SEQ (= connect.sink.handoffStartSeq = the F0+1 you precreated at)." >&2
                   if [ "$CUR_DELIVER_POLICY" != "by_start_sequence" ]; then
                     echo "ERROR: [handoff assert-only] consumer '$CONSUMER' on '$STREAM' has deliver_policy=[$CUR_DELIVER_POLICY], but the §8.3 AIO→sharded handoff requires by_start_sequence — the operator must precreate every shard durable with '--deliver by_start_sequence --start-sequence <F0+1>' before deleting the old AIO durable. connect.sink.handoffAssertOnly=true will NOT auto-create or bless a wrong-policy durable: a --deliver all durable here replays the whole 72h backlog (VF-16) the instant the old AIO durable is gone. Precreate '$CONSUMER' correctly and re-run this Job." >&2
                     echo "note: connect.sink.bootstrap.allowStartMismatch does NOT override this assertion — the handoff mode exists precisely to catch precreate mistakes, so an escape hatch would defeat it." >&2
                     exit 1
                   fi
-                  echo "note: [handoff assert-only] consumer '$CONSUMER' start_seq observed = [${CUR_START_SEQ:-none}] — audit this equals the F0+1 you precreated against the recorded ack_floor.stream_seq." >&2
+                  if [ "$CUR_START_SEQ" != "$EXPECTED_START_SEQ" ]; then
+                    echo "ERROR: [handoff assert-only] consumer '$CONSUMER' on '$STREAM' has opt_start_seq=[${CUR_START_SEQ:-none}], but connect.sink.handoffStartSeq=$EXPECTED_START_SEQ — the durable must start at EXACTLY F0+1 (F0 = the old AIO durable's ack_floor.stream_seq you read at quiesce). A durable at the wrong sequence replays too much (duplicate reapply) or skips a range (silent gap) the instant the old AIO durable is deleted. Recreate '$CONSUMER' with '--deliver by_start_sequence --start-sequence $EXPECTED_START_SEQ' (or, if $EXPECTED_START_SEQ is wrong, re-read F0 and pass the corrected --set connect.sink.handoffStartSeq), then re-run this Job." >&2
+                    exit 1
+                  fi
+                  echo "note: [handoff assert-only] consumer '$CONSUMER' start_seq verified = [$CUR_START_SEQ] == connect.sink.handoffStartSeq ($EXPECTED_START_SEQ)." >&2
                   {{- else if ne $bDeliver "" }}
                   # ── Start-semantics validation (design §8.4, R3/F3) ────────────────
                   # Without this, a durable created by a PRIOR `--deliver all` (or any

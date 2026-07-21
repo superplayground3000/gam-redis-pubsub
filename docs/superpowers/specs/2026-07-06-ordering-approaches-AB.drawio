@@ -1,0 +1,297 @@
+<mxfile>
+  <diagram id="approach-a" name="Approach A — election gate">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Layout plan:
+             Col1 x=70..320 : JetStream (y=180..290), redelivery note (y=320..390)
+             Col2 x=430..670: old leader (y=70..160), new leader (y=250..370)
+             Col3 x=790..1030/960: Lease (y=70..130), region Redis (y=280..360)
+             Gutters: x=320..430 (e1 x=375, e3 x=355, e4 x=395), x=670..790 (e2 x=730, lease-expire x=750)
+             Timeline y=430; caveats y=520 -->
+
+        <mxCell id="a1" value="&lt;b&gt;Approach A&lt;/b&gt; — election gate: new leader sleeps longer than ackWait before its first pull (+ fully serialized sink)"
+          style="text;html=1;fontSize=16;fontStyle=1;align=left;verticalAlign=middle;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="20" width="1000" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a2" value="&lt;b&gt;NATS JetStream — KV_CDC&lt;/b&gt;&lt;br&gt;durable pull consumer cdc_sink&lt;br&gt;ackWait=30s · maxAckPending=1024&lt;br&gt;maxDeliver=-1"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="180" width="250" height="110" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a3" value="expired un-acked msgs join the&lt;br&gt;&lt;b&gt;redelivery queue&lt;/b&gt; — served before&lt;br&gt;new msgs, in stream-seq order"
+          style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=11;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="320" width="250" height="70" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a4" value="&lt;b&gt;sink leader (old)&lt;/b&gt;&lt;br&gt;✖ SIGKILL at t0&lt;br&gt;holds an un-acked batch in flight"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="430" y="70" width="240" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a5" value="&lt;b&gt;K8s Lease&lt;/b&gt;&lt;br&gt;lab-connect-sink-elector"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="790" y="70" width="240" height="60" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a6" value="&lt;b&gt;sink leader (new)&lt;/b&gt;&lt;br&gt;&lt;b&gt;GATE: sleep ackWait+5s (35s)&lt;/b&gt;&lt;br&gt;before POSTing its pipeline;&lt;br&gt;then apply serially&lt;br&gt;(threads=1, in-order acks)"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="430" y="250" width="240" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a7" value="region Redis KV"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="790" y="280" width="170" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="a8" value="Timeline:  t0 SIGKILL   →   t0+~2s Lease flips to a standby   →   t0+35s gate opens, first pull (all ack timers expired, redeliveries drain first)   →   traffic resumes"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=10;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="430" width="960" height="40" as="geometry" />
+        </mxCell>
+
+        <!-- caveats -->
+        <mxCell id="a9" value="&lt;b&gt;Caveat 1 — pays 30s+ on EVERY election&lt;/b&gt;&lt;br&gt;the gate fires on clean rollouts and healthy lease flips too; failover downtime goes from ~2s to ~35s"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="520" width="250" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="a10" value="&lt;b&gt;Caveat 2 — steady-state hole (guarantee is INCOMPLETE)&lt;/b&gt;&lt;br&gt;a transient nack during normal traffic reorders anyway: the msg returns 30s later, newer same-key msgs were already applied. No election happened, so the gate never fires."
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="350" y="520" width="250" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="a11" value="&lt;b&gt;Caveat 3 — needs a truly serial sink&lt;/b&gt;&lt;br&gt;threads=1 and in-order acks required; any batch/parallel processing (this image IS batch-nats) can still reorder inside a pull batch"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="630" y="520" width="250" height="130" as="geometry" />
+        </mxCell>
+        <mxCell id="a12" value="&lt;b&gt;Caveat 4 — source leg uncovered&lt;/b&gt;&lt;br&gt;if the source leg republishes claimed PEL entries after newer ones, the NATS stream itself is already out of order — no sink-side wait can repair that"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="910" y="520" width="250" height="130" as="geometry" />
+        </mxCell>
+
+        <!-- edges -->
+        <!-- e1: JS right(0.25)=(320,208) -> old leader left(0.5)=(430,115), vertical at x=375 -->
+        <mxCell id="a20" value="① deliver batch (un-acked)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a2" target="a4" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="375" y="208" />
+              <mxPoint x="375" y="115" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- lease expiry: old leader right(0.5)=(670,115) -> Lease left(0.33)=(790,90), vertical x=750 -->
+        <mxCell id="a21" value="② lease not renewed → expires"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.33;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a4" target="a5" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="750" y="115" />
+              <mxPoint x="750" y="90" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- e2: Lease left(0.67)=(790,110) -> new leader right(0.25)=(670,280), vertical x=730 -->
+        <mxCell id="a22" value="③ standby acquires Lease"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.67;exitDx=0;exitDy=0;entryX=1;entryY=0.25;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a5" target="a6" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="730" y="110" />
+              <mxPoint x="730" y="280" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- e3: new leader left(0.75)=(430,340) -> JS right(0.85)=(320,274), vertical x=355 -->
+        <mxCell id="a23" value="④ first pull at t0+35s (gate open)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.75;exitDx=0;exitDy=0;entryX=1;entryY=0.85;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a6" target="a2" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="355" y="340" />
+              <mxPoint x="355" y="274" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- e4: JS right(0.5)=(320,235) -> new leader left(0.35)=(430,292), vertical x=395 -->
+        <mxCell id="a24" value="⑤ redeliveries first (stream-seq order), then new msgs"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.35;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a2" target="a6" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="395" y="235" />
+              <mxPoint x="395" y="292" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- e5: new leader right(0.5)=(670,310) -> region left(0.5)=(790,320) -->
+        <mxCell id="a25" value="⑥ apply serially → ack in order"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="a6" target="a7" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="735" y="310" />
+              <mxPoint x="735" y="320" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+
+  <diagram id="approach-b" name="Approach B — maxAckPending=1 + DLQ">
+    <mxGraphModel dx="0" dy="0" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1169" pageHeight="827" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <!-- Layout plan:
+             JS x=70..330 y=150..270; sink x=450..670 y=150..240; region x=800..970 y=150..230
+             decision x=470..650 y=310..400; failover note x=70..330 y=330..460; DLQ x=790..990 y=440..530
+             Gutter x=330..450: ack x=400, nack x=370. Caveats y=580 -->
+
+        <mxCell id="b1" value="&lt;b&gt;Approach B&lt;/b&gt; — maxAckPending=1 + maxDeliver=N + DLQ: the server itself enforces total order"
+          style="text;html=1;fontSize=16;fontStyle=1;align=left;verticalAlign=middle;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="20" width="1000" height="30" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b2" value="&lt;b&gt;NATS JetStream — KV_CDC&lt;/b&gt;&lt;br&gt;cdc_sink: &lt;b&gt;maxAckPending=1&lt;/b&gt;&lt;br&gt;maxDeliver=5 · ackWait=30s&lt;br&gt;only ONE msg in flight; an expired or nacked msg is redelivered before anything newer"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="150" width="260" height="120" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b3" value="&lt;b&gt;connect-sink leader&lt;/b&gt;&lt;br&gt;switch: SET / DEL / guarded-RENAME Lua"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="450" y="150" width="220" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b4" value="region Redis KV"
+          style="shape=cylinder3;whiteSpace=wrap;html=1;boundedLbl=1;backgroundOutline=1;size=15;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="800" y="150" width="170" height="80" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b5" value="apply&lt;br&gt;succeeded?"
+          style="rhombus;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="470" y="310" width="180" height="90" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b6" value="&lt;b&gt;Failover for free:&lt;/b&gt; leader dies holding THE one in-flight msg → the new leader&#39;s first pull returns nothing until that msg&#39;s ackWait expires (max 30s), then it is redelivered FIRST. Order preserved with no gate and no special code."
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="330" width="260" height="130" as="geometry" />
+        </mxCell>
+
+        <mxCell id="b7" value="&lt;b&gt;KV_CDC_DLQ (parked msgs)&lt;/b&gt;&lt;br&gt;payload + error + attempt count&lt;br&gt;cdc_unprocessable{reason}++&lt;br&gt;alert · replayable by operator"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#e1d5e7;strokeColor=#9673a6;fontSize=12;"
+          vertex="1" parent="1">
+          <mxGeometry x="790" y="440" width="200" height="90" as="geometry" />
+        </mxCell>
+
+        <!-- caveats -->
+        <mxCell id="b8" value="&lt;b&gt;Caveat 1 — throughput collapses&lt;/b&gt;&lt;br&gt;1 msg per apply+ack round-trip; zero pipelining. A 5,000-msg verify batch goes from under a minute to several minutes; SINK_TIMEOUT_S likely needs raising."
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="70" y="580" width="250" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="b9" value="&lt;b&gt;Caveat 2 — duplicate apply still possible&lt;/b&gt;&lt;br&gt;crash AFTER the Redis write but BEFORE the ack → the msg is redelivered and written twice. State stays correct only because SET/DEL/guarded-RENAME are idempotent; non-idempotent side effects (cdc:latency XADD) duplicate. Inherent to at-least-once — A has it too."
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="350" y="580" width="250" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="b10" value="&lt;b&gt;Caveat 3 — head-of-line blocking&lt;/b&gt;&lt;br&gt;every transient error stalls the WHOLE stream for up to ackWait (30s) per retry attempt; a flaky Redis becomes stream-wide latency"
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="630" y="580" width="250" height="140" as="geometry" />
+        </mxCell>
+        <mxCell id="b11" value="&lt;b&gt;Caveat 4 — a parked msg is a permanent order gap&lt;/b&gt;&lt;br&gt;after N failed attempts its key&#39;s later events proceed without it; strict order holds only among applied msgs. Needs alerting + a replay path."
+          style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=11;align=left;spacingLeft=8;spacingRight=8;"
+          vertex="1" parent="1">
+          <mxGeometry x="910" y="580" width="250" height="140" as="geometry" />
+        </mxCell>
+
+        <!-- edges -->
+        <!-- b20: JS right(0.25)=(330,180) -> sink left(0.33)=(450,180) -->
+        <mxCell id="b20" value="① deliver msg N (the only one in flight)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.25;exitDx=0;exitDy=0;entryX=0;entryY=0.33;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b2" target="b3" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- b21: sink right(0.5)=(670,195) -> region left(0.5)=(800,190) -->
+        <mxCell id="b21" value="② write (SET/DEL/EVAL)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0;entryY=0.5;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b3" target="b4" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- b22: sink bottom(0.5)=(560,240) -> decision top(0.5)=(560,310) -->
+        <mxCell id="b22" value="③ result"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0.5;exitY=1;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b3" target="b5" parent="1">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- b23 ack: decision left(0.33)=(470,340) -> JS right(0.6)=(330,222), vertical x=400 -->
+        <mxCell id="b23" value="④a success → ACK (cursor advances)"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=0;exitY=0.33;exitDx=0;exitDy=0;entryX=1;entryY=0.6;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b5" target="b2" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="400" y="340" />
+              <mxPoint x="400" y="222" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- b24 nack: decision left(0.66)=(470,369) -> JS right(0.85)=(330,252), vertical x=370 -->
+        <mxCell id="b24" value="④b fail → NACK / ackWait timeout → redeliver the SAME msg"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;dashed=1;strokeColor=#b85450;exitX=0;exitY=0.66;exitDx=0;exitDy=0;entryX=1;entryY=0.85;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b5" target="b2" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="370" y="369" />
+              <mxPoint x="370" y="252" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+        <!-- b25 park: decision right(0.5)=(650,355) -> DLQ top(0.5)=(890,440), vertical x=890 -->
+        <mxCell id="b25" value="④c 5th failure → park + ACK"
+          style="edgeStyle=orthogonalEdgeStyle;html=1;exitX=1;exitY=0.5;exitDx=0;exitDy=0;entryX=0.5;entryY=0;entryDx=0;entryDy=0;orthogonalLoop=1;jettySize=auto;rounded=1;"
+          edge="1" source="b5" target="b7" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <Array as="points">
+              <mxPoint x="890" y="355" />
+            </Array>
+          </mxGeometry>
+        </mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
