@@ -2,6 +2,38 @@
 
 Append-only (format and compression policy: `rules/40-maintenance-protocol.md`). Newest first.
 
+## 2026-07-21 — A test harness that duplicates its own msg-ids will frame the pipeline
+- What happened: the sharded-DLQ e2e (`scripts/verify-sharded-dlq-e2e.sh`) showed a short poison
+  count — fewer messages parked than injected. Hours went into suspecting the pipeline (dedup on
+  the DLQ publish, a lost park, an ack-floor bug). The real cause was the HARNESS: its id-generator
+  collided, minting duplicate `event_id`s, so the second injection carried an id JetStream had
+  already seen. Stream-wide `Nats-Msg-Id` dedup correctly swallowed the duplicate publish — the
+  pipeline was behaving exactly as designed; the injected input was wrong.
+- Rule that would have prevented it: new — when a delivery/park counter comes up SHORT, FIRST diff
+  the actual ids/keys you injected against what you believe you injected (dump and `sort | uniq -d`
+  the harness's own event_ids/keys) before instrumenting the pipeline. In an at-least-once system
+  with stream-wide msg-id dedup, a duplicate injected id is indistinguishable from a lost message at
+  the output — but trivially visible at the input. Suspect the oracle/injector before the SUT.
+- Applied: harness id-generator collision fixed (commit f7f69e4); recorded here as a debugging-order
+  rule for any future delivery/dedup counter shortfall.
+
+## 2026-07-21 — Bare app: selectors cross-wire same-namespace releases (single-release installs can never catch it)
+- What happened: multi-env e2e surfaced an "applied + acked + counted, yet key absent" ghost. Two
+  helm releases of this chart in ONE namespace both labelled their Services/Deployments
+  `app: connect-sink` (etc.) with no release-scoped selector, so kube-proxy round-robined
+  connections ACROSS the two releases (proven 50/50 live) — a sink in release A would apply to
+  release B's region Redis and vice-versa, so each env was missing ~half its keys while every
+  metric said success. Every single-release install (every prior test, the whole e2e ladder until
+  multi-env) passed — there was only ever one release, so the cross-wiring had nothing to cross to.
+- Rule that would have prevented it: new — any Service/Deployment selector in a chart that can be
+  installed more than once per namespace MUST include a release-scoped label (`release:
+  {{ .Release.Name }}`); an `app:`-only selector is a latent cross-release wormhole. A guarantee
+  that only manifests with ≥2 releases co-resident is UNTESTABLE by a single-release suite — it
+  needs a multi-release (or namespace-per-release) e2e, which is why the multi-env proof is
+  load-bearing, not redundant with the single-env ladder.
+- Applied: `release` label added to every Service/Deployment selector (commit 280034f); the
+  multi-env e2e (`scripts/verify-multi-env.sh`) is the standing guard.
+
 ## 2026-07-20 — Containment guards need an exact-equality branch; prefix checks alone pass the degenerate case
 - What happened: the shared-prefix subject-layout change (PR #33) added guard N5 requiring
   explicit `sinkGroups[*].filterSubject` to sit under `kv.cdc.<normalSegment>.`. The first

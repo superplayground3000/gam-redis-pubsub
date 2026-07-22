@@ -1,3 +1,4 @@
+{{- include "rrcs.connect.forward.assertShardingConsistency" . -}}
 # cdc-forward.yaml — STREAMS-MODE stream config (input/pipeline/output only).
 # Reads central app.events stream; publishes each CDC event to NATS JetStream on
 # <subjectPrefix>.<op> with Nats-Msg-Id=event_id for dedup. XADD fields
@@ -70,10 +71,8 @@ pipeline:
   # link in the ordering chain that REPLACES the LWW fence — hard-coded, no
   # values override. Loosening it silently reintroduces old-overwrites-new
   # with no metric able to detect it.
-  threads: 1
-  {{- else }}
-  threads: 2
   {{- end }}
+  threads: {{ include "rrcs.connect.forward.threads" . }}
   processors:
     {{- if .Values.connect.contentLog.enabled }}
     # Dump the raw inbound Redis stream entry (app.events): XADD fields arrive as
@@ -295,7 +294,7 @@ output:
     # fence: allowing >1 in flight lets a later event's PubAck land before an earlier
     # one's, so an older value can overwrite a newer one on the same key, and NO
     # metric can detect it. Never raise this in the sharded render.
-    max_in_flight: 1
+    max_in_flight: {{ include "rrcs.connect.forward.maxInFlight" . }}
   {{- else }}
   # Non-sharded output: a two-child `fallback`. Child 1 tries the real JetStream
   # publish; child 2 runs ONLY if child 1 failed, to count and nack.

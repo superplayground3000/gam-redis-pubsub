@@ -28,17 +28,28 @@ imagePullSecrets:
 {{- end -}}
 
 {{/*
-rrcs.podLabels — pod-template labels for a workload: the mandatory `app`
-selector label plus any user-supplied common labels from .Values.podLabels.
-`app` is emitted first; podLabels cannot override it because each workload's
-selector.matchLabels pins `app` and the selector is immutable after install.
+rrcs.podLabels — pod-template labels for a workload: the mandatory `app` +
+`release` selector labels plus any user-supplied common labels from
+.Values.podLabels. `app` and `release` are emitted first; podLabels cannot
+override either (they are omitted from the user set) because each workload's
+selector.matchLabels pins both and the selector is immutable after install.
+
+`release: {{ "{{" }} .Release.Name {{ "}}" }}` is what keeps two releases of THIS
+chart in ONE namespace from cross-wiring: without it every pod carries a bare
+`app: redis-region` (etc.) and BOTH releases' Services select BOTH releases' pods
+(a Service Endpoints set that spans releases round-robins writes into the wrong
+release's Redis — this actually happened, corrupting a multi-env e2e). Scoping the
+pod label + the matching selectors to the release makes each Service select only
+its own pods. See the immutability note in _redis.tpl (redis-region selector) for
+the reinstall-required consequence.
 Usage (at template.metadata.labels indent):
   labels:
     {{- include "rrcs.podLabels" (dict "root" $ "app" "writer") | nindent 8 }}
 */}}
 {{- define "rrcs.podLabels" -}}
 app: {{ .app }}
-{{- with omit .root.Values.podLabels "app" }}
+release: {{ .root.Release.Name }}
+{{- with omit .root.Values.podLabels "app" "release" }}
 {{ toYaml . | trim }}
 {{- end }}
 {{- end -}}
@@ -60,6 +71,204 @@ tolerations:
 affinity:
   {{- toYaml . | nindent 2 }}
 {{- end }}
+{{- end -}}
+
+{{/*
+rrcs.envId — the validated per-release environment id (connect.envId), or "" in
+legacy mode. This is the SOLE per-release identity in a multi-env topology: it
+feeds the durable base (rrcs.connect.durableBase), the DLQ subject/msg-id
+(rrcs.nats.dlqRoot / rrcs.nats.dlqMsgIdPrefix), the default resourcePrefix
+(rrcs.resourcePrefix), and the Prometheus `env` label. Empty => byte-identical
+legacy render in every one of those dimensions at once.
+
+Validation is fail-loud at render (design §4): DNS-1123 label
+^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ (lowercase alnum + dashes; NO underscores, dots,
+or uppercase) and <=16 chars. The grammar is load-bearing twice over — envId is
+concatenated into Kubernetes names via resourcePrefix (an underscore/uppercase
+passes `helm template` but fails `kubectl apply`), and it is the token the A1/A6
+alerts label_replace out of the durable name cdc_sink_<envId>_<fam>_s<K> (an
+underscore or an _s<digits> run would make that regex ambiguous). The <=16 cap
+keeps the longest derived durable within its 64-char budget and the K8s name
+within the 57-char budget. Immutable across redeploys (design §4): renaming mints
+a fresh durable with a fresh ack floor and moves the DLQ lane, stranding parked
+poison — same hazard class as INV-1 row 2.
+Usage: {{ include "rrcs.envId" . }}
+*/}}
+{{- define "rrcs.envId" -}}
+{{- $env := .Values.connect.envId | default "" -}}
+{{- if ne $env "" -}}
+{{-   if gt (len $env) 16 -}}
+{{-     fail (printf "connect.envId=%q is %d chars — the cap is 16. envId is inserted into the durable name cdc_sink_<envId>_<fam>_s<K> (base 8 + '_' + envId + '_' + family + shard-token) which must stay <=64, and into every Kubernetes resource name via resourcePrefix (57-char budget). Shorten it." $env (len $env)) -}}
+{{-   end -}}
+{{-   if not (regexMatch "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" $env) -}}
+{{-     fail (printf "connect.envId=%q is not a DNS-1123 label — it must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ : lowercase alnum and dashes only, no leading/trailing dash, no underscores, no dots, no uppercase. envId is concatenated into Kubernetes names (an underscore or uppercase renders fine but fails kubectl apply) and is the token the A1/A6 alerts label_replace out of the durable name cdc_sink_<envId>_<fam>_s<K> (an underscore or _s<digits> run would make that regex ambiguous). Use e.g. enva or eu-west." $env) -}}
+{{-   end -}}
+{{- end -}}
+{{- $env -}}
+{{- end -}}
+
+{{/*
+rrcs.resourcePrefix — the effective Kubernetes resource-name prefix. An explicit
+.Values.resourcePrefix always wins; only when it is empty AND connect.envId is set
+does it default to "<envId>-" so a sink-only env's objects are namespaced by env
+without the operator having to repeat it. Empty envId + empty resourcePrefix => ""
+(byte-identical legacy). rrcs.name and the 57-char sink-name guard both consume
+this, so the default has one source of truth.
+Usage: {{ include "rrcs.resourcePrefix" $ }}
+*/}}
+{{- define "rrcs.resourcePrefix" -}}
+{{- $rp := .Values.resourcePrefix | default "" -}}
+{{- if ne $rp "" -}}
+{{- $rp -}}
+{{- else -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s-" $env -}}{{- end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sink.bootstrapDeliver — the validated connect.sink.bootstrap.deliver
+token: "" (legacy), "new", "all", or "by-time". This is the sole gate the EXTERNAL
+nats-init consults to (a) choose the deliver_policy for a durable it CREATES and
+(b) — when non-empty — VALIDATE an already-existing durable's start semantics against
+that choice, failing closed on a mismatch (design §8.4, R3/F3). Only the external
+init acts on it; the bundled nats-init owns/recreates its throwaway consumers and
+always creates --deliver all (nats-init-job.yaml).
+
+Empty ("", the default) is LEGACY: the external create path stays --deliver all and
+NO start-semantics validation renders, so the whole chart stays byte-identical to the
+pre-bootstrap version. A future major may flip the default to "new".
+
+Fails the render loud on: an unknown deliver value; deliver="by-time" without a
+byStartTime; a byStartTime that is not an RFC3339 timestamp; or a byStartTime set for
+a non-by-time mode (it would be silently ignored — a trap). Calling this helper is
+therefore what enforces the guards; call it wherever the token is needed.
+Usage: {{ include "rrcs.connect.sink.bootstrapDeliver" . }}
+*/}}
+{{- define "rrcs.connect.sink.bootstrapDeliver" -}}
+{{- $b := (.Values.connect.sink).bootstrap | default dict -}}
+{{- $d := $b.deliver | default "" -}}
+{{- $ts := $b.byStartTime | default "" -}}
+{{- if not (has $d (list "" "new" "all" "by-time")) -}}
+{{-   fail (printf "connect.sink.bootstrap.deliver=%q is invalid — must be \"\" (legacy: create --deliver all, no start-semantics validation, byte-identical render), \"new\" (start at the stream head, replay nothing — the safe go-forward default for a new env), \"all\" (replay the whole 72h backlog of CHANGES — NOT a snapshot), or \"by-time\" (start at bootstrap.byStartTime). See design §8.4." $d) -}}
+{{- end -}}
+{{- if eq $d "by-time" -}}
+{{-   if eq $ts "" -}}
+{{-     fail "connect.sink.bootstrap.deliver=\"by-time\" requires connect.sink.bootstrap.byStartTime — an RFC3339 UTC timestamp (e.g. 2026-07-21T00:00:00Z) giving the stream position the durable starts from. Set it to the snapshot instant T0 (design §8.4 strict path)." -}}
+{{-   end -}}
+{{-   if not (regexMatch "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$" $ts) -}}
+{{-     fail (printf "connect.sink.bootstrap.byStartTime=%q is not an RFC3339 timestamp — expected e.g. 2026-07-21T00:00:00Z or 2026-07-21T00:00:00+00:00. It is passed verbatim to `nats consumer add --deliver <ts>` (which sets deliver_policy=by_start_time / opt_start_time); a malformed value would fail the consumer creation at deploy time." $ts) -}}
+{{-   end -}}
+{{- else -}}
+{{-   if ne $ts "" -}}
+{{-     fail (printf "connect.sink.bootstrap.byStartTime=%q is set but connect.sink.bootstrap.deliver=%q is not \"by-time\", so the timestamp would be silently ignored. Set deliver=\"by-time\" to use it, or clear byStartTime." $ts $d) -}}
+{{-   end -}}
+{{- end -}}
+{{- $d -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sink.handoffAssertOnly — resolves connect.sink.handoffAssertOnly to
+"true"/"false" AND runs its two render guards (design E7, §8.3 step 3, plan P6).
+
+The handoff mode makes the EXTERNAL nats-init ASSERT that every durable this release
+derives already exists as `deliver_policy=by_start_sequence` (operator-precreated at
+F0+1) and NEVER auto-create — so an AIO→sharded per-env handoff can't silently fall
+back to create `--deliver all` (a 72h replay burst, VF-16) on a typo or a missing
+precreate. It is a one-window switch: turn on for the cutover, off again afterwards.
+
+Two things make it nonsensical outside that window, so we fail render loud rather than
+let them pass as inert:
+
+  1. BUNDLED NATS. The bundled nats-init owns and freely recreates its throwaway
+     consumers (labs rebuild from scratch); the assert-only contract only means
+     something against the user-owned durables on an EXTERNAL stream. A bundled
+     release carrying this flag is an operator mistake — fail, don't ignore it.
+  2. bootstrap.deliver ALSO set. A handoff release asserts a pre-existing
+     by_start_sequence position; declaring a bootstrap START policy at the same time
+     is contradictory (which one wins?). They are mutually exclusive by construction.
+
+Note the mode deliberately does NOT honour bootstrap.allowStartMismatch — see the
+assert branch in nats-init-external-job.yaml for why an escape hatch would defeat it.
+Usage: {{ if eq (include "rrcs.connect.sink.handoffAssertOnly" .) "true" }}...
+*/}}
+{{- define "rrcs.connect.sink.handoffAssertOnly" -}}
+{{- $h := (.Values.connect.sink).handoffAssertOnly | default false -}}
+{{- if $h -}}
+{{-   if not .Values.nats.external.enabled -}}
+{{-     fail "connect.sink.handoffAssertOnly=true is only valid on an EXTERNAL-NATS release (nats.external.enabled=true). The AIO→sharded handoff runbook (design §8.3) operates on user-owned durables on an external PROD stream; the bundled nats-init owns and freely recreates its throwaway consumers, so assert-only has nothing to assert against and bundled labs rebuild from scratch. Unset connect.sink.handoffAssertOnly on a bundled release." -}}
+{{-   end -}}
+{{-   $bDeliver := ((.Values.connect.sink).bootstrap | default dict).deliver | default "" -}}
+{{-   if ne $bDeliver "" -}}
+{{-     fail (printf "connect.sink.handoffAssertOnly=true is mutually exclusive with connect.sink.bootstrap.deliver=%q. A handoff release ASSERTS a pre-existing by_start_sequence durable (operator-precreated at F0+1, design §8.3); it must not ALSO declare a bootstrap start policy — the two contradict each other. Clear bootstrap.deliver for the handoff window, or turn handoffAssertOnly off." $bDeliver) -}}
+{{-   end -}}
+{{- end -}}
+{{- $h -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.sink.validateHandoffStartSeq — render guard binding connect.sink.handoffStartSeq
+to connect.sink.handoffAssertOnly (design §8.3/E7, F1 exact-seq fix). Emits NOTHING; it
+only fails render. Invoked from rrcs.connect.sinkGroups so it runs on EVERY render path
+(external, bundled, source, sink) rather than only where the external nats-init assert
+branch renders.
+
+  - handoffAssertOnly=true  => handoffStartSeq is REQUIRED and must be a positive integer
+    (it is F0+1, the exact opt_start_seq every precreated shard durable must report). The
+    assert-only init compares the observed opt_start_seq against it byte-for-byte.
+  - handoffAssertOnly=false => handoffStartSeq is FORBIDDEN (a start-seq only means something
+    inside the handoff window; a leftover value is an operator mistake, so we fail rather
+    than silently ignore it).
+Usage: {{ include "rrcs.connect.sink.validateHandoffStartSeq" . }}
+*/}}
+{{- define "rrcs.connect.sink.validateHandoffStartSeq" -}}
+{{- $sink := .Values.connect.sink | default dict -}}
+{{- $h := $sink.handoffAssertOnly | default false -}}
+{{- $seq := $sink.handoffStartSeq -}}
+{{- $seqSet := and (ne (kindOf $seq) "invalid") (ne (printf "%v" $seq) "") -}}
+{{- if $h -}}
+{{-   if not $seqSet -}}
+{{-     fail "connect.sink.handoffStartSeq is REQUIRED when connect.sink.handoffAssertOnly=true — it is F0+1, the EXACT opt_start_seq every precreated shard durable must report (F0 = the old AIO durable's ack_floor.stream_seq at quiesce; runbook-aio-to-sharded-handoff.md step 1). The assert-only init asserts deliver_policy=by_start_sequence AND opt_start_seq==handoffStartSeq, so it cannot run without the expected value. Pass --set connect.sink.handoffStartSeq=$((F0+1)) at the assert-only upgrade." -}}
+{{-   end -}}
+{{-   if or (ne (printf "%v" $seq) (printf "%d" (int64 $seq))) (le (int64 $seq) 0) -}}
+{{-     fail (printf "connect.sink.handoffStartSeq=%v must be a POSITIVE INTEGER (it is F0+1, a JetStream stream sequence >= 1). Set it to the ack_floor.stream_seq you read at quiesce, plus one." $seq) -}}
+{{-   end -}}
+{{- else -}}
+{{-   if $seqSet -}}
+{{-     fail (printf "connect.sink.handoffStartSeq=%v is set but connect.sink.handoffAssertOnly is not true — a start sequence only means something during the §8.3 AIO→sharded handoff window (it is the exact position the assert-only init checks against). A leftover value outside that window is an operator mistake, so the render fails rather than silently ignore it. Clear connect.sink.handoffStartSeq, or set handoffAssertOnly=true for the cutover." $seq) -}}
+{{-   end -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.durableBase — the env-scoped durable base: nats.stream.consumer.durable
+with "_<envId>" appended when connect.envId is set, else the bare base. This is the
+single seam through which envId reaches EVERY derived durable — the synthesized
+"default" durable (cdc_sink_<envId>), per-group durables (cdc_sink_<envId>_<name>),
+and per-shard durables (cdc_sink_<envId>_<fam>_s<K>) — because rrcs.connect.sinkGroups
+builds all of them from this base. Empty envId => the bare base (byte-identical).
+Usage: {{ include "rrcs.connect.durableBase" $ }}
+*/}}
+{{- define "rrcs.connect.durableBase" -}}
+{{- $base := required "nats.stream.consumer.durable is required" .Values.nats.stream.consumer.durable -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s_%s" $base $env -}}{{- else -}}{{- $base -}}{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.nats.dlqMsgIdPrefix — the Nats-Msg-Id prefix for a parked (dead-lettered)
+message: "dlq.<envId>." when connect.envId is set, else the legacy "dlq.". The
+"dlq." stem is LOAD-BEARING (INV-1 row 14): JetStream msg-id dedup is stream-wide
+and subject-independent, so the parked copy must not reuse the original publish's
+bare event_id or it PubAck{duplicate}s and nothing is stored. The "<envId>."
+segment additionally makes two envs parking the SAME poison event get DISTINCT
+msg-ids, so each stores its own copy instead of one deduping the other away
+(design §5.4, E2). Empty envId => "dlq." (byte-identical legacy render).
+Usage: {{ include "rrcs.nats.dlqMsgIdPrefix" . }}
+*/}}
+{{- define "rrcs.nats.dlqMsgIdPrefix" -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "dlq.%s." $env -}}{{- else -}}dlq.{{- end -}}
 {{- end -}}
 
 {{/*
@@ -243,17 +452,24 @@ script so they can never disagree. Two mutually-exclusive layouts:
     stream prefix is FIXED (external PROD NATS) so a sibling dlq.cdc.> root is
     unbindable — disjointness from normal traffic is enforced by guard N1
     (normalSegment != segment), not structurally.
+When connect.envId is set the DLQ root gains a trailing ".<envId>" segment
+(kv.cdc.dlq.<envId> in segment mode, dlq.cdc.<envId> legacy) so each env parks on
+its OWN lane under the same fixed stream binding — disjoint drains, no cross-env
+overlap (design §5, E2). Empty envId => unchanged root (byte-identical).
 Usage: {{ include "rrcs.nats.dlqRoot" . }}
 */}}
 {{- define "rrcs.nats.dlqRoot" -}}
 {{- $p := required "nats.stream.subjectPrefix is required" .Values.nats.stream.subjectPrefix -}}
 {{- $dl := .Values.connect.deadLetter | default dict -}}
 {{- $seg := $dl.segment | default "" -}}
+{{- $root := "" -}}
 {{- if ne $seg "" -}}
-{{- printf "%s.%s" $p $seg -}}
+{{- $root = printf "%s.%s" $p $seg -}}
 {{- else -}}
-{{- required "connect.deadLetter.subject is required" $dl.subject -}}
+{{- $root = required "connect.deadLetter.subject is required" $dl.subject -}}
 {{- end -}}
+{{- $env := include "rrcs.envId" . -}}
+{{- if ne $env "" -}}{{- printf "%s.%s" $root $env -}}{{- else -}}{{- $root -}}{{- end -}}
 {{- end -}}
 
 {{/*
@@ -319,10 +535,13 @@ Usage: {{ include "rrcs.nats.stream.subjects" . }}
 {{- $dl := .Values.connect.deadLetter | default dict -}}
 {{- $seg := .Values.nats.stream.normalSegment | default "" -}}
 {{- if $dl.enabled -}}
-{{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
-{{-   if gt (len $families) 0 -}}
-{{-     fail (printf "connect.deadLetter.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set) — the sharded sink pipeline (cdc-reverse-sharded.yaml) has no DLQ routing, so a mixed topology would be silently half-protected (unsharded poison parked, sharded poison still loops). Disable one of them.") -}}
-{{-   end -}}
+{{- /* Sharded DLQ (design §5, E2-E4): the deadLetter x sharding.families mutual
+     exclusion was REMOVED here — cdc-reverse-sharded.yaml now carries the same
+     park-then-ack switch output as cdc-reverse.yaml (env-scoped subject + msg-id,
+     dlq_env/dlq_shard headers). The DLQ subject/msg-id guards below (segment-mode
+     N1-N6 via rrcs.nats.validateSegmentLayout, and the legacy out-of-prefix rule)
+     apply to the sharded render IDENTICALLY, because this helper feeds nats-init
+     regardless of whether the release is sharded. */ -}}
 {{-   if ne $seg "" -}}
 {{- /* In-prefix segment mode: the DLQ lives at <prefix>.<deadLetter.segment>.>,
      already under the single superset binding <prefix>.>. Bind the superset alone —
@@ -404,13 +623,15 @@ Emits nothing on success. Usage: {{ include "rrcs.connect.validateAllInOne" . }}
 {{-     if ne $wsSeg "" -}}{{- $wsRoot = printf "%s.%s" $wsRoot $wsSeg -}}{{- end -}}
 {{-     fail (printf "connect.sinkAllInOne.enabled=true owns the whole stream (the synthesised \"default\" group, filter %s.>) — it cannot be combined with explicit connect.sinkGroups (%d configured). Any prefix-routed group would re-consume subjects the whole-stream consumer already drains (double delivery). Remove connect.sinkGroups, or turn all-in-one off and route by prefix instead." $wsRoot (len ($.Values.connect.sinkGroups | default list))) -}}
 {{-   end -}}
-{{- /* G3 — sharding is the exact opposite of one-consumer-drains-all, and the
-     sharded sink pipeline has no DLQ routing (see the DLQ+sharding exclusion at
-     the top of rrcs.nats.stream.subjects). Keep them mutually exclusive; do not
-     build the DLQ into the sharded pipeline in this change. */ -}}
+{{- /* G3 — sharding is the exact opposite of one-consumer-drains-all: all-in-one is
+     ONE whole-stream consumer, sharding is K per-key durables. They remain mutually
+     exclusive on THAT ground alone (a whole-stream drainer would double-consume every
+     shard subject). NOTE: this is no longer about DLQ support — the sharded sink now
+     carries park-then-ack (design §5, E2-E4), so the old "sharded pipeline has no DLQ
+     routing" rationale is gone; the topology conflict is what remains. */ -}}
 {{-   $families := (.Values.connect.sharding | default dict).families | default dict -}}
 {{-   if gt (len $families) 0 -}}
-{{-     fail (printf "connect.sinkAllInOne.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set, %d configured) — all-in-one is one consumer draining the whole stream, the opposite of per-key sharding, and the sharded sink pipeline has no DLQ routing (same reason connect.deadLetter is already excluded with sharding). Disable one of them." (len $families)) -}}
+{{-     fail (printf "connect.sinkAllInOne.enabled=true is not supported with subject-sharding v2 (connect.sharding.families is set, %d configured) — all-in-one is one consumer draining the whole stream, the exact opposite of per-key sharding (K per-shard durables); a whole-stream drainer would double-consume every shard subject. Disable one of them." (len $families)) -}}
 {{-   end -}}
 {{- end -}}
 {{- end -}}
@@ -439,6 +660,7 @@ in this pass); the 57-char name budget.
 {{- $v := .Values -}}
 {{- include "rrcs.connect.validateAllInOne" . -}}
 {{- include "rrcs.nats.validateSegmentLayout" . -}}
+{{- include "rrcs.connect.sink.validateHandoffStartSeq" . -}}
 {{- $subjectPrefix := required "nats.stream.subjectPrefix is required" $v.nats.stream.subjectPrefix -}}
 {{- /* Shared-prefix subject layout: when nats.stream.normalSegment is set, ALL
      normal traffic (and therefore every derived sink filter) moves under
@@ -457,7 +679,11 @@ in this pass); the 57-char name budget.
 {{- $legSink := $v.connect.sink -}}
 {{- $legLease := $legSink.lease -}}
 {{- $legCons := $v.nats.stream.consumer -}}
-{{- $baseDurable := $legCons.durable -}}
+{{- /* Env-scoped durable base: cdc_sink_<envId> when connect.envId is set, else the
+     bare cdc_sink. Every derived durable below (default, per-group, per-shard) is
+     built from this one seam, so a single knob env-scopes them all; empty envId is
+     byte-identical (design §4). */ -}}
+{{- $baseDurable := include "rrcs.connect.durableBase" $root -}}
 {{- $tokenRe := "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$" -}}
 {{- /* Key-prefix grammar: ONE or TWO ':'-separated segments (first-two-seg
      routing). Segment charset [a-z0-9_-], alnum first+last: '_' is legal in a
@@ -687,7 +913,7 @@ in this pass); the 57-char name budget.
 {{-     $saBase = printf "connect-sink-%s-elector" $name -}}
 {{-     $streamID = printf "reverse_leg_%s" $name -}}
 {{-   end -}}
-{{-   $fullName := printf "%s%s" $root.Values.resourcePrefix $deployBase -}}
+{{-   $fullName := printf "%s%s" (include "rrcs.resourcePrefix" $root) $deployBase -}}
 {{-   if gt (len $fullName) 57 -}}
 {{-     fail (printf "connect.sinkGroups[%s]: derived resource name %q (%d chars) exceeds the 57-char budget — shorten resourcePrefix or the group name" $name $fullName (len $fullName)) -}}
 {{-   end -}}
@@ -704,6 +930,18 @@ in this pass); the 57-char name budget.
 {{-     $durable = "" -}}
 {{-   else -}}
 {{-     $consumers = list (dict "token" "" "durable" $durable "filter" $filter "maxAckPending" $maxAckPending) -}}
+{{-   end -}}
+{{- /* Durable-name length guard (design §4): every derived durable — base
+     nats.stream.consumer.durable + "_<envId>" + group/shard suffix — must stay
+     <=64 chars (the conservative NATS durable-name budget). Distinct from the
+     57-char K8s resource-name guard above: durables are not bound by the K8s
+     limit, and a long family/shard token can blow the durable budget while the
+     Deployment name is fine. Fails loud with the offending length so the operator
+     can shorten connect.envId (<=16), the group name, or the family token. */ -}}
+{{-   range $c := $consumers -}}
+{{-     if gt (len $c.durable) 64 -}}
+{{-       fail (printf "connect.sinkGroups[%s]: derived durable name %q is %d chars, over the 64-char budget (base %q [= nats.stream.consumer.durable, env-scoped to _<envId> when connect.envId is set] + group/shard suffix; %d > 64). Shorten connect.envId (cap 16), the group name, or the sharding family token." $name $c.durable (len $c.durable) $baseDurable (len $c.durable)) -}}
+{{-     end -}}
 {{-   end -}}
 {{-   $elem := dict
              "name" $name
@@ -752,7 +990,24 @@ in this pass); the 57-char name budget.
 {{- /* INV-S4: every configured family must have {0..N-1} plus the isolation
      shard "x" claimed EXACTLY once by enabled shardsOf groups. An unclaimed
      shard means a subject nobody consumes — its messages would park in the
-     stream until maxAge silently discards them. */ -}}
+     stream until maxAge silently discards them.
+
+     SCOPED to SINK-CARRYING releases (design §3.2 / E5). The coverage check
+     answers "does THIS release's set of sink durables cover every shard the
+     forward publishes?" — a question that only exists when this release carries
+     the sink side. A source-only PUBLISHER declares families to drive the
+     PUBLISH taxonomy (it owns the forward leg, not the consumers), so it has no
+     shard groups to claim with and must render EXIT 0; the cross-release
+     coverage guarantee for a publisher is the topology manifest (§7), not this
+     render-time check. Predicate: connect.sink.enabled (the legacy/co-located
+     single-sink is on) OR an explicit connect.sinkGroups list is present (a
+     sink release routes by group). This is deliberately NOT weakened for the
+     co-located case — a combined release keeps sink.enabled=true so the check
+     fires exactly as before; only a sink-less publisher (sink.enabled=false AND
+     no sinkGroups) is exempted. A sharded SINK release still carries sinkGroups,
+     so an incomplete shard claim there fails EXIT 1 unchanged. */ -}}
+{{- $sinkCarrying := or $legSink.enabled (gt (len ($v.connect.sinkGroups | default list)) 0) -}}
+{{- if $sinkCarrying -}}
 {{- range $fam, $fcfg := $families -}}
 {{-   $claims := get $famClaims $fam | default dict -}}
 {{-   $n := int $fcfg.shards -}}
@@ -765,19 +1020,70 @@ in this pass); the 57-char name budget.
 {{-     fail (printf "connect.sharding.families[%s]: the isolation shard \"x\" is not claimed by any ENABLED sinkGroup — add \"x\" to one group's shards list (it receives unparseable-key and cross-shard-rename events; INV-S4)" $fam) -}}
 {{-   end -}}
 {{- end -}}
+{{- end -}}
+{{- /* Final filter-overlap sweep (Codex review 2026-07-21, F2). The per-domain guards
+     above catch prefix-vs-prefix and whole-stream-vs-prefix overlaps, but an EXPLICIT
+     filterSubject is passed through verbatim (N5) and, in legacy mode, is not checked
+     against any OTHER group's synthesized filter — so a shard family PLUS an explicit
+     filterSubject on one of its shard subjects (e.g. kv.cdc.aio.lb.company.s0.>) both
+     render and double-consume that subject. This sweep is the catch-all: it collects
+     EVERY enabled group's RESOLVED filters (a group's `filter` is a comma-joined list of
+     synthesized shard filters / catch-all / whole-stream / prefixed subjects, or the
+     verbatim explicit filterSubject) and fails loud on ANY cross-group overlap.
+
+     All these shapes are either `<literal>.>` wildcards or plain literals, so overlap
+     reduces to a dot-boundary prefix test: strip a trailing ".>" to get each filter's
+     prefix; two filters overlap iff their prefixes are EQUAL or one is a dot-boundary
+     prefix of the other (prefixB == prefixA or prefixB starts with "prefixA."). Only
+     DIFFERENT groups are compared — a single group's own multiple filters are disjoint by
+     construction (distinct shards / distinct prefixes, already validated above). Overlaps
+     the earlier domain guards also catch fail there first with their specific message;
+     this sweep is reached only for the gap they miss. */ -}}
+{{- $flat := list -}}
+{{- range $g := $out -}}
+{{-   if $g.enabled -}}
+{{-     range $f := (splitList "," $g.filter) -}}
+{{-       $flat = append $flat (dict "group" $g.name "filter" $f) -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- range $i, $a := $flat -}}
+{{-   range $j, $b := $flat -}}
+{{-     if and (lt $i $j) (ne $a.group $b.group) -}}
+{{-       $pa := trimSuffix ".>" $a.filter -}}
+{{-       $pb := trimSuffix ".>" $b.filter -}}
+{{-       if or (eq $pa $pb) (hasPrefix (printf "%s." $pa) $pb) (hasPrefix (printf "%s." $pb) $pa) -}}
+{{-         fail (printf "connect.sinkGroups: filter overlap between group %q (filter %q) and group %q (filter %q) — the two consumer filters cover overlapping subject space, so every message on the shared subtree is delivered to BOTH durables (double consumption / double apply). Every enabled sink filter must be disjoint at a dot boundary. This most often means an explicit filterSubject was pointed at a subject a sharded family or another group already owns; re-scope one of them (a more specific filterSubject, or let the owning group consume the subtree)." $a.group $a.filter $b.group $b.filter) -}}
+{{-       end -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
 {{- $out | toYaml -}}
 {{- end -}}
 
 {{/*
-rrcs.connect.prefixRouting — "true" iff any ENABLED sinkGroup routes by key-prefix.
-Gates the forward leg's kv_prefix subject segment (design §3): a pure default /
-non-prefix install stays on the legacy <subjectPrefix>.<op> subject and grant.
+rrcs.connect.prefixRouting — "true" iff the forward leg must carry the kv_prefix
+subject segment. TWO independent triggers, OR'd (design §3.2 / E5):
+  (a) any ENABLED sinkGroup in THIS release routes by key-prefix (prefixed or
+      sharded) — the co-located source+sink case; OR
+  (b) connect.sharding.families is declared (shardingEnabled) — the PUBLISHER-SIDE
+      taxonomy declaration, REGARDLESS of local sink groups.
+Trigger (b) is what makes the publish taxonomy a publisher property: a source-only
+publisher release declaring families now emits per-shard subjects
+(kv.cdc.<seg>.<fam>.s<K>.<op>) that downstream sharded sink releases filter on, even
+though the publisher owns no sink group. Without it a sink-less publisher would be
+serialized (shardingEnabled) yet publish bare kv.cdc.<seg>.<op> that matches no
+shard filter and no catch-all — the VF-5 "family black-hole" (silent 72h loss).
+The two predicates are bound by rrcs.connect.forward.assertShardingConsistency so
+they can never re-drift. A pure default / non-prefix, non-sharded install keeps the
+legacy <subjectPrefix>.<op> subject and grant (byte-identical).
 */}}
 {{- define "rrcs.connect.prefixRouting" -}}
 {{- $any := false -}}
 {{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
 {{- if and $g.enabled (or $g.prefixed $g.sharded) -}}{{- $any = true -}}{{- end -}}
 {{- end -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}{{- $any = true -}}{{- end -}}
 {{- ternary "true" "false" $any -}}
 {{- end -}}
 
@@ -791,6 +1097,75 @@ in rrcs.connect.sinkGroups (invoked by every consumer of this helper's result).
 {{- define "rrcs.connect.shardingEnabled" -}}
 {{- $s := .Values.connect.sharding | default dict -}}
 {{- ternary "true" "false" (gt (len ($s.families | default dict)) 0) -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.threads — the forward pipeline's thread count. 1 under
+sharding (ordering link O-3: read order == process order; a parallel pipeline
+reorders publishes), else 2. SINGLE SOURCE for cdc-forward.yaml's `pipeline.threads`
+AND the anti-drift assertion below, so the value the template renders and the value
+the assertion checks can never disagree — a future edit that changes this mapping
+is caught by the assertion pinning the constant "1" under sharding.
+*/}}
+{{- define "rrcs.connect.forward.threads" -}}
+{{- ternary "1" "2" (eq (include "rrcs.connect.shardingEnabled" .) "true") -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.maxInFlight — the forward JetStream output's max_in_flight. 1
+under sharding (ordering link O-4: serialized publish — one PubAck before the next,
+so a later event's ack can never land before an earlier one's and overwrite a newer
+value with an older one), else connect.source.maxInFlight (default 256). SINGLE
+SOURCE for the sharded output branch AND the assertion below (same rationale as
+rrcs.connect.forward.threads). connect.source.maxInFlight is render-guarded to be
+unset under sharding, so the else branch is only reached when NOT sharding.
+*/}}
+{{- define "rrcs.connect.forward.maxInFlight" -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}1{{- else -}}{{ .Values.connect.source.maxInFlight | default 256 }}{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.forward.assertShardingConsistency — anti-drift render assertion
+(design §3.2 / E5). Emits nothing on success; FAILS the render when
+shardingEnabled is true but any of the three ordering/routing predicates the
+sharded forward depends on has drifted:
+
+  shardingEnabled=="true" ⇒ publishSubject contains "kv_prefix"   (VF-5 routing)
+                          ∧ forward threads == 1                  (O-3)
+                          ∧ forward max_in_flight == 1            (O-4)
+
+This is a REAL check on the RESOLVED values that feed cdc-forward.yaml, not a
+re-statement of the branch that renders them:
+  - the subject predicate reads the actual rrcs.nats.stream.publishSubject output,
+    which is gated on rrcs.connect.prefixRouting — a DIFFERENT helper than
+    shardingEnabled. If a future edit decouples prefixRouting from shardingEnabled
+    again (the VF-5 black-hole), publishSubject stops carrying kv_prefix and this
+    fires — that is precisely the drift E5 binds shut.
+  - threads / max_in_flight are read from the single-source helpers above (which
+    the template also renders from) and compared against the CONSTANT "1"; if the
+    helper mapping is ever changed to emit a non-1 value under sharding, the
+    constant assertion catches it.
+
+Invoked from the TOP of cdc-forward.yaml so every render path that emits the
+forward pipeline evaluates it. Naming O-3/O-4 in the failure text so the operator
+lands on the ordering-chain rule (INV-1 row 13) that the loosened value breaks.
+Usage: {{ include "rrcs.connect.forward.assertShardingConsistency" . }}
+*/}}
+{{- define "rrcs.connect.forward.assertShardingConsistency" -}}
+{{- if eq (include "rrcs.connect.shardingEnabled" .) "true" -}}
+{{-   $subject := include "rrcs.nats.stream.publishSubject" . -}}
+{{-   if not (contains "kv_prefix" $subject) -}}
+{{-     fail (printf "forward anti-drift (design E5, closes VF-5): connect.sharding.families is set (shardingEnabled) but the forward publish subject %q does NOT carry the kv_prefix shard token. rrcs.connect.prefixRouting has drifted away from shardingEnabled, so every family event would publish to a bare subject matching NO shard filter and NO catch-all — the family black-hole: valid messages park unconsumed until the 72h stream max-age silently discards them (INV-1 loss). rrcs.connect.prefixRouting MUST return \"true\" whenever shardingEnabled is \"true\"; do not decouple them." $subject) -}}
+{{-   end -}}
+{{-   $threads := include "rrcs.connect.forward.threads" . -}}
+{{-   if ne $threads "1" -}}
+{{-     fail (printf "forward anti-drift (INV-1 row 13, ordering link O-3): shardingEnabled is \"true\" but the forward pipeline would render threads=%s (must be 1). A parallel forward pipeline processes out of read order and reorders publishes, silently reintroducing old-overwrites-new with no metric able to detect it (the v2 design removed the LWW fence). Keep rrcs.connect.forward.threads at 1 under sharding." $threads) -}}
+{{-   end -}}
+{{-   $mif := include "rrcs.connect.forward.maxInFlight" . -}}
+{{-   if ne $mif "1" -}}
+{{-     fail (printf "forward anti-drift (INV-1 row 13, ordering link O-4): shardingEnabled is \"true\" but the forward output would render max_in_flight=%s (must be 1). With >1 in flight a later event's PubAck can land before an earlier one's, overwriting a newer value with an older one on the same key — silent, no metric detects it. Keep rrcs.connect.forward.maxInFlight at 1 under sharding (and leave connect.source.maxInFlight unset)." $mif) -}}
+{{-   end -}}
+{{- end -}}
 {{- end -}}
 
 {{/*
@@ -892,6 +1267,227 @@ existing CDCForwardUnrouted alert fires, unchanged).
 {{- ternary "true" "false" $any -}}
 {{- end -}}
 
+{{/*
+rrcs.connect.topologyManifest.json — the resolved publish taxonomy as a compact,
+deterministic JSON object, the SINGLE SOURCE OF TRUTH shared by the publisher's
+manifest WRITE and every sink's drift COMPARE (design §7 / E6). Rendering it once
+here means the two sides can never disagree on how the taxonomy is spelled.
+
+  {"families":{"lp:m2g":32},"normalSegment":"aio","prefixes":["tg.caveat"],"schema":1}
+
+  - schema:        wire-format version (bump if the shape changes).
+  - normalSegment: nats.stream.normalSegment (the second subject segment ALL normal
+                   traffic — and therefore every sink filter — shifts under).
+  - families:      { rawFamily: shardCount } from connect.sharding.families, keyed by
+                   the RAW colon family (same key the shardMap/routeMap use).
+  - prefixes:      sorted, de-duped subject tokens (':' -> '.') of every ENABLED
+                   PREFIXED, non-sharded sinkGroup — the disjoint first-two-seg routes
+                   that are NOT absorbed by the catch-all (design §3.3).
+
+No updatedAt/clock field: the manifest is a pure function of the taxonomy so both
+sides render byte-identical, and the NATS KV entry already carries a server-side
+revision + timestamp (nats kv history cdc_topology) for "when". toJson sorts map
+keys and the prefixes list is sortAlpha'd => deterministic render, stable checksum.
+Usage: {{ include "rrcs.connect.topologyManifest.json" $ }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.json" -}}
+{{- $seg := .Values.nats.stream.normalSegment | default "" -}}
+{{- $families := dict -}}
+{{- $s := .Values.connect.sharding | default dict -}}
+{{- range $fam, $fcfg := ($s.families | default dict) -}}
+{{-   $_ := set $families $fam (int $fcfg.shards) -}}
+{{- end -}}
+{{- $prefixSet := dict -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{-   if and $g.enabled $g.prefixed (not $g.sharded) -}}
+{{-     range $p := ($g.prefixes | default list) -}}
+{{-       $_ := set $prefixSet (replace ":" "." $p) true -}}
+{{-     end -}}
+{{-   end -}}
+{{- end -}}
+{{- $manifest := dict "schema" 1 "normalSegment" $seg "families" $families "prefixes" (keys $prefixSet | sortAlpha) -}}
+{{- $manifest | toJson -}}
+{{- end -}}
+
+{{/*
+rrcs.connect.topologyManifest.writeScript — publisher-side shell fragment that
+PUBLISHES the resolved taxonomy to KV bucket cdc_topology, key "current" (design
+§7 / E6). Emits NOTHING unless nats.topologyManifest.enabled AND this release is
+publisher-shaped (connect.source.enabled) — so with the toggle off the init job
+renders byte-identical. Consumes $SERVER/$CREDS already defined by both init jobs.
+The `.bundled` arg selects bucket-creation policy: bundled mode CREATES the bucket
+if absent (the chart owns that NATS); external mode FAILS LOUD if it is missing
+(the bucket + the $KV.cdc_topology.> grant are user-provisioned — the chart never
+creates buckets on an external/user-owned NATS).
+Usage: {{ include "rrcs.connect.topologyManifest.writeScript" (dict "root" $ "bundled" true) }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.writeScript" -}}
+{{- $root := .root -}}
+{{- if and $root.Values.nats.topologyManifest.enabled $root.Values.connect.source.enabled }}
+
+              # ── Topology manifest publish (drift gate, design §7 / E6) ─────────
+              # This publisher owns the resolved taxonomy. Each sink init reads it
+              # and fails closed on drift: if the publisher's N (or normalSegment /
+              # prefixes) diverges from a sink's, that sink derives durables for a
+              # different subject set than the forward publishes to, so valid events
+              # park unconsumed until the 72h stream max-age SILENTLY discards them
+              # (VF-16). The manifest is the only cross-release seam that can catch it.
+              MANIFEST='{{ include "rrcs.connect.topologyManifest.json" $root }}'
+              if ! nats --server "$SERVER" --creds "$CREDS" kv info cdc_topology >/dev/null 2>&1; then
+              {{- if .bundled }}
+                echo "topology manifest: KV bucket cdc_topology absent — creating it (bundled NATS)"
+                nats --server "$SERVER" --creds "$CREDS" kv add cdc_topology --history 5 --replicas 1
+              {{- else }}
+                echo "ERROR: nats.topologyManifest.enabled=true but KV bucket 'cdc_topology' is not present on the external NATS (or the publisher creds lack \$KV.cdc_topology.>)." >&2
+                echo "Provision it once — 'nats kv add cdc_topology --history 5' — and grant \$KV.cdc_topology.> to the publisher + subscriber creds (gen-nats-auth.sh). The chart never creates buckets on a user-owned NATS." >&2
+                exit 1
+              {{- end }}
+              fi
+              # ── F2 taxonomy-change rollout guard (design §16 / F2) ─────────────
+              # A publisher owns the PUBLISH taxonomy — families+N AND normalSegment
+              # AND sinkGroup prefixes. Shifting ANY of these re-points the published
+              # subjects: a normalSegment or prefixes change moves subjects for every
+              # sink exactly the same way a family/N change does, sharded or not. Any
+              # sink release still filtering the OLD subjects then silently loses every
+              # event on a changed subject until the 72h stream max-age (VF-16) — the
+              # exact window F2 exists to close. The P2 sink-side gate only catches
+              # this at the sink's NEXT init, which may be 72h of drift-loss away, so
+              # the guard runs here for EVERY manifest-enabled publisher, NOT only
+              # sharded ones. Before OVERWRITING an existing manifest, compare it to
+              # what this release would publish and BLOCK on a difference, unless the
+              # operator has asserted (allowTaxonomyChange=true) that every sink
+              # release already consumes the new subjects. No manifest yet (first
+              # publisher deploy) => nothing to break, the write proceeds. Inert when
+              # the manifest is disabled (this whole block renders only when enabled),
+              # in which case the F2 rule rests on the operator (see values.yaml).
+              if nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology current --raw >/tmp/prev_manifest.json 2>/dev/null; then
+                TM_PREV=$(jq -Sc . /tmp/prev_manifest.json 2>/dev/null || cat /tmp/prev_manifest.json)
+                TM_NEXT=$(printf '%s' "$MANIFEST" | jq -Sc .)
+                if [ "$TM_PREV" != "$TM_NEXT" ]; then
+                {{- if $root.Values.nats.topologyManifest.allowTaxonomyChange }}
+                  echo "WARN: topology taxonomy CHANGE permitted by nats.topologyManifest.allowTaxonomyChange=true:" >&2
+                  echo "WARN:   cdc_topology/current [$TM_PREV] -> [$TM_NEXT]." >&2
+                  echo "WARN:   Overwriting — you have asserted every sink release already consumes the NEW subjects." >&2
+                {{- else }}
+                  echo "ERROR: topology taxonomy CHANGE blocked (F2 rollout guard):" >&2
+                  echo "ERROR:   cdc_topology/current is [$TM_PREV]" >&2
+                  echo "ERROR:   but this publisher would publish [$TM_NEXT]." >&2
+                  echo "Changing families/N, normalSegment, or prefixes shifts the published subjects. Any sink release still filtering the OLD subjects would silently lose every event on a changed subject until the 72h stream max-age (VF-16)." >&2
+                  echo "Roll EVERY sink release onto the new taxonomy FIRST and confirm each is registered on the manifest, THEN re-run this publisher with nats.topologyManifest.allowTaxonomyChange=true to permit the overwrite." >&2
+                  exit 1
+                {{- end }}
+                fi
+              fi
+              echo "topology manifest: publishing cdc_topology/current = $MANIFEST"
+              printf '%s' "$MANIFEST" | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology current
+{{- end }}
+{{- end -}}
+
+{{/*
+rrcs.connect.topologyManifest.readScript — sink-side shell fragment that READS the
+publisher manifest (cdc_topology/current) and gates this release on it (design §7 /
+E6). Emits NOTHING unless nats.topologyManifest.enabled AND this release is
+sink-shaped (any enabled sinkGroup) — toggle off => byte-identical render. Consumes
+$SERVER/$CREDS/$STREAM from the enclosing init job.
+
+Compares ONLY the fields that affect THIS release's filters:
+  - normalSegment: ALWAYS (every sink filter shifts under it)
+  - families+N:    only when this release has shardsOf groups (shardingEnabled)
+  - prefixes:      only when this release has a prefixed (non-shard) group
+MISMATCH => fail closed ALWAYS. UNREADABLE (bucket/key gone or no $KV grant) =>
+fail closed on a FIRST install, fail OPEN (+ loud marker) on a redeploy so an
+emergency rollback is never blocked on the monitoring-adjacent bucket.
+
+First-install vs redeploy discriminator (F3 fix, Codex review 2026-07-21): a durable
+VERIFIED-MARKER — cdc_topology/_verified_<envId-or-default> — written ONLY after a
+SUCCESSFUL manifest compare. Marker PRESENT => this env verified the taxonomy on a
+prior deploy => redeploy (unreadable manifest => fail-open + loud warn). Marker ABSENT
+=> first install (unreadable manifest => fail-closed). This replaces the earlier
+"do any of this env's durables already exist?" test, which misclassified a FIRST
+install whose durables the operator PRECREATED (the AIO->sharded handoff, E7) as a
+redeploy and fail-OPENED on an unreadable manifest — skipping the drift gate on a
+brand-new env, in violation of E6. Precreated durables prove nothing about whether the
+taxonomy was ever checked; only the verified-marker does. The marker PUT needs
+$KV.cdc_topology.> (the admin creds carry it since the 2026-07-21 regen); a denied PUT
+degrades to a warning and the safe first-install (fail-closed) default. Same helper is
+included by BOTH the external and bundled nats-init jobs, so both stay consistent.
+Usage: {{ include "rrcs.connect.topologyManifest.readScript" $ }}
+*/}}
+{{- define "rrcs.connect.topologyManifest.readScript" -}}
+{{- if and .Values.nats.topologyManifest.enabled (eq (include "rrcs.connect.anySinkEnabled" .) "true") }}
+{{- $env := include "rrcs.envId" . -}}
+{{- $markerToken := ternary $env "default" (ne $env "") -}}
+{{- $hasPrefix := false -}}
+{{- range $g := (include "rrcs.connect.sinkGroups" . | fromYamlArray) -}}
+{{- if and $g.enabled $g.prefixed (not $g.sharded) -}}{{- $hasPrefix = true -}}{{- end -}}
+{{- end }}
+
+              # ── Topology manifest drift gate (sink side, design §7 / E6) ───────
+              EXPECTED_MANIFEST='{{ include "rrcs.connect.topologyManifest.json" . }}'
+              TM_SHARDED='{{ include "rrcs.connect.shardingEnabled" . }}'
+              TM_HAS_PREFIX='{{ ternary "true" "false" $hasPrefix }}'
+              # First install vs redeploy is decided by a durable VERIFIED-MARKER
+              # (cdc_topology/_verified_<env>) written after a SUCCESSFUL compare below —
+              # NOT by whether this env's durables exist. Durable-existence misclassifies
+              # a FIRST install whose durables the operator PRECREATED (the AIO->sharded
+              # handoff, E7) as a redeploy, which would fail-OPEN on an unreadable manifest
+              # and skip the drift gate on a brand-new env (design §7 / E6, F3 fix).
+              if nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology current --raw >/tmp/manifest.json 2>/dev/null; then
+                # Accumulate mismatches with literal \n escapes (a real newline here
+                # would terminate the YAML block scalar); render them with printf %b.
+                TM_MISMATCH=""
+                WANT_SEG=$(printf '%s' "$EXPECTED_MANIFEST" | jq -r '.normalSegment')
+                GOT_SEG=$(jq -r '.normalSegment // ""' /tmp/manifest.json)
+                [ "$WANT_SEG" != "$GOT_SEG" ] && TM_MISMATCH="${TM_MISMATCH}  normalSegment: sink=[$WANT_SEG] manifest=[$GOT_SEG]\n"
+                if [ "$TM_SHARDED" = "true" ]; then
+                  WANT_FAM=$(printf '%s' "$EXPECTED_MANIFEST" | jq -Sc '.families')
+                  GOT_FAM=$(jq -Sc '.families // {}' /tmp/manifest.json)
+                  [ "$WANT_FAM" != "$GOT_FAM" ] && TM_MISMATCH="${TM_MISMATCH}  families: sink=[$WANT_FAM] manifest=[$GOT_FAM]\n"
+                fi
+                if [ "$TM_HAS_PREFIX" = "true" ]; then
+                  WANT_PFX=$(printf '%s' "$EXPECTED_MANIFEST" | jq -Sc '.prefixes|sort')
+                  GOT_PFX=$(jq -Sc '(.prefixes // [])|sort' /tmp/manifest.json)
+                  [ "$WANT_PFX" != "$GOT_PFX" ] && TM_MISMATCH="${TM_MISMATCH}  prefixes: sink=[$WANT_PFX] manifest=[$GOT_PFX]\n"
+                fi
+                if [ -n "$TM_MISMATCH" ]; then
+                  echo "ERROR: topology DRIFT between this sink release and the publisher manifest (cdc_topology/current) — FAIL CLOSED:" >&2
+                  printf '%b' "$TM_MISMATCH" >&2
+                  echo "The publisher emits subjects this sink does not consume (or vice-versa) => valid messages park unconsumed until the 72h stream max-age silently discards them (VF-16). Reconcile connect.sharding.families / sinkGroup prefixes / nats.stream.normalSegment against the publisher, then redeploy." >&2
+                  exit 1
+                fi
+                echo "topology manifest: verified against publisher (normalSegment/families/prefixes match); proceeding."
+                # F3: record a durable verified-marker so a LATER run that finds the
+                # manifest unreadable can tell a redeploy (marker present) from a first
+                # install (marker absent) WITHOUT inferring it from durable existence.
+                # Admin creds carry $KV.cdc_topology.> since the 2026-07-21 regen; if the
+                # PUT is denied we DEGRADE with a warning (a future unreadable run then
+                # treats this env as a first install and fails closed — the safe default).
+                printf '%s' "verified reason=manifest_match" \
+                  | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology {{ printf "_verified_%s" $markerToken }} 2>/dev/null \
+                  || echo "WARN: could not write the _verified_{{ $markerToken }} marker (creds lack \$KV.cdc_topology.> PUT) — a later UNREADABLE-manifest run will treat this env as a FIRST install (fail-closed) rather than a redeploy fail-open; grant the PUT to enable redeploy fail-open." >&2
+              elif nats --server "$SERVER" --creds "$CREDS" kv get cdc_topology {{ printf "_verified_%s" $markerToken }} >/dev/null 2>&1; then
+                echo "WARN: ================================================================" >&2
+                echo "WARN: CDCTopologyManifestUnverified — cdc_topology/current is UNREADABLE" >&2
+                echo "WARN:   (bucket/key missing or creds lack \$KV.cdc_topology.>) and this env has a" >&2
+                echo "WARN:   _verified_{{ $markerToken }} marker from a prior verified deploy (REDEPLOY)" >&2
+                echo "WARN:   => proceeding FAIL-OPEN so an emergency rollback is never blocked on the" >&2
+                echo "WARN:   manifest bucket." >&2
+                echo "WARN:   The drift gate did NOT run: if the publisher taxonomy changed, this sink" >&2
+                echo "WARN:   may now be silently mis-consuming. Restore the manifest and re-verify." >&2
+                echo "WARN: ================================================================" >&2
+                # Best-effort durable marker an operator / DLQ-drain runbook can see
+                # (needs $KV.cdc_topology.> PUT; never blocks the deploy if absent).
+                printf '%s' "unverified redeploy reason=manifest_unreadable" \
+                  | nats --server "$SERVER" --creds "$CREDS" kv put cdc_topology {{ printf "_unverified_%s" $markerToken }} 2>/dev/null \
+                  || echo "WARN:   (could not write the _unverified_{{ $markerToken }} marker — subscriber creds lack \$KV.cdc_topology.> PUT; log signal above stands)" >&2
+              else
+                echo "ERROR: cdc_topology/current is UNREADABLE and this env has NO _verified_{{ $markerToken }} marker — treating as a FIRST install and FAILING CLOSED." >&2
+                echo "The manifest is a hard, ordered dependency for a NEW sink env: without it we cannot prove the publisher's N/prefixes/normalSegment match this release, and a mismatch is silent 72h loss (VF-16). This holds even when the env's durables were PRECREATED (the AIO->sharded handoff) — precreated durables are not proof the taxonomy was ever verified, which is exactly why the discriminator is the _verified marker and not durable existence. Run the publisher release (nats.topologyManifest.enabled) so it populates cdc_topology/current, grant this release's creds \$KV.cdc_topology.>, then redeploy." >&2
+                exit 1
+              fi
+{{- end }}
+{{- end -}}
+
 {{- define "rrcs.nats.credsSecret.publisher" -}}
 {{- if .Values.nats.external.enabled -}}
 {{- required "nats.external.auth.publisherSecret is required when external" .Values.nats.external.auth.publisherSecret -}}
@@ -926,6 +1522,6 @@ Usage: {{ include "rrcs.name" (dict "root" $ "base" "writer") }}
 */}}
 {{- define "rrcs.name" -}}
 {{- if ne .base "" -}}
-{{- printf "%s%s" .root.Values.resourcePrefix .base -}}
+{{- printf "%s%s" (include "rrcs.resourcePrefix" .root) .base -}}
 {{- end -}}
 {{- end -}}

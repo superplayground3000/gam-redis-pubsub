@@ -25,15 +25,41 @@ spec:
       - key: app
         operator: In
         values: [connect-source, {{ range $g := (include "rrcs.connect.sinkGroups" $ | fromYamlArray) }}{{ if $g.enabled }}{{ $g.appLabel }}, {{ end }}{{ end }}writer, latency-calculator]
+      # Release-scoped: two releases of this chart in one namespace both label
+      # their Services `app: connect-source` (etc.); without this ANDed match each
+      # release's ServiceMonitor would scrape BOTH releases' Services and merge
+      # their series. The scoped Services carry `release: {{ "{{" }} .Release.Name {{ "}}" }}`.
+      - key: release
+        operator: In
+        values: [{{ .Release.Name }}]
+  {{- /* When connect.envId is set, stamp a static `env` label onto every series
+       scraped through this ServiceMonitor (source + sink groups + writer +
+       latency-calculator + elector), so Grafana's $env variable and per-env alert
+       routing work off pipeline metrics directly (design §9). This is the
+       "external label" route: pipeline metrics carry env via this relabeling +
+       namespace/job, while the NATS-exporter A1/A6 series (durable-labelled only)
+       recover env via label_replace on the durable name in a later phase. Empty
+       envId emits nothing here => byte-identical. */}}
+  {{- $env := include "rrcs.envId" . }}
   endpoints:
     # `http` matches connect (4195), writer (8081), latency-calculator (8082) —
     # every selected Service names its metrics port `http`.
     - port: http
       path: /metrics
       interval: {{ .Values.observability.serviceMonitor.interval }}
+      {{- if ne $env "" }}
+      relabelings:
+        - targetLabel: env
+          replacement: {{ $env | quote }}
+      {{- end }}
     # `elector` exists only on the connect Services (sidecar on 8090); Services
     # without a port of this name are simply not scraped by this endpoint.
     - port: elector
       path: /metrics
       interval: {{ .Values.observability.serviceMonitor.interval }}
+      {{- if ne $env "" }}
+      relabelings:
+        - targetLabel: env
+          replacement: {{ $env | quote }}
+      {{- end }}
 {{- end }}

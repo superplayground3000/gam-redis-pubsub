@@ -16,11 +16,13 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" $g.deployBase) }}
   labels:
     app: {{ $g.appLabel }}
+    release: {{ $.Release.Name }}
 spec:
   replicas: {{ $g.replicas }}
   selector:
     matchLabels:
       app: {{ $g.appLabel }}
+      release: {{ $.Release.Name }}
   template:
     metadata:
       labels:
@@ -166,10 +168,12 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" $g.deployBase) }}
   labels:
     app: {{ $g.appLabel }}
+    release: {{ $.Release.Name }}
 spec:
   clusterIP: None
   selector:
     app: {{ $g.appLabel }}
+    release: {{ $.Release.Name }}
   ports:
     - name: http
       port: 4195

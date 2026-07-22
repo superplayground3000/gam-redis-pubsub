@@ -1,0 +1,90 @@
+# Example values for a SINK-ONLY release (one downstream environment).
+#
+# What this shows:
+#   - How to run a sink-only release: it binds a durable consumer on the shared
+#     JetStream stream and applies to its OWN region Redis, but publishes nothing.
+#   - How connect.envId scopes this env's durable, DLQ lane, resource names, and
+#     metrics so MANY sink envs can share one stream without colliding.
+#
+# Where this fits (multi-env mixed-sink topology, docs/design/multi-env-mixed-sink):
+#   Exactly one publisher release owns the forward leg (see values-publisher.yaml).
+#   Each downstream environment — like this one — is its own sink-only release with
+#   its own region Redis. JetStream fans one published copy of every event out to
+#   each env's durable server-side, so every env gets a FULL copy of the stream.
+#
+# Install example (bundled NATS, fresh namespace — one per env):
+#   helm upgrade --install rrcs-enva ./chart -n rrcs-enva --create-namespace \
+#     -f chart/examples/values-sink-only.yaml
+#
+# Render check (L1, seconds):
+#   helm template chart/ -f chart/examples/values-sink-only.yaml >/dev/null
+
+# Leave resourcePrefix empty on a sink-only release so it defaults to "<envId>-"
+# (here "enva-"), namespacing every rendered object by env without you repeating
+# it. Set it explicitly if you have your own naming convention — an explicit value
+# always wins over the envId-derived default.
+resourcePrefix: ""
+
+connect:
+  # The per-release environment id. THIS is what makes multi-env safe: it scopes the
+  # durable base (cdc_sink -> cdc_sink_enva), the DLQ lane and its dedup msg-id, the
+  # resourcePrefix default, and the Prometheus `env` label — all from one knob. Two
+  # sink envs on the SAME durable name would SHARE one ack floor and split the
+  # stream between them (each seeing only part of it) instead of each getting a full
+  # copy, so every env MUST set a distinct envId.
+  #
+  # Grammar: a DNS-1123 label (lowercase alnum + dashes, no underscores/dots/
+  # uppercase), at most 16 chars — validated fail-loud at render. IMMUTABLE for the
+  # life of the release: renaming it mints a brand-new durable from a fresh ack
+  # floor (a full --deliver-all replay), orphans the old durable, and moves the DLQ
+  # lane (stranding parked poison). Pick it once, per env, and never change it live.
+  envId: "enva"
+
+  source:
+    # No forward leg on a sink-only release — the single publisher release owns it.
+    # With the source off the chart renders no source Deployment, Service, source
+    # pipeline ConfigMap, or source elector.
+    enabled: false
+
+  sink:
+    # Render the reverse (sink) leg: NATS -> this env's region Redis. With the
+    # default (empty) connect.sinkGroups the chart synthesises one whole-stream
+    # ("all-in-one") group whose durable is env-scoped to cdc_sink_enva and whose
+    # filter is the whole stream (kv.cdc.aio.> in segment mode, kv.cdc.> otherwise)
+    # — this env receives a full copy of every event, sharded families included
+    # (the whole-stream filter is a superset of the per-shard subjects).
+    enabled: true
+
+    # Start this NEW env at the stream head — replay NOTHING. This is the safe
+    # go-forward default for onboarding a fresh env: a durable created with the
+    # legacy --deliver all would instead replay the whole 72h retained backlog of
+    # CHANGES (a partial history, NOT a snapshot), leaving an inconsistent region
+    # Redis. With deliver: new the EXTERNAL nats-init also VALIDATES an existing
+    # durable's start semantics and fails closed if a stale --deliver all consumer
+    # is squatting on this durable name (design §8.4, R3). To seed a fully-correct
+    # region instead, use deliver: by-time with byStartTime = your snapshot instant
+    # — see docs/design/multi-env-mixed-sink/runbook-new-env-bootstrap.md.
+    #
+    # NOTE: this switch is acted on by the EXTERNAL nats-init only — the real
+    # multi-env case is a shared external PROD stream (set nats.external.* as in
+    # values-dlq.yaml). The bundled-NATS demo install above ignores it and creates
+    # its throwaway consumer --deliver all, which is harmless for a disposable
+    # in-cluster Redis.
+    bootstrap:
+      deliver: new
+
+  # Turn the DLQ on so this env parks a poison message it can never apply instead of
+  # head-of-line-blocking its whole consumer forever. Each env parks on its OWN lane
+  # and its own dedup key — the DLQ subject and msg-id are env-scoped
+  # (dlq.cdc.enva.<reason> / msg-id dlq.enva.<event_id>) so one env's park can never
+  # dedup-swallow another's. Leave it off only if this env is genuinely poison-free
+  # and you accept a stuck consumer on the first unprocessable message.
+  deadLetter:
+    enabled: true
+    subject: "dlq.cdc"
+
+# Point this release at its OWN region Redis (distinct per env — an env's applies
+# must never race another env's on a shared region Redis). Bundled mode deploys a
+# throwaway in-cluster Redis; for real environments set redis.region.external.* to
+# your managed instance. See values-dlq.yaml / values-all-in-one.yaml for the full
+# external-Redis and credential notes, which apply unchanged to a sink-only release.

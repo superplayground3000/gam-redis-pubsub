@@ -5,11 +5,13 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator") }}
   labels:
     app: latency-calculator
+    release: {{ .Release.Name }}
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: latency-calculator
+      release: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -61,9 +63,11 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "latency-calculator") }}
   labels:
     app: latency-calculator
+    release: {{ .Release.Name }}
 spec:
   selector:
     app: latency-calculator
+    release: {{ .Release.Name }}
   ports:
     - name: http
       port: 8082

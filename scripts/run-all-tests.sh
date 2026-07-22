@@ -15,6 +15,30 @@
 #   (with RUN_FAILOVER=1) verify-sharding-failover.sh + verify-sharding-replay.sh
 #   at L4. measure-shard-throughput.sh (T-8, tc netem) and
 #   sharding-cutover-drill.sh (T-10) stay manual-only.
+# RUN_MULTIENV=1 additionally runs the multi-env mixed-sink L3 proofs (design
+#   docs/design/multi-env-mixed-sink, P7) in namespace cdc-menv/cdc-sdlq:
+#   verify-multi-env.sh (one publisher + a sharded env A + an AIO env B on ONE
+#   stream: fan-out, env-disjoint durables, poison cross-park with no dedup-swallow,
+#   env-A-poison isolation from env B, env attribution, and an OPTIONAL topology-
+#   manifest fail-closed gate) and verify-sharded-dlq-e2e.sh (the focused sharded
+#   park-then-ack proof). verify-multi-env.sh FOLDS IN the old
+#   verify-multi-env-cross-park.sh (its assertion C is the cross-park E2 proof
+#   generalized to an AIO+sharded pair), which was deleted. The manifest gate needs
+#   the user-provisioned $KV.cdc_topology.> grant (design §7) that gen-nats-auth.sh
+#   does not mint; without it that ONE assertion self-skips loudly (MANIFEST_GATE=
+#   require to force it, =skip to suppress).
+#   STANDALONE ONLY — like RUN_E2E_MATRIX, do NOT co-run with RUN_PREFIX/RUN_SHARDING
+#   in the same invocation: two live multi-release installs (~3 connect legs for env
+#   A + 1 for env B, plus the P5 sharded-DLQ release) plus those suites' cdc-mg/
+#   cdc-shard releases oversubscribe connect CPU limits and flake the quiescence
+#   polls. Separate namespaces prevent name collision but not CPU co-tenancy.
+# RUN_HANDOFF=1 additionally runs verify-env-reshard-handoff.sh in namespace cdc-hoff
+#   at L3: mechanizes runbook-aio-to-sharded-handoff.md end-to-end (quiesce + read
+#   F0, F1 filter-coverage gate, precreate shard durables at F0+1 via the P6
+#   assert-only mode incl. a NEGATIVE missing-durable case, no-loss + no-reorder +
+#   R2 across the cutover, second env keeps flowing). STANDALONE ONLY — same CPU
+#   co-tenancy caveat as RUN_MULTIENV (host publisher+AIO sink + migrating env =
+#   several connect legs); run it alone or after scaling other suites to 0.
 # RUN_E2E_MATRIX=1 additionally runs the permanent e2e MATRIX (verify-e2e-matrix.sh)
 #   in namespace cdc-e2e at L3: one install coexisting sharded lb:company + 2-seg
 #   tg:caveat + catchAll (P1 render, P2 traffic/isolation/ordering/loss, P3 graceful
@@ -74,12 +98,18 @@ MB=$(git merge-base master HEAD 2>/dev/null || true)
 # so the render stays byte-exact everywhere a gating leak could appear. Long
 # Bloblang/args_mapping lines are safe from the base64 pattern: quotes, parens
 # and spaces break the 60+ run.
+# Also stripped since 280034f: the release-scoped `release: <name>` selector/label
+# lines — a DELIBERATE default-render change (cross-release wiring fix: bare app:
+# selectors round-robined connections across same-namespace releases). The value
+# is the helm release name, deterministic and content-free, so stripping it
+# cannot mask a gating leak.
 norm_render() {
   sed -E \
     -e 's/nats-init-[0-9a-f]{8}/nats-init-CREDSHASH/g' \
     -e '/[A-Za-z0-9+\/=_.-]{60,}/d' \
     -e '/^[[:space:]]*system_account:/d' \
     -e '/^[[:space:]]*\/\/ Account /d' \
+    -e '/^[[:space:]]*release: /d' \
     -e '/^[[:space:]]*$/d'
 }
 if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; then
@@ -114,18 +144,34 @@ for badsub in 'dlq.cdc.>' 'dlq..cdc' 'dlq.cdc.' '.dlq.cdc' 'dlq.*.cdc' 'dlq cdc'
     echo "L1: malformed deadLetter.subject '$badsub' must fail-loud"; fail L1
   fi
 done
-# fail-loud B: DLQ + subject-sharding v2 is an unsupported mix (the sharded sink
-# has no DLQ routing) — the chart must reject deadLetter.enabled=true whenever
-# connect.sharding.families is configured. Reuse the same valid sharded family
-# used by the sharding section below; it renders fine on its own (proven there),
-# so the ONLY reason this render fails is the DLQ+sharding guard.
-if helm template chart/ \
+# B: DLQ + subject-sharding v2 is now SUPPORTED (design §5, E2-E4; P5 removed the old
+# mutual-exclusion). The sharded sink carries the same park-then-ack switch output as
+# the AIO sink, env-scoped. Render it (segment mode + envId) and assert the park lane,
+# the env-scoped subject/msg-id, and the dlq_env/dlq_shard headers appear.
+SHARDED_DLQ_OUT=$(helm template chart/ \
+     --set connect.envId=enva \
+     --set connect.deadLetter.enabled=true \
+     --set connect.deadLetter.segment=dlq \
+     --set nats.stream.normalSegment=aio \
      --set 'connect.sharding.families.lb:company.shards=4' \
      --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' \
-     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
-     --set connect.deadLetter.enabled=true >/dev/null 2>&1; then
-  echo "L1: deadLetter.enabled=true with subject-sharding families must fail-loud"; fail L1
-fi
+     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}') \
+  || { echo "L1: DLQ + sharding must RENDER now (P5 removed the exclusion)"; fail L1; }
+grep -qF 'kv.cdc.dlq.enva.${! meta("dlq_reason") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ output must park on the env-scoped subject"; fail L1; }
+grep -qF 'Nats-Msg-Id: dlq.enva.${! meta("event_id") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ msg-id must be env-scoped (dlq.<envId>.<event_id>)"; fail L1; }
+grep -q 'label: dlq_out'   <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ output missing the dlq_out park branch"; fail L1; }
+grep -qF 'dlq_env: "enva"' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded park copy missing dlq_env header"; fail L1; }
+grep -qF 'dlq_shard: ${! meta("shard") }' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded park copy missing dlq_shard header"; fail L1; }
+grep -q 'reason: hash_decode_error' <<<"$SHARDED_DLQ_OUT" || { echo "L1: sharded DLQ render missing hash_decode_error counter (E3)"; fail L1; }
+# E3: the hash-guard counter renders UNCONDITIONALLY on the sharded path — present even
+# with the DLQ OFF (closes the pre-existing un-counted VF-8 poison hole). But the park
+# lane (dlq_out) must NOT appear when the DLQ is off.
+SHARDED_NODLQ_OUT=$(helm template chart/ \
+     --set 'connect.sharding.families.lb:company.shards=4' \
+     --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' \
+     --set 'connect.sinkGroups[0].shards={0,1,2,3,x}') || fail L1
+grep -q 'reason: hash_decode_error' <<<"$SHARDED_NODLQ_OUT" || { echo "L1: sharded (DLQ off) must still count hash_decode_error (E3, closes VF-8)"; fail L1; }
+grep -q 'label: dlq_out' <<<"$SHARDED_NODLQ_OUT" && { echo "L1: sharded park lane leaked into the DLQ-off render"; fail L1; } || true
 grep -q 'reason: hash_decode_error' <<<"$DLQ_OUT" || { echo "L1: missing hash_decode_error counter"; fail L1; }
 grep -q 'cdc_dlq_forwarded'        <<<"$DLQ_OUT" || { echo "L1: missing cdc_dlq_forwarded counter"; fail L1; }
 grep -q 'hash_decode_failed'       <<<"$DLQ_OUT" || { echo "L1: missing hash guard"; fail L1; }
@@ -177,6 +223,25 @@ for d in yaml.safe_load_all(sys.stdin):
   LINT_OUT=$(printf '%s' "$REV_PIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label '__POD__'" || true)
   if [ -n "$LINT_OUT" ]; then echo "L1: enabled DLQ reverse pipeline fails redpanda-connect lint:"; echo "$LINT_OUT"; fail L1; fi
   echo "[run-all-tests] L1: enabled DLQ pipeline lints clean on $CONNECT_IMG"
+  # SHARDED DLQ pipeline lint (P5): the sharded park output uses the SAME switch-output-
+  # under-reject_errored construct that once shipped an invalid `processors`-under-a-case
+  # bug (rules/50-lessons.md 2026-07-14). L3 runs with the DLQ OFF and the non-sharded
+  # lint above never sees the sharded render, so this is the ONLY tier that validates the
+  # DLQ-enabled SHARDED pipeline loads in the real Connect binary. Lint every rendered
+  # sharded sink pipeline from SHARDED_DLQ_OUT.
+  while IFS= read -r SPIPE_B64; do
+    [ -z "$SPIPE_B64" ] && continue
+    SPIPE=$(printf '%s' "$SPIPE_B64" | base64 -d)
+    SLINT=$(printf '%s' "$SPIPE" | docker run --rm -i "$CONNECT_IMG" lint /dev/stdin 2>&1 | grep -v "invalid label" || true)
+    if [ -n "$SLINT" ]; then echo "L1: enabled SHARDED DLQ pipeline fails redpanda-connect lint:"; echo "$SLINT"; fail L1; fi
+  done < <(python3 -c '
+import sys,yaml,base64
+for d in yaml.safe_load_all(sys.stdin):
+  if d and d.get("kind")=="ConfigMap":
+    for k,v in (d.get("data") or {}).items():
+      if v and "copies: 1" in v and "reject_errored" in v and "dlq_out" in v:
+        print(base64.b64encode(v.encode()).decode())' <<<"$SHARDED_DLQ_OUT")
+  echo "[run-all-tests] L1: enabled SHARDED DLQ pipeline(s) lint clean on $CONNECT_IMG"
   # Behavioral guard test (rules/50-lessons.md 2026-07-15: templated Bloblang needs a
   # got-vs-want run of the REAL rendered pipeline — lint proves loadability, never
   # semantics; the meta-vs-let guard bug lints clean and silently never fires).
@@ -340,6 +405,62 @@ done
 if grep -q 'kv.cdc.aio' <<<"$DEFAULT_OUT"; then
   echo "[run-all-tests] default render leaked shared-prefix segment layout (kv.cdc.aio)"; fail L1
 fi
+
+# ── Sink bootstrap start policy + start-semantics validation (P4, design §8.4/R3) ──
+# The EXTERNAL nats-init maps connect.sink.bootstrap.deliver -> the consumer's start
+# policy AND validates an EXISTING durable's start semantics. Capture-then-grep.
+EXT_AUTH=(--set nats.external.enabled=true --set nats.external.url=nats://x:4222
+          --set nats.external.auth.subscriberSecret=s --set nats.external.auth.adminSecret=a
+          --set nats.external.auth.publisherSecret=p)
+BS_NEW_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=new) || fail L1
+grep -q 'deliver_policy'   <<<"$BS_NEW_OUT" || { echo "L1: P4 external init missing existing-durable start-semantics (deliver_policy) validation"; fail L1; }
+grep -qF -- '--deliver new' <<<"$BS_NEW_OUT" || { echo "L1: P4 bootstrap.deliver=new must create with --deliver new"; fail L1; }
+grep -q 'allowStartMismatch' <<<"$BS_NEW_OUT" || { echo "L1: P4 start-semantics validation missing the allowStartMismatch escape hatch"; fail L1; }
+BS_ALL_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=all) || fail L1
+grep -qF -- '--deliver all' <<<"$BS_ALL_OUT" || { echo "L1: P4 bootstrap.deliver=all must create with --deliver all"; fail L1; }
+BS_BT_OUT=$(helm template chart/ "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=by-time --set connect.sink.bootstrap.byStartTime=2026-01-01T00:00:00Z) || fail L1
+grep -q 'by_start_time\|2026-01-01' <<<"$BS_BT_OUT" || { echo "L1: P4 bootstrap.deliver=by-time must anchor at byStartTime"; fail L1; }
+# bundled render is INERT to bootstrap (throwaway consumer, no start-semantics gate).
+BS_BUNDLED_OUT=$(helm template chart/ --set connect.sink.bootstrap.deliver=new) || fail L1
+if grep -q 'deliver_policy' <<<"$BS_BUNDLED_OUT"; then
+  echo "L1: P4 bootstrap.deliver leaked start-semantics validation into the BUNDLED init (should be external-only, inert)"; fail L1
+fi
+# fail-loud: invalid enum, and by-time without a timestamp.
+seg_guard P4-enum 'is invalid — must be' "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=bogus
+seg_guard P4-bytime 'requires connect.sink.bootstrap.byStartTime' "${EXT_AUTH[@]}" --set connect.sink.bootstrap.deliver=by-time
+
+# ── Assert-only handoff mode for named durables (P6, design §8.3/E7) ──
+# handoffAssertOnly makes the EXTERNAL init REFUSE to auto-create: it asserts each
+# derived durable exists and is --deliver by_start_sequence, else exit 1. The
+# ordinary create path (`consumer add "$STREAM" "$CONSUMER"`) must be compiled OUT.
+HANDOFF_SET=("${EXT_AUTH[@]}"
+  --set 'connect.sharding.families.lb:company.shards=4'
+  --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}'
+  --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true)
+# handoffStartSeq is REQUIRED with the toggle since Codex review F1 (the init
+# asserts the EXACT opt_start_seq, not just the policy).
+HANDOFF_ON_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13) || fail L1
+grep -qF 'handoff assert-only' <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only render missing the [handoff assert-only] branch"; fail L1; }
+grep -qF 'by_start_sequence'   <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must assert deliver_policy by_start_sequence"; fail L1; }
+grep -qF 'does NOT exist'      <<<"$HANDOFF_ON_OUT" || { echo "L1: P6 assert-only must fail closed (exit 1) on a MISSING durable"; fail L1; }
+grep -qE 'EXPECTED_START_SEQ="?13"?' <<<"$HANDOFF_ON_OUT" || { echo "L1: F1 exact start-seq assert missing (EXPECTED_START_SEQ must carry handoffStartSeq)"; fail L1; }
+# F1 guards: toggle without the seq, and the seq without the toggle, both fail loud.
+seg_guard F1-noseq 'handoffStartSeq is REQUIRED' "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true
+seg_guard F1-seq-noassert 'is set but connect.sink.handoffAssertOnly is not true' "${HANDOFF_SET[@]}" --set connect.sink.handoffStartSeq=13
+if grep -qE 'consumer add "\$STREAM" "\$CONSUMER"' <<<"$HANDOFF_ON_OUT"; then
+  echo "L1: P6 assert-only still executes 'consumer add' (create path not compiled out — would auto-create --deliver all, VF-16)"; fail L1
+fi
+# toggle OFF restores the create path.
+HANDOFF_OFF_OUT=$(helm template chart/ "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=false) || fail L1
+grep -qE 'consumer add "\$STREAM" "\$CONSUMER"' <<<"$HANDOFF_OFF_OUT" || { echo "L1: P6 create path missing with handoffAssertOnly=false"; fail L1; }
+# fail-loud: bundled release, and pairing with bootstrap.deliver.
+seg_guard P6-bundled 'only valid on an EXTERNAL-NATS release' \
+  --set 'connect.sharding.families.lb:company.shards=4' \
+  --set connect.sinkGroups[0].name=shard-a --set 'connect.sinkGroups[0].shardsOf=lb:company' --set 'connect.sinkGroups[0].shards={0,1,2,3,x}' \
+  --set connect.sinkGroups[1].name=others --set connect.sinkGroups[1].catchAll=true \
+  --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13
+seg_guard P6-bootstrap 'mutually exclusive with connect.sink.bootstrap.deliver' \
+  "${HANDOFF_SET[@]}" --set connect.sink.handoffAssertOnly=true --set connect.sink.handoffStartSeq=13 --set connect.sink.bootstrap.deliver=new
 
 helm template chart/ --set observability.enabled=true --set latencyCalculator.enabled=true >/dev/null || fail L1
 # Every component toggle: disabled render must drop the component's resources.
@@ -556,6 +677,15 @@ else
   # STANDALONE (see header): do not co-run with RUN_PREFIX/RUN_SHARDING (CPU co-tenancy).
   if [ "${RUN_E2E_MATRIX:-0}" = "1" ]; then
     RRCS_NS=cdc-e2e RRCS_RELEASE=cdce2e scripts/verify-e2e-matrix.sh || fail L3
+  fi
+  # STANDALONE (see header): multi-env mixed-sink proofs (P7). Own namespaces.
+  if [ "${RUN_MULTIENV:-0}" = "1" ]; then
+    RRCS_NS=cdc-menv scripts/verify-multi-env.sh || fail L3
+    RRCS_NS=cdc-sdlq RRCS_RELEASE=cdcsdlq scripts/verify-sharded-dlq-e2e.sh || fail L3
+  fi
+  # STANDALONE (see header): AIO->sharded per-env handoff (P6/P7). Own namespace.
+  if [ "${RUN_HANDOFF:-0}" = "1" ]; then
+    RRCS_NS=cdc-hoff scripts/verify-env-reshard-handoff.sh || fail L3
   fi
   pass L3
 fi

@@ -137,6 +137,77 @@ nats:
     maxBytes: "256MB"
     maxMsgSize: "1MB"
     dupeWindow: "5m"
+  # ── Topology drift manifest (multi-env drift gate, design §7 / E6) ────────────
+  # Cross-release safety net for the shared PROD stream. Each helm release renders
+  # independently, so no render-time guard can see across releases — but if the
+  # PUBLISHER's shard count N (or normalSegment / prefixes) drifts from a SINK
+  # env's, that sink derives durables for a different subject set than the forward
+  # publishes to, and the mismatched events park unconsumed until the 72h stream
+  # max-age SILENTLY discards them (a VF-16 at-least-once loss no metric catches).
+  #
+  # When enabled:
+  #   - a PUBLISHER-shaped release (connect.source.enabled) writes the resolved
+  #     taxonomy JSON {schema,normalSegment,families,prefixes} to NATS KV bucket
+  #     cdc_topology, key "current", on every nats-init run;
+  #   - a SINK-shaped release (any enabled sinkGroup) reads that key at init time
+  #     and compares the fields that affect ITS filters — normalSegment always,
+  #     families+N when it is sharded, prefixes when it has a prefixed group.
+  #     MISMATCH => the init fails closed (the release is blocked). UNREADABLE
+  #     (bucket/key missing or no grant) => fail closed on a NEW env's first
+  #     install, but fail OPEN with a loud CDCTopologyManifestUnverified log banner
+  #     + a best-effort cdc_topology/_unverified_<env> marker on a REDEPLOY, so an
+  #     emergency rollback is never blocked on the manifest bucket. First-install vs
+  #     REDEPLOY is discriminated by a cdc_topology/_verified_<env> KV marker written
+  #     after a SUCCESSFUL compare — NOT by whether the env's durables exist, so an
+  #     env whose durables the operator PRECREATED for the AIO->sharded handoff is
+  #     still treated as a first install (fail-closed) until it has verified once.
+  #
+  # OPERATIONAL CHECK (fail-open surfacing — no Prometheus alert in this lab).
+  # A real CDCTopologyManifestUnverified *alert* would need the shared ops-owned
+  # NATS KV exporter (design §9 / E10) that this lab deliberately does NOT ship;
+  # rather than ship a permanently-non-firing alert, the fail-open banner is
+  # surfaced by hand. After any redeploy, list the marker keys:
+  #   nats kv ls cdc_topology | grep '^_unverified_'      # any hit => a release
+  #     came up UNVERIFIED against the manifest (grant/bucket gap); investigate
+  #     and re-run its nats-init once the manifest is readable, then delete the
+  #     stale marker: `nats kv del cdc_topology _unverified_<env>`.
+  # See docs/design/multi-env-mixed-sink/runbook-first-sharded-env.md.
+  #
+  # Grant: the manifest put/read runs inside the nats-init Job, i.e. with the
+  # ADMIN identity — the committed lab creds carry $KV.cdc_topology.> pub on the
+  # admin user (minted by gen-nats-auth.sh; regenerated 2026-07-21 — CAUTION:
+  # that regeneration rotated the operator/account identities, same class as the
+  # 2026-07-16 DLQ-grant rotation; releases installed with older creds need a
+  # fresh NATS or a migration, see docs/dlq.md §6 Rollout). On an EXTERNAL NATS
+  # supply the equivalent grant on whatever creds you hand the init Job
+  # (nats.external.auth.adminSecret), and pre-provision the cdc_topology bucket
+  # (the init fails loud if it is missing — the chart never creates buckets on a
+  # user-owned NATS; bundled mode creates it automatically).
+  #
+  # F2 ROLLOUT RULE (design §16): before ANY publisher-taxonomy change (P3) may
+  # roll, this manifest MUST be live and EVERY sink release already registered on
+  # it (i.e. each sink has done at least one verified deploy). Turning it off
+  # reintroduces the silent-drift risk — do NOT disable it while a taxonomy change
+  # is mid-rollout. Default false keeps the init jobs byte-identical (INV-3).
+  topologyManifest:
+    enabled: false
+    # F2 taxonomy-change escape hatch (design §16 / F2). Default false.
+    #
+    # A sharded PUBLISHER owns the publish taxonomy (sharding families + N,
+    # normalSegment, sinkGroup prefixes). When it re-runs with a DIFFERENT taxonomy
+    # than the manifest already records, the init job BLOCKS the manifest overwrite
+    # (fail closed): shifting the taxonomy re-points the published subjects, and any
+    # sink release still filtering the OLD subjects would silently lose every event
+    # on a changed subject until the 72h stream max-age (VF-16). First publisher
+    # deploy (no manifest yet) is never blocked — there is nothing to break.
+    #
+    # Set true ONLY after you have rolled EVERY sink release onto the new taxonomy
+    # and confirmed each is registered on the manifest — then this run overwrites
+    # cdc_topology/current with the new taxonomy. Leave it false again afterwards.
+    # Inert unless enabled=true (with the manifest off the F2 rule rests entirely on
+    # the operator following the rollout runbook). Never touched by legacy (empty
+    # taxonomy) publishers — the guard only compares when shardingEnabled.
+    allowTaxonomyChange: false
   persistence:
     mode: emptyDir
     size: 4Gi
@@ -158,6 +229,44 @@ natsBox:
 # replicas>1 gives active/standby HA: only the Lease holder POSTs the leg's
 # pipeline; standbys idle. One Lease + stream id + ServiceAccount per leg.
 connect:
+  # ── Environment id (multi-env sink scoping) ──────────────────────────────────
+  # The single per-release identity that lets MANY downstream sink environments
+  # share ONE JetStream stream without colliding. Default "" keeps the render
+  # byte-identical to the legacy single-env chart in every dimension at once, so
+  # leaving it unset changes nothing.
+  #
+  # What it feeds (all derived from this one knob):
+  #   - Durable base: cdc_sink -> cdc_sink_<envId>; per-group cdc_sink_<envId>_<name>;
+  #     per-shard cdc_sink_<envId>_<fam>_s<K>. A durable IS a per-consumer ack floor,
+  #     so two envs on the SAME durable name would SHARE one floor and split delivery
+  #     (each sees only part of the stream) instead of each getting a full copy.
+  #     env-scoping the durable is what makes native JetStream fan-out give every env
+  #     its own complete copy.
+  #   - DLQ subject: <dlqRoot>.<envId>.<reason> (kv.cdc.dlq.<envId>.<reason> in
+  #     segment mode) and DLQ msg-id: dlq.<envId>.<event_id> — so each env parks
+  #     poison on its own lane and its own dedup key (msg-id dedup is stream-wide, so
+  #     without the env segment one env's park would dedup-swallow another's).
+  #   - resourcePrefix: when resourcePrefix is left empty it defaults to "<envId>-"
+  #     (an explicit resourcePrefix always wins).
+  #   - Prometheus `env` label on the connect legs' scraped metrics (via the
+  #     ServiceMonitor), for per-env dashboards and alert routing.
+  #
+  # Grammar (validated fail-loud at render): a DNS-1123 label
+  # ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$ — lowercase letters, digits and dashes only; no
+  # underscores, no dots, no uppercase, no leading/trailing dash — and at most 16
+  # chars. The grammar is not cosmetic: envId is concatenated into Kubernetes names
+  # (an underscore or uppercase renders fine but fails `kubectl apply`) and it is the
+  # token alerts extract back out of the durable name cdc_sink_<envId>_<fam>_s<K>
+  # (an underscore or an _s<digits> run would make that extraction ambiguous). The
+  # 16-char cap keeps the longest derived durable within its 64-char budget.
+  #
+  # IMMUTABLE for a release's life. Renaming envId does NOT rename the existing
+  # durable — it mints a NEW durable that starts from a fresh ack floor (a
+  # --deliver-all replay burst), orphans the old durable (which keeps accruing
+  # num_pending), AND moves the DLQ lane, stranding any poison already parked on the
+  # old one. Same hazard class as changing the source consumer id (INV-1 row 2): if
+  # you must re-identify an env, plan a durable split/re-adopt, never a live rename.
+  envId: ""
   image: hpdevelop/connect:4.92.0-claudefix
   # Wire format for the CDC body carried inside the NATS envelope. Only the FORWARD
   # (source) leg honors this; the REVERSE (sink) leg auto-detects per message via the
@@ -213,6 +322,21 @@ connect:
   deadLetter:
     # Turn the DLQ on for the sink leg. Leave false unless you have read the
     # subject and credentials notes below — both can bite on an in-place upgrade.
+    #
+    # SHARDED SINK (subject-sharding v2): the DLQ is now supported WITH
+    # connect.sharding.families (the old mutual-exclusion render error is gone,
+    # design §5, E2-E4). The sharded sink (cdc-reverse-sharded.yaml) carries the
+    # same park-then-ack switch output as the AIO sink: three permanent-poison
+    # classes — decode_error, hash_decode_error, unknown_op — are published to the
+    # DLQ lane and acked instead of nack-looping and head-of-line-blocking their
+    # shard forever. Transient region-Redis errors and the sx CROSSSLOT-rename
+    # fail-stop still nack (never parked). ENV-SCOPING (connect.envId, see above):
+    # each env parks on its OWN lane <dlqRoot>.<envId>.<reason> with msg-id
+    # dlq.<envId>.<event_id>, so two envs consuming one shared stream never dedup
+    # each other's parked copies away. Parked copies also carry dlq_env + dlq_shard
+    # headers (the AIO sink adds dlq_env only — it has no shard) for per-env drain
+    # correlation. The hash_decode_error counter now fires on the sharded path too,
+    # DLQ on or off (a pre-existing un-counted poison hole; INV-2).
     #
     # Credentials: the DLQ publishes with the subscriber creds, which must grant
     # pub on <subject>.> . The committed chart/files/nats-auth/ creds were
@@ -280,9 +404,12 @@ connect:
   # - connect.sinkGroups MUST be empty (G2). All-in-one OWNS the whole stream; any
   #   explicit prefix-routed group would re-consume subjects it already drains
   #   (double delivery).
-  # - connect.sharding.families MUST be empty (G3). Sharding is the opposite of
-  #   one-consumer-drains-all, and the sharded sink has no DLQ routing — the same
-  #   reason the DLQ itself is excluded with sharding.
+  # - connect.sharding.families MUST be empty (G3). Sharding is the exact opposite
+  #   of one-consumer-drains-all (K per-shard durables vs one whole-stream consumer);
+  #   a whole-stream drainer would double-consume every shard subject. NOTE: this is
+  #   NOT about DLQ support any more — the sharded sink now has its own park-then-ack
+  #   DLQ (design §5); the topology conflict is what keeps all-in-one and sharding
+  #   mutually exclusive.
   #
   # DLQ drain SLA: parked messages share the stream's retention (--retention
   # limits --discard old; lab default nats.stream.maxAge = 1h, PROD external NATS
@@ -375,6 +502,92 @@ connect:
       duration: 6s
       renewDeadline: 4s
       retryPeriod: 1s
+    # ── New-env bootstrap start policy (EXTERNAL NATS onboarding; design §8.4, R3) ──
+    # Chooses the deliver_policy the EXTERNAL nats-init job gives a durable it CREATES
+    # for this env, and — when `deliver` is non-empty — makes that job VALIDATE an
+    # already-existing durable's start semantics against this choice, FAILING CLOSED on
+    # a mismatch instead of blessing whatever position it happens to be at. This closes
+    # the F3 gap: today the init accepts any existing consumer as "usable" without
+    # inspecting deliver_policy, so a durable left from a prior `--deliver all` create
+    # silently replays 72h of history even when you want a fresh go-forward env.
+    #
+    # ONLY the external init acts on this. The bundled nats-init (bundled NATS / labs)
+    # owns and freely recreates its throwaway consumers and always creates them
+    # --deliver all — a bundled disposable region Redis does not need this switch. A
+    # bootstrap value set on a bundled release is therefore inert (see nats-init-job.yaml).
+    #
+    #   deliver:
+    #     ""        LEGACY (default): create --deliver all, run NO start-semantics
+    #               validation. Byte-identical to the pre-bootstrap chart. A future
+    #               major may flip this default to "new".
+    #     "new"     go-forward only — the durable starts at the stream head and replays
+    #               NOTHING. The safe default for a NEW env that is seeded another way
+    #               (or is change-tolerant). Needs the validation so a stale --deliver
+    #               all durable can't be silently accepted in its place (design R3/F3).
+    #     "all"     replay the whole 72h retained backlog of CHANGES (a partial history,
+    #               NOT a snapshot — VF-16). Only for a snapshot-seeded or change-tolerant
+    #               env. Same effect as legacy, but now explicit and validated.
+    #     "by-time" start at `byStartTime` (deliver_policy=by_start_time). The strict
+    #               snapshot-seed path (§8.4): snapshot the source at T0, load this env's
+    #               region Redis, then start the durable at T0 so nothing before it and
+    #               nothing after it is missed. See runbook-new-env-bootstrap.md.
+    bootstrap:
+      deliver: ""
+      # RFC3339 UTC timestamp, REQUIRED iff deliver="by-time" (and rejected otherwise so
+      # it can't be silently ignored). The stream position the durable starts from — set
+      # it to the snapshot instant T0. Passed verbatim to `nats consumer add --deliver`.
+      byStartTime: ""
+      # Escape hatch for the start-semantics validation. When an existing durable's
+      # deliver_policy / opt_start_time does NOT match `deliver`, the init fails closed
+      # by default (the operator deletes+recreates the durable, since a durable's start
+      # policy is fixed at creation and the chart never mutates a user-owned consumer).
+      # Set true to DOWNGRADE that failure to a WARN and proceed with the existing
+      # durable as-is — use only when you deliberately pre-created it and accept its
+      # position (this is also the machinery the P6 assert-only handoff builds on).
+      allowStartMismatch: false
+
+    # ── Assert-only handoff mode (AIO→sharded per-env cutover; design §8.3, E7) ──
+    # Set true ONLY during the §8.3 AIO→sharded handoff window, then turn it back
+    # OFF once the handoff completes. It makes the EXTERNAL nats-init REFUSE to
+    # auto-create any durable and instead ASSERT that every durable this release
+    # derives already exists as deliver_policy=by_start_sequence — the position the
+    # operator precreated at F0+1 (F0 = the old AIO durable's ack_floor.stream_seq,
+    # the contiguous-APPLIED prefix, read at quiesce; see runbook-aio-to-sharded-
+    # handoff.md). The EXACT start sequence is asserted too: pass the same F0+1
+    # via connect.sink.handoffStartSeq (required with this toggle) — a durable at
+    # any other sequence fails the init loud (Codex review F1, 2026-07-21).
+    #
+    # Why a whole mode instead of create-if-absent: the ordinary external init
+    # create path defaults --deliver all, so a single typo'd or missing precreate
+    # would silently build a durable that replays the entire 72h backlog (VF-16)
+    # the instant the old AIO durable is deleted. Assert-only exists precisely to
+    # catch that mistake BEFORE traffic moves — so it fails the release loud
+    # (missing durable => exit 1; wrong deliver_policy => exit 1) rather than
+    # papering over it. For the same reason it does NOT honour
+    # bootstrap.allowStartMismatch (an escape hatch would defeat the guard) and is
+    # mutually exclusive with bootstrap.deliver (a handoff release must not also
+    # declare a bootstrap start policy). It is EXTERNAL-NATS only — a bundled
+    # release carrying it fails render (bundled labs recreate from scratch).
+    handoffAssertOnly: false
+
+    # The EXACT start sequence every precreated shard durable must report — F0+1,
+    # where F0 is the old AIO durable's ack_floor.stream_seq read at quiesce (the
+    # contiguous-APPLIED prefix; see runbook-aio-to-sharded-handoff.md step 1).
+    # REQUIRED (must be a positive integer) when handoffAssertOnly=true, and
+    # FORBIDDEN otherwise — the render fails loud either way. F0 is discovered at
+    # runtime, so the operator passes it at the assert-only upgrade:
+    #   helm upgrade ... --set connect.sink.handoffAssertOnly=true \
+    #                    --set connect.sink.handoffStartSeq=$((F0+1))
+    #
+    # The assert-only init then fails closed unless EVERY derived durable is
+    # deliver_policy=by_start_sequence AND opt_start_seq == handoffStartSeq. This
+    # closes the F1 gap where the mode asserted only the POLICY and accepted ANY
+    # start sequence: a durable precreated at the wrong seq (a typo, or a stale
+    # by_start_sequence durable squatting the name at a different position) would
+    # replay too much (duplicate reapply) or skip a range (silent gap) the instant
+    # the old AIO durable is deleted. Asserting the exact seq catches that before
+    # any traffic moves. Empty/default => no handoff (handoffAssertOnly must be off).
+    handoffStartSeq: ""
 
   # ── Multi-subject sink groups (design D3) ──────────────────────────────────
   # Split the sink leg into N groups, each = (durable pull consumer × filter

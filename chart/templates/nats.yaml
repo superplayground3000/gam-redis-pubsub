@@ -23,11 +23,13 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "nats") }}
   labels:
     app: nats
+    release: {{ .Release.Name }}
 spec:
   replicas: 1
   selector:
     matchLabels:
       app: nats
+      release: {{ .Release.Name }}
   template:
     metadata:
       labels:
@@ -88,9 +90,11 @@ metadata:
   name: {{ include "rrcs.name" (dict "root" $ "base" "nats") }}
   labels:
     app: nats
+    release: {{ .Release.Name }}
 spec:
   selector:
     app: nats
+    release: {{ .Release.Name }}
   ports:
     - name: client
       port: {{ .Values.nats.clientPort }}

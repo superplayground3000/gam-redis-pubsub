@@ -1,0 +1,84 @@
+# Example values for a PUBLISHER release (the forward leg only).
+#
+# What this shows:
+#   - How to run a source-only release: it reads the central Redis stream and
+#     publishes every CDC event to NATS JetStream, but binds NO sink consumer and
+#     applies to NO region Redis.
+#   - Why a publisher parks nothing (deadLetter is off, on purpose).
+#   - The one-publisher-per-stream rule, and the P0 caveat about sharding.
+#
+# Where this fits (multi-env mixed-sink topology, docs/design/multi-env-mixed-sink):
+#   One shared JetStream stream is fanned out to MANY downstream sink environments
+#   at once. The split is: exactly ONE publisher release (this file) owns the
+#   forward leg, and each downstream env is its OWN sink-only release with its own
+#   region Redis and its own env-scoped durable (see values-sink-only.yaml).
+#   JetStream fans one published copy of each event out to every env's durable
+#   server-side, so "N envs each get a full copy" is native multi-consumer fan-out,
+#   not N publishes.
+#
+# Install example (bundled NATS, fresh namespace):
+#   helm upgrade --install rrcs-pub ./chart -n rrcs-pub --create-namespace \
+#     -f chart/examples/values-publisher.yaml
+#
+# Render check (L1, seconds):
+#   helm template chart/ -f chart/examples/values-publisher.yaml >/dev/null
+
+connect:
+  source:
+    # Render the forward (source) leg: central Redis -> NATS. This is the whole job
+    # of a publisher release. Keep consumerClientId at its stable role-scoped
+    # default (cdc_propagator_active) — a pod-scoped id orphans the Redis PEL on a
+    # SIGKILL failover and loses messages (INV-1 row 2). Leave it untouched here.
+    enabled: true
+
+  sink:
+    # No sink leg on a publisher release: it binds no durable consumer and writes to
+    # no region Redis. With the sink off the chart renders no sink Deployment,
+    # Service, pipeline ConfigMap, or sink elector — the release is forward-only.
+    enabled: false
+
+  # A publisher parks NOTHING, so the DLQ is explicitly OFF (design D-fwd). The DLQ
+  # park machinery lives entirely in the SINK pipeline (cdc-reverse*.yaml), gated by
+  # an enabled sink group; a source-only release renders no sink pipeline at all, so
+  # there is nothing to park with and no dead-letter subject to own. Dead-lettering
+  # is a per-env decision made on each sink-only release, not here. (This is also
+  # the chart default — stated explicitly so the publisher's intent is unmistakable
+  # and a later edit can't quietly turn parking on for a leg that has no sink.)
+  deadLetter:
+    enabled: false
+
+  # ── Publish taxonomy: declare sharding families to feed sharded sink envs ──────
+  #
+  # A publisher declares the publish taxonomy — the sharding families (and their
+  # shard count N) whose per-shard subjects the forward leg emits. Since P3
+  # (docs/design/multi-env-mixed-sink §3.2 / E5) this is a PUBLISHER-SIDE property,
+  # decoupled from locally-enabled sink groups: declaring a family here makes the
+  # forward publish kv.cdc.lp.m2g.s<K>.<op> (and route non-family keys to
+  # kv.cdc.others.<op>) even though this release owns NO sink group. Downstream
+  # SHARDED sink releases claim {0..N-1,x} across their sinkGroups and filter those
+  # per-shard subjects; this publisher just produces them.
+  #
+  # The shard-coverage guard (INV-S4) does NOT fire here — it is scoped to
+  # sink-carrying releases, and a publisher (sink.enabled=false, no sinkGroups) is
+  # not one. The publisher's cross-release safety net is instead the topology
+  # manifest (nats.topologyManifest.enabled): it records this taxonomy and each sink
+  # init fails closed if its own families/N/prefixes drift from it.
+  #
+  # Declaring ANY family forces the SERIALIZED forward (threads:1 + max_in_flight:1,
+  # INV-1 row 13) for the WHOLE stream — the ~1/RTT ceiling then applies to every
+  # env, including AIO envs (design R1). Pick N once, over-provisioned; changing it
+  # later is a global pause/drain event.
+  #
+  # ── F2 ROLLOUT WARNING (design §16) ───────────────────────────────────────────
+  # Enabling the first family flips the publish subject GLOBALLY: every non-family
+  # subject shifts kv.cdc.<op> -> kv.cdc.<prefix|others>.<op>. A sharded sink with no
+  # enabled catch-all group then misses ALL non-family traffic (CDCForwardUnrouted).
+  # SEQUENCE A CATCH-ALL SINK GROUP FIRST, and roll it before declaring the family
+  # here. And once the manifest is live (nats.topologyManifest.enabled), CHANGING
+  # this taxonomy on a later run is blocked by the F2 guard unless you set
+  # nats.topologyManifest.allowTaxonomyChange=true AFTER every sink release is
+  # already on the new subjects — do not shift the publisher ahead of the consumers.
+  sharding:
+    families:
+      "lp:m2g":
+        shards: 32
