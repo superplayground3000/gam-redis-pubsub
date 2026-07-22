@@ -1,0 +1,66 @@
+# values-sink-aio.yaml — sink env #1: ALL-IN-ONE (1 consumer, own region Redis)
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-env worked example, part 2 of 3 (see README.md in this directory).
+# Consumes the SAME stream as values-sink-sharded.yaml — a full independent copy.
+#
+# Render:
+#   helm template aio chart/ -f chart/examples/multi-env/values-sink-aio.yaml
+#
+# What to look for in the render:
+#   - SINK_GROUPS carries ONE durable:
+#       cdc_sink_aioenv|kv.cdc.aio.>|30s|1024|false
+#     The filter kv.cdc.aio.> is a SUPERSET wildcard: the shard-tokenized
+#     subjects the publisher emits (kv.cdc.aio.lb.company.s2.create) are just
+#     extra tokens under '>' — this env never needs to know sharding exists.
+#   - The durable name carries envId ("aioenv") so its ack floor is disjoint
+#     from the sharded env's durables on the same stream.
+#   - Ordering note: AIO = threads:4 + maxAckPending:1024 — NO per-key order
+#     guarantee (unchanged legacy semantics). Want strict order? That is what
+#     the sharded shape is for.
+
+resourcePrefix: "aioenv-"
+
+connect:
+  # THE env identity. Feeds the durable base (cdc_sink_aioenv), the DLQ lane
+  # (kv.cdc.dlq.aioenv.<reason>), the park msg-id prefix (dlq.aioenv.<eid>) and
+  # the Prometheus env label. DNS-1123, ≤16 chars, IMMUTABLE across redeploys
+  # (renaming it = a brand-new ack floor + a stranded DLQ lane).
+  envId: "aioenv"
+
+  source:
+    enabled: false           # sink-only release — the publisher owns the forward.
+  sink:
+    enabled: true
+    bootstrap:
+      deliver: new           # fresh env starts at NEW messages (no 72h partial
+                             # replay); the external init fails closed if a stale
+                             # durable with a different start policy already exists.
+  sinkAllInOne:
+    enabled: true            # the AIO preset: ONE whole-segment consumer…
+  deadLetter:
+    enabled: true            # …which REQUIRES the DLQ (G1): one ack floor for
+    segment: "dlq"           # every key family means the first poison message
+                             # would head-of-line-block the entire env forever.
+                             # Parks land on kv.cdc.dlq.aioenv.<reason>.
+
+nats:
+  stream:
+    normalSegment: "aio"     # MUST match the publisher's declaration (the
+                             # topology manifest enforces this at init).
+  topologyManifest:
+    enabled: true
+  # Point at the shared stream. In-cluster demo: the publisher release's bundled
+  # NATS Service + its minted creds Secrets (copy them into this namespace, or
+  # install both releases in one namespace). Real PROD: your external NATS url
+  # + your own creds Secrets (admin needs $KV.cdc_topology.> for the manifest).
+  external:
+    enabled: true
+    url: "nats://pub-nats:4222"
+    auth:
+      subscriberSecret: "pub-subscriber-creds"
+      adminSecret: "pub-admin-creds"
+
+writer:
+  enabled: false
+# This env's OWN region Redis stays bundled (aioenv-redis-region). Its central
+# Redis is unused in a sink-only release; the writer is off.
