@@ -1,0 +1,78 @@
+# values-sink-sharded.yaml — sink env #2: SHARDED (6 consumers, own region Redis)
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-env worked example, part 3 of 3 (see README.md in this directory).
+# Consumes the SAME stream as values-sink-aio.yaml — a full independent copy,
+# but with strict per-key ordering (subject-sharding v2).
+#
+# Render:
+#   helm template shard chart/ -f chart/examples/multi-env/values-sink-sharded.yaml
+#
+# What to look for in the render — the SIX durables (SINK_GROUPS):
+#   cdc_sink_shardenv_lb_company_s0|kv.cdc.aio.lb.company.s0.>|30s|1|true
+#   cdc_sink_shardenv_lb_company_s1|kv.cdc.aio.lb.company.s1.>|30s|1|true
+#   cdc_sink_shardenv_lb_company_s2|kv.cdc.aio.lb.company.s2.>|30s|1|true
+#   cdc_sink_shardenv_lb_company_s3|kv.cdc.aio.lb.company.s3.>|30s|1|true
+#   cdc_sink_shardenv_lb_company_sx|kv.cdc.aio.lb.company.sx.>|30s|1|true   (isolation)
+#   cdc_sink_shardenv_others       |kv.cdc.aio.others.>       |30s|1024|false (catch-all)
+#   (record fields: durable|filter|ackWait|maxAckPending|shardPinned)
+#   - Each shard durable pins max_ack_pending=1 (hard-coded — ordering link
+#     O-6; never inherited from sinkDefaults).
+#   - The UNION of the six filters ⊇ everything the publisher emits under
+#     kv.cdc.aio.> — same traffic the AIO env sees, split for parallel fetch +
+#     strict per-key order.
+#   - Every durable name carries envId ("shardenv"): disjoint ack floors from
+#     the AIO env's cdc_sink_aioenv on the very same stream.
+
+resourcePrefix: "shardenv-"
+
+connect:
+  envId: "shardenv"          # see values-sink-aio.yaml for the envId contract.
+
+  source:
+    enabled: false
+  sink:
+    enabled: true
+    bootstrap:
+      deliver: new
+  deadLetter:
+    enabled: true            # sharded DLQ (park-then-ack): poison parks on
+    segment: "dlq"           # kv.cdc.dlq.shardenv.<reason> and the shard
+                             # UNBLOCKS instead of nack-looping forever. The
+                             # msg-id dlq.shardenv.<eid> never collides with the
+                             # AIO env's park of the SAME event (stream-wide
+                             # dedup is msg-id-keyed — both copies land).
+
+  # The family declaration MUST match the publisher byte-for-byte (same name,
+  # same N, same keyPattern) — the topology manifest fails this release closed
+  # at init if it drifts (e.g. you bump the publisher to N=8 and forget this).
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'
+    families:
+      "lb:company":
+        shards: 4
+
+  # 6 consumers = one group claiming all 4 shards + the isolation lane, plus a
+  # catch-all group for non-family traffic. Split the shards across MORE groups
+  # (each group = one Deployment) when one pod's serialized fetch is not enough:
+  # e.g. {0,1} / {2,3,x} / others = 3 Deployments, same 6 durables.
+  sinkGroups:
+    - name: shard-a
+      shardsOf: "lb:company"
+      shards: [0, 1, 2, 3, "x"]
+    - name: others
+      catchAll: true
+
+nats:
+  stream:
+    normalSegment: "aio"     # must match the publisher (manifest-enforced).
+  topologyManifest:
+    enabled: true
+  external:                  # same shared stream as the AIO env — see the
+    enabled: true            # credential notes in values-sink-aio.yaml.
+    url: "nats://pub-nats:4222"
+    auth:
+      subscriberSecret: "pub-subscriber-creds"
+      adminSecret: "pub-admin-creds"
+
+writer:
+  enabled: false

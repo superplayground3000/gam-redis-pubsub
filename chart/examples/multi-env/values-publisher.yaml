@@ -1,0 +1,73 @@
+# values-publisher.yaml — the ONE shared source (publisher-only release)
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-env worked example, part 1 of 3 (see README.md in this directory).
+#
+# Topology this trio builds: ONE source Redis + ONE JetStream stream feeding
+# TWO independent sink environments at once —
+#   values-sink-aio.yaml      → 1 whole-segment consumer  (cdc_sink_<envId>)
+#   values-sink-sharded.yaml  → 6 consumers               (s0..s3 + sx + others)
+#
+# This release is the ONLY writer-side deployment: it runs the forward leg
+# (source Redis → JetStream) and hosts the taxonomy declaration. It deploys NO
+# sink. Exactly ONE publisher release may exist per stream (operational
+# invariant — two would collide on the Redis consumer group cdc_propagator).
+#
+# Render:
+#   helm template pub chart/ -f chart/examples/multi-env/values-publisher.yaml
+#
+# What to look for in the render (the "how can one source serve both?" answer):
+#   - connect-source pipeline publishes to
+#       kv.cdc.aio.${! meta("kv_prefix") }.${! meta("op") }
+#     For family keys the shard token is folded INTO kv_prefix by the forward
+#     (lb:company + employee id mod 4 → "lb.company.s2"), non-family keys route
+#     to "others". ONE publish per event — JetStream fans out server-side to
+#     however many durables exist; the publisher never knows who consumes.
+#   - pipeline.threads: 1 and max_in_flight: 1 on the forward — declaring ANY
+#     sharding family serializes the forward (ordering links O-3/O-4). This is
+#     a GLOBAL ceiling (~1/RTT) shared by every env, including the AIO one.
+
+resourcePrefix: "pub-"
+
+connect:
+  source:
+    enabled: true            # the forward leg lives here…
+  sink:
+    enabled: false           # …and ONLY here — no sink in the publisher release.
+  deadLetter:
+    enabled: false           # the publisher parks nothing; DLQ is a sink concern.
+    segment: "dlq"           # …but the LAYOUT is declared stream-wide: the DLQ
+                             # subtree lives in-prefix at kv.cdc.dlq.> (segment
+                             # mode). Sink releases must declare the same segment.
+
+  # ── the publish taxonomy: a PUBLISHER-side declaration ─────────────────────
+  # Declaring a family here is what makes the forward emit per-shard subjects.
+  # It does NOT require any local sink group (P3 decoupling): the sink-less
+  # render is valid and emits shard tokens.
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'
+    families:
+      "lb:company":
+        shards: 4            # → subjects kv.cdc.aio.lb.company.s0..s3.<op> (+sx).
+                             # Pick N ONCE, over-provisioned — resharding needs a
+                             # global pause-drain (design R1).
+
+nats:
+  stream:
+    # Shared-prefix segment layout: ALL normal traffic under kv.cdc.aio.>, the
+    # DLQ under kv.cdc.dlq.>. The stream keeps binding the superset kv.cdc.>.
+    normalSegment: "aio"
+
+  # Drift protection (STRONGLY recommended in multi-env): the publisher writes
+  # {normalSegment, families+N, prefixes} to KV bucket cdc_topology; every sink
+  # release compares at init and FAILS CLOSED on mismatch — e.g. a sink still
+  # built for N=8 against this N=4 publisher never comes up half-wired.
+  # Changing the taxonomy later requires allowTaxonomyChange=true (F2 guard).
+  topologyManifest:
+    enabled: true
+
+# Bundled NATS + central Redis for a self-contained demo. On a real PROD
+# deployment the stream is external: set nats.external.* here and hand the SAME
+# url/creds to both sink values files.
+
+writer:
+  enabled: false             # drive traffic yourself (XADD) or enable the lab writer.
