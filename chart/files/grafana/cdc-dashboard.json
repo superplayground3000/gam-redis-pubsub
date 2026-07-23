@@ -35,40 +35,30 @@
         { "expr": "histogram_quantile(0.95, sum by (le) (rate(processor_latency_ns_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "p95" },
         { "expr": "histogram_quantile(0.99, sum by (le) (rate(processor_latency_ns_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "p99" }
       ] },
-    { "id": 7, "title": "End-to-end CDC latency percentiles (s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "description": "cdc_latency_seconds from the latency-calculator (region XADD timestamp delta, rolling window). Its job label differs from the connect legs, so this panel scopes by namespace only.",
-      "fieldConfig": { "defaults": { "unit": "s" } },
-      "targets": [ { "expr": "cdc_latency_seconds{namespace=~\"$namespace\",op=\"overall\"}", "legendFormat": "{{quantile}}" } ] },
-    { "id": 8, "title": "Writer throughput & errors (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
-      "description": "cdc_writer_* from the writer's own job (scoped by namespace only — the $job variable tracks the connect legs).",
-      "targets": [
-        { "expr": "sum by (op) (rate(cdc_writer_ops_total{namespace=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "{{op}}" },
-        { "expr": "sum(rate(cdc_writer_errors_total{namespace=~\"$namespace\"}[$__rate_interval]))", "legendFormat": "errors" }
-      ] },
-    { "id": 9, "title": "Elector leadership & lease ops", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+    { "id": 9, "title": "Elector leadership & lease ops", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "description": "elector_leading per pod (1 = holds the Lease; exactly one per leg) and stream POST/DELETE error rate. Scoped by namespace only.",
       "targets": [
         { "expr": "elector_leading{namespace=~\"$namespace\"}", "legendFormat": "leading {{pod}}" },
         { "expr": "sum(rate(elector_post_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval])) + sum(rate(elector_delete_total{namespace=~\"$namespace\",result=\"err\"}[$__rate_interval]))", "legendFormat": "lease-op errors/s" }
       ] },
-    { "id": 10, "title": "Sink apply throughput by group (job) — ops/s", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
+    { "id": 10, "title": "Sink apply throughput by group (job) — ops/s", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
       "description": "Per-group apply rate. With multi-subject sink groups each group is a distinct Prometheus job (its Service name, e.g. lab-connect-sink / lab-connect-sink-a), so `by (job)` breaks throughput out per group; a single-group install shows one series.",
       "targets": [
         { "expr": "sum by (job, op) (rate({__name__=~\"cdc_apply(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{job}} {{op}}" }
       ] },
-    { "id": 11, "title": "Forward-leg unrouted (parked)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
+    { "id": 11, "title": "Forward-leg unrouted (parked)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
       "description": "cdc_forward_unrouted by reason: empty_prefix = no derivable key segment (malformed event); no_match = key matched no configured prefix AND no catchAll group is deployed — either way the event publishes to kv.cdc.others.<op>, which nothing consumes, and parks in the stream. Only nonzero when prefix routing is configured. Drives the CDCForwardUnrouted alert. Fix the key format, add a sinkGroup for the missing prefix, or deploy a catchAll group.",
       "targets": [
         { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_unrouted(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{reason}}" }
       ] },
-    { "id": 12, "title": "Forward-leg catch-all traffic (others)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 40 },
+    { "id": 12, "title": "Forward-leg catch-all traffic (others)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "description": "cdc_forward_others: events whose key matched no configured prefix, published to kv.cdc.others.<op> and consumed by the catchAll sink group (reason=no_match). Emitted ONLY when a catchAll group is deployed — without one the same miss increments cdc_forward_unrouted (panel 11) and alerts. A sustained rate here means a key family is flowing through the catch-all: consider giving it its own sinkGroup.",
       "targets": [
         { "expr": "sum by (reason) (increase({__name__=~\"cdc_forward_others(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "others {{reason}}" }
       ] },
     {
      "id": 13,
-     "title": "Sync latency p50/p95/p99 (s) by group",
+     "title": "Sync latency p50/p95/p99 (s) by prefix",
      "type": "timeseries",
      "datasource": {
       "type": "prometheus",
@@ -78,9 +68,9 @@
       "h": 8,
       "w": 12,
       "x": 12,
-      "y": 40
+      "y": 32
      },
-     "description": "cdc_sync_latency_seconds: writer mint (envelope ts) → sink successful apply, ALL ops — includes forward leg, JetStream, and redelivery/replay time. Timing is fed in ns; the exporter divides by 1e9, so values are SECONDS. sum by (le, job): each sink group keeps its own distribution — merging jobs would produce a bogus blended quantile.",
+     "description": "cdc_sync_latency_seconds: writer mint (envelope ts) → sink successful apply, ALL ops — includes forward leg, JetStream, and redelivery/replay time. Timing is fed in ns; the exporter divides by 1e9, so values are SECONDS. sum by (le, prefix): each key-family prefix keeps its own distribution. The prefix label is emitted by the AIO sink only when connect.syncLatencyPrefix.enabled is on (bounded set: routing families + others + none). Samples WITHOUT the label — the sharded pipeline, or an AIO sink with the toggle off — collapse into one blank-prefix series here; use the by-shard panel for per-shard detail.",
      "fieldConfig": {
       "defaults": {
        "unit": "s"
@@ -88,16 +78,16 @@
      },
      "targets": [
       {
-       "expr": "histogram_quantile(0.50, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
-       "legendFormat": "{{job}} p50"
+       "expr": "histogram_quantile(0.50, sum by (le, prefix) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{prefix}} p50"
       },
       {
-       "expr": "histogram_quantile(0.95, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
-       "legendFormat": "{{job}} p95"
+       "expr": "histogram_quantile(0.95, sum by (le, prefix) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{prefix}} p95"
       },
       {
-       "expr": "histogram_quantile(0.99, sum by (le, job) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
-       "legendFormat": "{{job}} p99"
+       "expr": "histogram_quantile(0.99, sum by (le, prefix) (rate(cdc_sync_latency_seconds_bucket{namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))",
+       "legendFormat": "{{prefix}} p99"
       }
      ]
     },
@@ -113,7 +103,7 @@
       "h": 8,
       "w": 12,
       "x": 0,
-      "y": 48
+      "y": 40
      },
      "description": "cdc_sync_skew_negative: messages whose writer ts was AHEAD of the sink clock (delta < 0). The latency sample is clamped to 0 (the metric processor rejects negatives), and counted here instead. Non-zero ⇒ writer clock ahead of sink (NTP drift) — investigate. Corrupt or missing ts never reaches this counter: it is caught by the ts parse guard (sync_has_ts=no) and skipped entirely.",
      "fieldConfig": {
@@ -128,25 +118,25 @@
       }
      ]
     },
-    { "id": 15, "title": "Sharded apply throughput by shard (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+    { "id": 15, "title": "Sharded apply throughput by shard (ops/s)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 40 },
       "description": "cdc_apply rate per shard (subject-sharding v2). Only sharded sink groups emit the shard label. Watch for balance: a hot shard (hot employee) saturates its serialized 1/RTT fetch lane while others idle — drives the CDCShardSkew alert. shard=sx is the isolation lane and belongs at zero (panel 16).",
       "targets": [
         { "expr": "sum by (shard) (rate({__name__=~\"cdc_apply(_total)?\",shard!=\"\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "{{shard}}" }
       ] },
-    { "id": 16, "title": "Shard isolation lane (must stay 0)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
+    { "id": 16, "title": "Shard isolation lane (must stay 0)", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
       "description": "Sharding invariant signals (design v2 §11 A3): cross_shard_rename = a rename whose old/new keys resolve to different shards (INV-S7 — any nonzero value is a bug); unparseable_shard = a sharded-family key without a keyPattern id (key contract broken); sx applies = traffic through the isolation shard. All three route to sx so nothing is lost — but nonzero means the key contract or the shard function is broken. NOTE: v2 has NO direct out-of-order signal (no fence) — these are proxies. Drives the CDCShardIsolationLane alert.",
       "targets": [
         { "expr": "sum(increase({__name__=~\"cdc_forward_cross_shard_rename(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "cross_shard_rename" },
         { "expr": "sum(increase({__name__=~\"cdc_forward_unrouted(_total)?\",reason=\"unparseable_shard\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "unparseable_shard" },
         { "expr": "sum(rate({__name__=~\"cdc_apply(_total)?\",shard=\"sx\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "sx apply rate" }
       ] },
-    { "id": 17, "title": "Sync latency p99 (s) by shard", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 56 },
+    { "id": 17, "title": "Sync latency p99 (s) by shard", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
       "description": "cdc_sync_latency_seconds p99 per shard (sharded groups only; buckets are SECONDS). A single shard's p99 climbing while others stay flat = that shard's serialized lane is saturated or blocked (a poison message under max_ack_pending=1 blocks the whole shard — see CDCShardStuck). Companion of the CDCSyncLatencyHigh alert.",
       "fieldConfig": { "defaults": { "unit": "s" } },
       "targets": [
         { "expr": "histogram_quantile(0.99, sum by (le, shard) (rate(cdc_sync_latency_seconds_bucket{shard!=\"\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval])))", "legendFormat": "{{shard}} p99" }
       ] },
-    { "id": 18, "title": "DLQ: routed vs confirmed parked", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 64 },
+    { "id": 18, "title": "DLQ: routed vs confirmed parked", "type": "timeseries", "datasource": { "type": "prometheus", "uid": "${datasource}" }, "gridPos": { "h": 8, "w": 12, "x": 0, "y": 56 },
       "description": "cdc_dlq_forwarded counts ROUTING DECISIONS (incremented in the pipeline BEFORE the DLQ publish is attempted — switch-output cases cannot count post-write on this Connect build), so it moves in lockstep with cdc_unprocessable and does NOT prove messages are landing in the DLQ. 'confirmed parked' (output_sent{label=dlq_out}) counts PubAck-confirmed DLQ publishes; 'publish failures' (output_error{label=dlq_out}) counts failed attempts (each failure nacks the original -> retry, so poison keeps redelivering). HEALTHY: routed == confirmed, failures 0. Routed climbing while confirmed stays flat means the DLQ publish is failing — most commonly the subscriber creds lack the pub grant on dlq.cdc.> (see the connect.deadLetter comment in values.yaml: gen-nats-auth.sh --force, commit creds, redeploy) — and poison is STILL looping despite this panel moving. Only meaningful when connect.deadLetter.enabled.",
       "targets": [
         { "expr": "sum by (reason, shard) (increase({__name__=~\"cdc_dlq_forwarded(_total)?\",namespace=~\"$namespace\",job=~\"$job\"}[$__rate_interval]))", "legendFormat": "routed {{reason}}{{shard}}" },
