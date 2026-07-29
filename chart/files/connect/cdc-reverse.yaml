@@ -376,12 +376,65 @@ pipeline:
                 let sync_delta_ns = if $ts_ms > 0 { timestamp_unix_nano() - ($ts_ms * 1000000).round() } else { 0 }
                 meta sync_latency_ns = [ $sync_delta_ns, 0 ].max().int64().string()
                 meta sync_skew_neg = if $sync_delta_ns < 0 { "yes" } else { "no" }
+{{- if .Values.connect.syncLatencyPrefix.enabled }}
+{{- /* Fixed subject head to skip: every segment of subjectPrefix, plus one more
+       when normalSegment inserts its own segment. Computed at render time so the
+       Bloblang below only sees a literal number. */}}
+{{- $skip := len (splitList "." .Values.nats.stream.subjectPrefix) }}
+{{- if .Values.nats.stream.normalSegment }}{{- $skip = add1 $skip }}{{- end }}
+                # OPT-IN (connect.syncLatencyPrefix.enabled — full rationale on that
+                # values block): recover the key-family token from the NATS subject
+                # so the metric below can carry a bounded `prefix` label. Subject
+                # shape: <head ({{ $skip }} fixed segments)>[.<family token…>][.s<K>].<op>.
+                # We skip the head, drop the trailing op segment, and strip a sharded
+                # publisher's s<K> token so all shards of one family share one series.
+                # No family token (legacy <head>.<op>) => "none". Same contract as
+                # the lines above: this runs AFTER the apply, so every step is
+                # meta-only and guarded — a throw here would nack an already-applied
+                # message.
+                let subj_toks = meta("nats_subject").or("").split(".")
+                let tok_hi = $subj_toks.length() - 1
+                let fam_toks = if $tok_hi > {{ $skip }} { $subj_toks.slice({{ $skip }}, $tok_hi) } else { [] }
+                let fam_kept = if $fam_toks.length() > 1 && $fam_toks.index($fam_toks.length() - 1).re_match("^s[0-9]+$") { $fam_toks.slice(0, $fam_toks.length() - 1) } else { $fam_toks }
+                meta sync_prefix = if $fam_kept.length() == 0 { "none" } else { $fam_kept.join(".") }
+{{- end }}
             - metric:
                 type: timing
                 name: cdc_sync_latency_seconds
                 labels:
                   op: '${! meta("op") }'
+{{- if .Values.connect.syncLatencyPrefix.enabled }}
+                  prefix: '${! meta("sync_prefix") }'
+{{- end }}
                 value: '${! meta("sync_latency_ns") }'
+{{- if .Values.connect.syncLatencyLog.enabled }}
+            # OPT-IN (connect.syncLatencyLog.enabled — full rationale on that values
+            # block): one structured log line per successfully applied message with
+            # its sync latency, for manual investigation of slow keys/ops/prefixes.
+            # Debug-only (one line per message; logs real key names). Every field
+            # read is meta-only with .or()/.catch() fallbacks. Note the failure mode
+            # differs from the metric processor above: on this pinned build a log
+            # fields_mapping throw is SWALLOWED (internal ERROR line, fields
+            # dropped, message continues un-errored — verified 2026-07-29), so the
+            # guards protect log usability, not ack safety. kv_key is empty for
+            # rename (renames carry old_key/new_key instead).
+            - log:
+                level: {{ .Values.connect.syncLatencyLog.level }}
+                message: "cdc-reverse sync_latency"
+                fields_mapping: |
+                  root.leg            = "reverse"
+                  root.stage          = "sync_latency"
+                  root.op             = meta("op").or("")
+                  root.kv_key         = meta("kv_key").or("")
+                  root.old_key        = meta("old_key").or("")
+                  root.new_key        = meta("new_key").or("")
+                  root.subject        = meta("nats_subject").or("")
+                  root.sync_latency_s = meta("sync_latency_ns").number().catch(0) / 1000000000.0
+                  root.sync_skew_neg  = meta("sync_skew_neg").or("no")
+{{- if .Values.connect.syncLatencyPrefix.enabled }}
+                  root.prefix         = meta("sync_prefix").or("none")
+{{- end }}
+{{- end }}
             - switch:
                 - check: meta("sync_skew_neg") == "yes"
                   processors:
