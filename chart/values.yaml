@@ -51,14 +51,41 @@ redis:
       enabled: false
       url: ""                      # required when enabled, e.g. "redis://redis.prod:6379"
       cluster: false               # route to url with a ClusterClient; requires enabled: true
-      authSecret: ""               # RESERVED — v1 does NOT consume it (see spec §2 non-goals)
+      # External Redis password auth (issue #39). authSecret names a PRE-CREATED
+      # opaque Secret in the release namespace (typically owned by another team)
+      # whose authSecretKey entry holds the Redis password. The chart never sees
+      # the password: the Connect pipeline URL renders as
+      # redis://:${REDIS_CENTRAL_PASSWORD}@host:port and the connect container
+      # resolves that env interpolation at config-parse time from a secretKeyRef
+      # env var — so neither values.yaml, the rendered ConfigMap, nor `helm get`
+      # ever contains the secret. The wait-redis init container authenticates the
+      # same way via REDISCLI_AUTH (native redis-cli support).
+      #
+      # Important details:
+      # - Requires external.enabled=true; setting authSecret on a bundled side
+      #   fails the render (bundled lab Redis is password-less by design).
+      # - Scope is the CONNECT LEGS ONLY. writer / verifier / dashboard /
+      #   latency-calculator do not authenticate — disable them in environments
+      #   with a passworded Redis (they are lab harness components).
+      # - The pinned Connect build takes Redis auth ONLY via the URL, so a
+      #   password containing URL-reserved characters (@ : / #) must be stored
+      #   URL-ENCODED in the Secret, or avoided. A wrong password surfaces as
+      #   NOAUTH/WRONGPASS in the connect logs and a stalled wait-redis init.
+      # - Rotation: update the Secret, then restart the connect pods (env vars
+      #   are read once at pod start; there is no hot reload).
+      # - A url that already embeds userinfo (redis://user:pass@...) together
+      #   with authSecret fails the render — pick one mechanism.
+      # See chart/examples/values-external-redis-auth.yaml for a safe example.
+      authSecret: ""               # name of the pre-created opaque Secret ("" = no auth)
+      authSecretKey: "redis-pass"  # key inside authSecret holding the password
   region:
     mode: standalone               # bundled topology: standalone | cluster (see central)
     external:
       enabled: false
       url: ""
       cluster: false               # route to url with a ClusterClient; requires enabled: true
-      authSecret: ""               # RESERVED — v1 does NOT consume it
+      authSecret: ""               # pre-created Secret with the region Redis password (see central docs)
+      authSecretKey: "redis-pass"  # key inside authSecret holding the password
 
 nats:
   external:

@@ -21,14 +21,25 @@
 # values.yaml connect.bodyEncoding for the two-step procedure.
 #
 # This file is POSTed verbatim by the source elector once it wins the Lease (the
-# http/logger/metrics blocks live in observability.yaml). The streams REST API
-# does NOT expand environment variables, so client_id and output.label use the
-# __POD__ token, which the elector replaces with the pod name before POSTing
-# (Connect accepts hyphenated labels, so the raw pod name is used verbatim).
+# http/logger/metrics blocks live in observability.yaml). Connect DOES resolve
+# environment-variable interpolations (dollar-brace VAR syntax) in configs
+# received via the streams REST API — from the CONNECT container's own
+# environment, at config-parse time (verified on the pinned build 2026-07-30;
+# the external-Redis auth URL below relies on it, proven end-to-end by
+# scripts/verify-redis-auth.sh). CAUTION: that interpolation pass scans the RAW
+# config text BEFORE YAML parsing, so it fires inside comments too — never write
+# a literal dollar-brace token anywhere in this file unless you mean it. An
+# unset variable makes the streams POST fail 400 ("required environment
+# variables were not set") and the elector releases leadership fail-closed, so
+# the whole forward leg stays down (this exact mistake took down an L3 run on
+# 2026-07-30). The __POD__ token is different: the pod name lives only in the
+# ELECTOR's env (Downward API), not connect's, so client_id and output.label use
+# __POD__, which the elector replaces with the pod name before POSTing (Connect
+# accepts hyphenated labels, so the raw pod name is used verbatim).
 input:
   label: redis_source
   redis_streams:
-    url: {{ include "rrcs.redis.central.url" . }}
+    url: {{ include "rrcs.redis.central.connectUrl" . }}
     kind: {{ include "rrcs.redis.central.connectKind" . }}
     streams:
       - app.events

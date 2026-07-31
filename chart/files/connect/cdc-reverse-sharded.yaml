@@ -226,7 +226,7 @@ pipeline:
                     - check: meta("body").parse_json().ts.or(0) > 0
                       processors:
                         - redis:
-                            url: {{ include "rrcs.redis.region.url" . }}
+                            url: {{ include "rrcs.redis.region.connectUrl" . }}
                             kind: {{ include "rrcs.redis.region.connectKind" . }}
                             command: xadd
                             args_mapping: |
@@ -247,7 +247,7 @@ pipeline:
                 - check: meta("type") == "hash"
                   processors:
                     - redis:
-                        url: {{ include "rrcs.redis.region.url" . }}
+                        url: {{ include "rrcs.redis.region.connectUrl" . }}
                         kind: {{ include "rrcs.redis.region.connectKind" . }}
                         command: hset
                         # Flatten the JSON field-map body into HSET args (ONE line —
@@ -255,7 +255,7 @@ pipeline:
                         args_mapping: 'root = [meta("kv_key")].concat(meta("body").parse_json().key_values().map_each(kv -> [kv.key, kv.value.string()]).flatten())'
                 - processors:
                     - redis:
-                        url: {{ include "rrcs.redis.region.url" . }}
+                        url: {{ include "rrcs.redis.region.connectUrl" . }}
                         kind: {{ include "rrcs.redis.region.connectKind" . }}
                         command: set
                         args_mapping: 'root = [ meta("kv_key"), meta("body") ]'
@@ -269,7 +269,7 @@ pipeline:
         - check: meta("op") == "delete"
           processors:
             - redis:
-                url: {{ include "rrcs.redis.region.url" . }}
+                url: {{ include "rrcs.redis.region.connectUrl" . }}
                 kind: {{ include "rrcs.redis.region.connectKind" . }}
                 command: del
                 args_mapping: 'root = [ meta("kv_key") ]'
@@ -283,7 +283,7 @@ pipeline:
         - check: meta("op") == "rename"
           processors:
             - redis:
-                url: {{ include "rrcs.redis.region.url" . }}
+                url: {{ include "rrcs.redis.region.connectUrl" . }}
                 kind: {{ include "rrcs.redis.region.connectKind" . }}
                 command: eval
                 args_mapping: |

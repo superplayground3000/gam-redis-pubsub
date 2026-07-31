@@ -341,3 +341,19 @@ Append-only (format and compression policy: `rules/40-maintenance-protocol.md`).
 - Applied: design §1.2/§5 amendments + verify-e2e-matrix.sh (run 3 = 21/21 green); also
   confirmed the cross-model review rule again — Codex caught a cleanup-trap bug that would have
   left a node-level iptables DROP to NATS after an aborted run.
+
+## 2026-07-30 — Connect env interpolation scans RAW config text, comments included
+- What happened: while adding external-Redis auth (issue #39), a factual correction to the
+  cdc-forward.yaml HEADER COMMENT spelled the literal token `$`+`{ENV_VAR}`. Connect's
+  environment-variable interpolation pass runs on the raw config text BEFORE YAML parsing, so
+  it fired inside the comment: the elector's streams POST failed 400 ("required environment
+  variables were not set: [ENV_VAR]"), the elector released leadership fail-closed, the forward
+  leg stayed down, and verify-cdc failed every check ("stream grew by 0"). L1 render checks
+  could never catch it — the render was valid YAML; only the L3 run surfaced it.
+- Rule that would have prevented it: new — never write a dollar-brace token in any file under
+  chart/files/connect/ (comments included) unless it is a deliberate interpolation; pipeline
+  text is live config for TWO interpreters (YAML + Connect's env lexer).
+- Applied: comment reworded (cdc-forward.yaml header now carries the CAUTION); mechanical gate
+  added — run-all-tests.sh L1 RA5 scans every rendered *-pipeline/*-observability ConfigMap and
+  fails on any env token outside the allowed REDIS_*_PASSWORD set (allowed only in auth-enabled
+  renders, never the default).
