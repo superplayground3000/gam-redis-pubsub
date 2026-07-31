@@ -103,6 +103,15 @@ MB=$(git merge-base master HEAD 2>/dev/null || true)
 # selectors round-robined connections across same-namespace releases). The value
 # is the helm release name, deterministic and content-free, so stripping it
 # cannot mask a gating leak.
+# Also stripped since issue #39: full-line `#` comments. The pipeline files under
+# chart/files/connect/ are rendered verbatim into ConfigMaps, so a factual
+# correction to a pipeline comment (e.g. the cdc-forward.yaml header's env-var
+# claim, proven wrong 2026-07-30) would otherwise fail this gate forever or force
+# leaving wrong docs in place. Comment-only lines are behavior-inert to Connect,
+# Bloblang, and the shell blocks alike, and both sides of the diff are normalized
+# symmetrically, so stripping them cannot mask a functional gating leak — a leak
+# that ONLY changes comments still shows up in the substring leak checks when it
+# carries feature machinery.
 norm_render() {
   sed -E \
     -e 's/nats-init-[0-9a-f]{8}/nats-init-CREDSHASH/g' \
@@ -110,6 +119,7 @@ norm_render() {
     -e '/^[[:space:]]*system_account:/d' \
     -e '/^[[:space:]]*\/\/ Account /d' \
     -e '/^[[:space:]]*release: /d' \
+    -e '/^[[:space:]]*#/d' \
     -e '/^[[:space:]]*$/d'
 }
 if [ -n "$MB" ] && git rev-parse --verify -q "$MB^{commit}" >/dev/null 2>&1; then
@@ -648,6 +658,180 @@ for badsh in \
     echo "[run-all-tests] expected fail-loud sharding render for '$badsh' but it succeeded"; fail L1
   fi
 done
+# ── External Redis password auth (issue #39) ──
+# authSecret names a PRE-CREATED opaque Secret (the password never transits
+# values.yaml or the render — Connect resolves a ${VAR} env interpolation at
+# config-parse time). Setting it on a side whose external.enabled=false is a
+# config error — bundled lab Redis is password-less by design — so it must
+# fail the render, loudly and for the right reason.
+seg_guard RA1-central 'redis.central.external.authSecret requires redis.central.external.enabled=true' \
+  --set redis.central.external.authSecret=my-redis-auth
+seg_guard RA1-region 'redis.region.external.authSecret requires redis.region.external.enabled=true' \
+  --set redis.region.external.authSecret=my-redis-auth
+# RA2 — central side ON: the forward pipeline URL carries the ${REDIS_CENTRAL_PASSWORD}
+# env interpolation (resolved by Connect at config-parse time, so the ConfigMap stays
+# password-free), the connect-source pod gets that env from the pre-created Secret
+# (connect container) plus REDISCLI_AUTH (wait-redis-central init container), and the
+# password-less hostPort consumers (writer REDIS_ADDR et al) are untouched.
+RAC_OUT=$(helm template chart/ \
+     --set redis.central.external.enabled=true \
+     --set redis.central.external.url=redis://central.prod:6400 \
+     --set redis.central.external.authSecret=central-redis-auth) \
+  || { echo "L1: RA2 central authSecret render must succeed"; fail L1; }
+grep -qF 'url: redis://:${REDIS_CENTRAL_PASSWORD}@central.prod:6400' <<<"$RAC_OUT" \
+  || { echo "L1: RA2 forward pipeline URL missing the env-interpolated auth form"; fail L1; }
+grep -qF 'value: "central.prod:6400"' <<<"$RAC_OUT" \
+  || { echo "L1: RA2 hostPort consumers must keep the bare host:port (no auth pollution)"; fail L1; }
+if grep -v 'redis://' <<<"$RAC_OUT" | grep -q 'REDIS_CENTRAL_PASSWORD}@'; then
+  echo "L1: RA2 interpolated auth URL leaked outside a redis:// context (hostPort?)"; fail L1
+fi
+# Env wiring lands on connect-source (connect container + wait init container) and
+# ONLY there — the sink Deployment must not reference the central Secret.
+RAC_TMP=$(mktemp); printf '%s\n' "$RAC_OUT" > "$RAC_TMP"
+python3 - "$RAC_TMP" <<'EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+def dep(name):
+    for d in docs:
+        if d.get("kind") == "Deployment" and d["metadata"]["name"] == name:
+            return d
+    sys.exit(f"RA2: Deployment {name} not rendered")
+def envs(container):
+    return {e["name"]: e for e in container.get("env") or []}
+src = dep("lab-connect-source")["spec"]["template"]["spec"]
+connect = [c for c in src["containers"] if c["name"] == "connect"][0]
+e = envs(connect).get("REDIS_CENTRAL_PASSWORD") or sys.exit("RA2: connect container missing REDIS_CENTRAL_PASSWORD env")
+ref = e["valueFrom"]["secretKeyRef"]
+assert ref["name"] == "central-redis-auth", f"RA2: env secret name {ref['name']}"
+assert ref["key"] == "redis-pass", f"RA2: env secret key {ref['key']} (default authSecretKey)"
+wait = [c for c in src["initContainers"] if c["name"] == "wait-redis-central"][0]
+w = envs(wait).get("REDISCLI_AUTH") or sys.exit("RA2: wait-redis-central missing REDISCLI_AUTH env")
+wref = w["valueFrom"]["secretKeyRef"]
+assert (wref["name"], wref["key"]) == ("central-redis-auth", "redis-pass"), f"RA2: wait env ref {wref}"
+sink = dep("lab-connect-sink")
+assert "central-redis-auth" not in yaml.dump(sink), "RA2: central Secret leaked into the sink Deployment"
+print("RA2 central env wiring OK")
+EOF
+RA_RC=$?; rm -f "$RAC_TMP"
+[ "$RA_RC" = 0 ] || { echo "L1: RA2 central env wiring assertions failed"; fail L1; }
+# RA3 — region side ON (with a NON-default authSecretKey, proving the key is
+# configurable): every reverse-pipeline redis URL interpolates
+# ${REDIS_REGION_PASSWORD}, no bare region URL survives anywhere, and the sink
+# Deployment gets the env pair (connect container + wait-redis-region init).
+RAR_OUT=$(helm template chart/ \
+     --set redis.region.external.enabled=true \
+     --set redis.region.external.url=redis://region.prod:6500 \
+     --set redis.region.external.authSecret=region-redis-auth \
+     --set redis.region.external.authSecretKey=alt-pass) \
+  || { echo "L1: RA3 region authSecret render must succeed"; fail L1; }
+grep -qF 'url: redis://:${REDIS_REGION_PASSWORD}@region.prod:6500' <<<"$RAR_OUT" \
+  || { echo "L1: RA3 reverse pipeline URL missing the env-interpolated auth form"; fail L1; }
+if grep -qF 'url: redis://region.prod:6500' <<<"$RAR_OUT"; then
+  echo "L1: RA3 a bare (unauthenticated) region URL survived in some pipeline"; fail L1
+fi
+RAR_TMP=$(mktemp); printf '%s\n' "$RAR_OUT" > "$RAR_TMP"
+python3 - "$RAR_TMP" <<'EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+def dep(name):
+    for d in docs:
+        if d.get("kind") == "Deployment" and d["metadata"]["name"] == name:
+            return d
+    sys.exit(f"RA3: Deployment {name} not rendered")
+def envs(c):
+    return {e["name"]: e for e in c.get("env") or []}
+sink = dep("lab-connect-sink")["spec"]["template"]["spec"]
+connect = [c for c in sink["containers"] if c["name"] == "connect"][0]
+e = envs(connect).get("REDIS_REGION_PASSWORD") or sys.exit("RA3: sink connect container missing REDIS_REGION_PASSWORD env")
+ref = e["valueFrom"]["secretKeyRef"]
+assert ref["name"] == "region-redis-auth", f"RA3: env secret name {ref['name']}"
+assert ref["key"] == "alt-pass", f"RA3: authSecretKey override not honored ({ref['key']})"
+wait = [c for c in sink["initContainers"] if c["name"] == "wait-redis-region"][0]
+w = envs(wait).get("REDISCLI_AUTH") or sys.exit("RA3: wait-redis-region missing REDISCLI_AUTH env")
+wref = w["valueFrom"]["secretKeyRef"]
+assert (wref["name"], wref["key"]) == ("region-redis-auth", "alt-pass"), f"RA3: wait env ref {wref}"
+src = dep("lab-connect-source")
+assert "region-redis-auth" not in yaml.dump(src), "RA3: region Secret leaked into the source Deployment"
+print("RA3 region env wiring OK")
+EOF
+RA_RC=$?; rm -f "$RAR_TMP"
+[ "$RA_RC" = 0 ] || { echo "L1: RA3 region env wiring assertions failed"; fail L1; }
+# RA4 — region auth × sharded sink groups: EVERY per-group sink Deployment gets
+# the env pair (the broker pipeline dials the same region Redis from each group).
+RASH_VALUES=$(mktemp)
+cat > "$RASH_VALUES" <<'EOF'
+redis:
+  region:
+    external:
+      enabled: true
+      url: redis://region.prod:6500
+      authSecret: region-redis-auth
+connect:
+  sharding:
+    keyPattern: '\{employees:(?P<id>[0-9]+)\}'
+    families:
+      "lb:company":
+        shards: 4
+  sinkGroups:
+    - { name: shard-a, shardsOf: "lb:company", shards: [0, 1] }
+    - { name: shard-b, shardsOf: "lb:company", shards: [2, 3, "x"] }
+    - { name: others,  catchAll: true }
+EOF
+RASH_OUT=$(helm template chart/ -f "$RASH_VALUES") || { rm -f "$RASH_VALUES"; echo "L1: RA4 region auth + sharding must render"; fail L1; }
+rm -f "$RASH_VALUES"
+grep -qF 'url: redis://:${REDIS_REGION_PASSWORD}@region.prod:6500' <<<"$RASH_OUT" \
+  || { echo "L1: RA4 sharded reverse pipeline URL missing the interpolated auth form"; fail L1; }
+RASH_TMP=$(mktemp); printf '%s\n' "$RASH_OUT" > "$RASH_TMP"
+python3 - "$RASH_TMP" <<'EOF'
+import sys, yaml
+docs = [d for d in yaml.safe_load_all(open(sys.argv[1])) if d]
+names = ["lab-connect-sink-shard-a", "lab-connect-sink-shard-b", "lab-connect-sink-others"]
+deps = {d["metadata"]["name"]: d for d in docs if d and d.get("kind") == "Deployment"}
+for n in names:
+    d = deps.get(n) or sys.exit(f"RA4: Deployment {n} not rendered")
+    spec = d["spec"]["template"]["spec"]
+    connect = [c for c in spec["containers"] if c["name"] == "connect"][0]
+    es = {e["name"]: e for e in connect.get("env") or []}
+    e = es.get("REDIS_REGION_PASSWORD") or sys.exit(f"RA4: {n} connect container missing REDIS_REGION_PASSWORD")
+    ref = e["valueFrom"]["secretKeyRef"]
+    assert (ref["name"], ref["key"]) == ("region-redis-auth", "redis-pass"), f"RA4: {n} ref {ref}"
+    wait = [c for c in spec["initContainers"] if c["name"] == "wait-redis-region"][0]
+    ws = {e["name"]: e for e in wait.get("env") or []}
+    w = ws.get("REDISCLI_AUTH") or sys.exit(f"RA4: {n} wait-redis-region missing REDISCLI_AUTH")
+    wref = w["valueFrom"]["secretKeyRef"]
+    assert (wref["name"], wref["key"]) == ("region-redis-auth", "redis-pass"), f"RA4: {n} wait ref {wref}"
+print("RA4 sharded env wiring OK")
+EOF
+RA_RC=$?; rm -f "$RASH_TMP"
+[ "$RA_RC" = 0 ] || { echo "L1: RA4 sharded region env wiring assertions failed"; fail L1; }
+# The shipped external-Redis-auth example must render.
+helm template chart/ -f chart/examples/values-external-redis-auth.yaml >/dev/null \
+  || { echo "L1: chart/examples/values-external-redis-auth.yaml must render"; fail L1; }
+# RA5 — no stray env-interpolation tokens in the Connect config ConfigMaps.
+# Connect's env pass scans the RAW config text (comments INCLUDED) before YAML
+# parsing, so a dollar-brace token in a mere comment is live config: an unset
+# one 400s the elector's streams POST and the leg stays down fail-closed (this
+# took out an L3 run on 2026-07-30 via a doc comment). Only the two auth
+# password vars are legitimate, and only in auth-enabled renders.
+check_pipeline_env_tokens() {  # <label> <render-var-content> <allowed-regex or ''>
+  local label="$1" render="$2" allowed="$3" toks
+  toks=$(python3 -c '
+import sys, yaml, re
+tokens = set()
+for d in yaml.safe_load_all(sys.stdin):
+    if d and d.get("kind") == "ConfigMap" and (
+        d["metadata"]["name"].endswith("-pipeline") or d["metadata"]["name"].endswith("-observability")):
+        for v in (d.get("data") or {}).values():
+            tokens.update(re.findall(r"\$\{([A-Z_][A-Z0-9_]*)\}", v))
+print("\n".join(sorted(tokens)))' <<<"$render")
+  if [ -n "$allowed" ]; then toks=$(grep -Ev "$allowed" <<<"$toks" || true); fi
+  if [ -n "$toks" ]; then
+    echo "L1: $label Connect ConfigMaps carry unexpected env-interpolation tokens: $toks"; fail L1
+  fi
+}
+check_pipeline_env_tokens RA5-default "$DEFAULT_OUT" ''
+check_pipeline_env_tokens RA5-central "$RAC_OUT" '^REDIS_CENTRAL_PASSWORD$'
+check_pipeline_env_tokens RA5-region  "$RAR_OUT" '^REDIS_REGION_PASSWORD$'
 pass L1
 
 echo "[run-all-tests] == L2: error-alerting lab proof =="

@@ -315,6 +315,64 @@ rrcs.redis.central.url / rrcs.redis.region.url — connection URL form.
 {{- end -}}
 
 {{/*
+rrcs.redis.{central,region}.connectUrl — the URL form the CONNECT pipeline
+configs use. Identical to rrcs.redis.<side>.url until external auth is on; with
+external.authSecret set it injects a ${REDIS_<SIDE>_PASSWORD} environment-variable
+interpolation as the URL password: redis://:${VAR}@host:port. Connect resolves
+${VAR} at config-parse time — including configs POSTed via the streams REST API
+(proven end-to-end by scripts/verify-redis-auth.sh) — so the rendered ConfigMap
+never carries a password. The password-less consumers (writer/verifier/
+init-container hostPort form) keep reading rrcs.redis.<side>.url; auth for them
+is out of scope (issue #39).
+The pinned Connect build's redis components take auth ONLY via the URL (no
+dedicated password field), so a password containing URL-reserved characters
+(@ / : #) must be URL-encoded by the Secret's owner — documented in values.yaml.
+*/}}
+{{- define "rrcs.redis.central.connectUrl" -}}
+{{- $u := include "rrcs.redis.central.url" . -}}
+{{- if and .Values.redis.central.external.enabled .Values.redis.central.external.authSecret -}}
+{{- if contains "@" $u -}}
+{{- fail (printf "redis.central.external: authSecret is set but url already carries userinfo (%s) — supply credentials via authSecret OR embedded in url, not both." $u) -}}
+{{- end -}}
+{{- printf "redis://:${REDIS_CENTRAL_PASSWORD}@%s" (trimPrefix "redis://" $u) -}}
+{{- else -}}
+{{- $u -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "rrcs.redis.region.connectUrl" -}}
+{{- $u := include "rrcs.redis.region.url" . -}}
+{{- if and .Values.redis.region.external.enabled .Values.redis.region.external.authSecret -}}
+{{- if contains "@" $u -}}
+{{- fail (printf "redis.region.external: authSecret is set but url already carries userinfo (%s) — supply credentials via authSecret OR embedded in url, not both." $u) -}}
+{{- end -}}
+{{- printf "redis://:${REDIS_REGION_PASSWORD}@%s" (trimPrefix "redis://" $u) -}}
+{{- else -}}
+{{- $u -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.redis.authEnvVar — one env entry sourcing the Redis password from the
+pre-created Secret, emitted only when that side's external auth is on (so the
+default render stays byte-identical). envName varies by consumer: the connect
+container wants the name the pipeline URL interpolates
+(REDIS_CENTRAL_PASSWORD / REDIS_REGION_PASSWORD); the wait-redis init
+containers want REDISCLI_AUTH, which redis-cli picks up natively.
+Usage: {{ include "rrcs.redis.authEnvVar" (dict "root" $ "side" "central" "envName" "REDIS_CENTRAL_PASSWORD") }}
+*/}}
+{{- define "rrcs.redis.authEnvVar" -}}
+{{- $cfg := index .root.Values.redis .side -}}
+{{- if and $cfg.external.enabled $cfg.external.authSecret -}}
+- name: {{ .envName }}
+  valueFrom:
+    secretKeyRef:
+      name: {{ $cfg.external.authSecret }}
+      key: {{ $cfg.external.authSecretKey | default "redis-pass" }}
+{{- end -}}
+{{- end -}}
+
+{{/*
 rrcs.redis.{central,region}.hostPort — host:port form (URL scheme stripped),
 for the writer's REDIS_ADDR env, the verifier's --redis-* flags, and the
 init-container redis-cli ping. These consumers DO NOT speak TLS in v1, so a
@@ -325,7 +383,7 @@ follow-up that wires writer/verifier auth (spec §2 non-goal).
 {{- define "rrcs.redis.central.hostPort" -}}
 {{- $u := include "rrcs.redis.central.url" . -}}
 {{- if hasPrefix "rediss://" $u -}}
-{{- fail (printf "redis.central.external: TLS (rediss://) is not supported in v1 — writer/verifier/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; TLS is deferred to the same follow-up as external Redis auth (spec §2)." $u) -}}
+{{- fail (printf "redis.central.external: TLS (rediss://) is not supported in v1 — writer/verifier/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; PASSWORD auth is available via external.authSecret (issue #39), but TLS remains unsupported." $u) -}}
 {{- end -}}
 {{- regexReplaceAll "^redis://" $u "" -}}
 {{- end -}}
@@ -333,7 +391,7 @@ follow-up that wires writer/verifier auth (spec §2 non-goal).
 {{- define "rrcs.redis.region.hostPort" -}}
 {{- $u := include "rrcs.redis.region.url" . -}}
 {{- if hasPrefix "rediss://" $u -}}
-{{- fail (printf "redis.region.external: TLS (rediss://) is not supported in v1 — writer/verifier/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; TLS is deferred to the same follow-up as external Redis auth (spec §2)." $u) -}}
+{{- fail (printf "redis.region.external: TLS (rediss://) is not supported in v1 — writer/verifier/init-container redis clients consume host:port only and would silently use plain TCP. URL: %s. Use redis:// for v1; PASSWORD auth is available via external.authSecret (issue #39), but TLS remains unsupported." $u) -}}
 {{- end -}}
 {{- regexReplaceAll "^redis://" $u "" -}}
 {{- end -}}
@@ -348,6 +406,21 @@ Usage: {{ include "rrcs.redis.validateMode" (dict "side" "central" "mode" .Value
 {{- define "rrcs.redis.validateMode" -}}
 {{- if not (has .mode (list "standalone" "cluster")) -}}
 {{- fail (printf "redis.%s.mode=%q is invalid — must be \"standalone\" or \"cluster\"." .side .mode) -}}
+{{- end -}}
+{{- end -}}
+
+{{/*
+rrcs.redis.validateAuth — fail-closed guard for redis.<side>.external.authSecret.
+The bundled lab Redis boots password-less by design (--protected-mode per
+values), so an authSecret on a side that is not external is always a config
+error: the Secret would be silently ignored and the operator would believe
+auth is in force. Evaluated unconditionally from rrcs.redis.bundled, next to
+validateMode, so it fires for both sides on every render.
+Usage: {{ include "rrcs.redis.validateAuth" (dict "side" "central" "cfg" .Values.redis.central) }}
+*/}}
+{{- define "rrcs.redis.validateAuth" -}}
+{{- if and .cfg.external.authSecret (not .cfg.external.enabled) -}}
+{{- fail (printf "redis.%s.external.authSecret requires redis.%s.external.enabled=true — the bundled redis-%s is password-less by design; authSecret names a pre-created Secret used only to authenticate against an EXTERNAL Redis." .side .side .side) -}}
 {{- end -}}
 {{- end -}}
 

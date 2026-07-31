@@ -1,0 +1,50 @@
+# Example: external Redis with password auth on BOTH sides (issue #39).
+#
+# What this shows:
+# - Both central and region Redis are EXTERNAL, password-protected instances.
+#   The passwords live in pre-created opaque Secrets owned by another team —
+#   they never appear in values, rendered manifests, or `helm get` output.
+# - The Connect legs authenticate via env interpolation: the pipeline URL
+#   renders as redis://:${REDIS_CENTRAL_PASSWORD}@central-redis.prod:6379 and
+#   the connect container resolves it at config-parse time from a secretKeyRef.
+# - The Go lab-harness workloads (writer, dashboard, latency-calculator) are
+#   DISABLED: they do not speak Redis auth (deliberate scope of issue #39) and
+#   would fail against a passworded instance. The verifier Job is off by
+#   default already (verifier.run).
+#
+# Before installing, the Secret owner must have created (per side, may be the
+# same Secret if both Redises share a password):
+#
+#   kubectl -n <release-ns> create secret generic central-redis-auth \
+#     --from-literal=redis-pass='<the password>'
+#
+# The values below use placeholders — replace the URLs and Secret names with
+# your environment's. If a password contains URL-reserved characters (@ : / #),
+# store it URL-ENCODED in the Secret (the pinned Connect build accepts auth
+# only inside the URL).
+#
+# Rotation: update the Secret, then roll the connect Deployments (env vars are
+# read at pod start; there is no hot reload).
+
+redis:
+  central:
+    external:
+      enabled: true
+      url: "redis://central-redis.prod.example.com:6379"   # replace
+      authSecret: "central-redis-auth"                     # replace: pre-created Secret name
+      # authSecretKey defaults to "redis-pass"; override it here if the Secret
+      # owner used a different key.
+  region:
+    external:
+      enabled: true
+      url: "redis://region-redis.prod.example.com:6379"    # replace
+      authSecret: "region-redis-auth"                      # replace
+      authSecretKey: "redis-pass"
+
+# Lab-harness workloads off: they have no Redis auth support (issue #39 scope).
+writer:
+  enabled: false
+dashboard:
+  enabled: false
+latencyCalculator:
+  enabled: false

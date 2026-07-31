@@ -21,6 +21,7 @@ Usage: {{ include "rrcs.redis.bundled" (dict "root" $ "side" "central") }}
 {{- $app := printf "redis-%s" $side -}}
 {{- $fullname := include "rrcs.name" (dict "root" $root "base" $app) -}}
 {{- include "rrcs.redis.validateMode" (dict "side" $side "mode" $cfg.mode) -}}
+{{- include "rrcs.redis.validateAuth" (dict "side" $side "cfg" $cfg) -}}
 {{- if not $cfg.external.enabled -}}
 {{- if eq $cfg.mode "cluster" -}}
 apiVersion: v1

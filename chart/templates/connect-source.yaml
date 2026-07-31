@@ -29,6 +29,10 @@ spec:
         - name: wait-redis-central
           image: {{ include "rrcs.image" (dict "root" $ "ref" .Values.redis.image) }}
           imagePullPolicy: {{ .Values.images.pullPolicy }}
+          {{- with include "rrcs.redis.authEnvVar" (dict "root" $ "side" "central" "envName" "REDISCLI_AUTH") }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           command:
             - /bin/sh
             - -c
@@ -55,6 +59,10 @@ spec:
             - streams
             - -o
             - /etc/connect/observability.yaml
+          {{- with include "rrcs.redis.authEnvVar" (dict "root" $ "side" "central" "envName" "REDIS_CENTRAL_PASSWORD") }}
+          env:
+            {{- . | nindent 12 }}
+          {{- end }}
           ports:
             - containerPort: 4195
           readinessProbe:
